@@ -26,6 +26,10 @@ def test_profile_environment_omits_default_config_and_credential_overrides(
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: secret")
     monkeypatch.setenv("NODE_OPTIONS", "--require ./malicious.js")
     monkeypatch.setenv("CC_SWAPER_RUN_ID", "a1b2c3d4e5f6")
+    monkeypatch.setenv("CLAUDE_CODE_PLUGIN_SEED_DIR", "/untrusted/plugins")
+    monkeypatch.setenv("CLAUDE_CODE_PLUGIN_CACHE_DIR", "/untrusted/cache")
+    monkeypatch.setenv("CLAUDE_CODE_PLUGIN_DIRS", "/untrusted/plugin-dir")
+    monkeypatch.setenv("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD", "1")
 
     default_env = profile_environment(Profile("main", None))
     assert "CLAUDE_CONFIG_DIR" not in default_env
@@ -39,6 +43,10 @@ def test_profile_environment_omits_default_config_and_credential_overrides(
     config_dir.chmod(0o700)
     managed_env = profile_environment(Profile("second", config_dir))
     assert managed_env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+    assert not any(key in managed_env for key in (
+        "CLAUDE_CODE_PLUGIN_SEED_DIR", "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+        "CLAUDE_CODE_PLUGIN_DIRS", "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD",
+    ))
 
 
 def test_hooks_report_only_identity_for_a_real_usage_limit(tmp_path: Path) -> None:

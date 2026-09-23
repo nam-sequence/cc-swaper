@@ -72,6 +72,13 @@ def profile_environment(profile: Profile) -> dict[str, str]:
     env.pop("CLAUDE_CONFIG_DIR", None)
     env.pop("CC_SWAPER_RUN_ID", None)
     if profile.config_dir is not None:
+        for key in (
+            "CLAUDE_CODE_PLUGIN_SEED_DIR",
+            "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+            "CLAUDE_CODE_PLUGIN_DIRS",
+            "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD",
+        ):
+            env.pop(key, None)
         if profile.config_dir.is_symlink() or not profile.config_dir.is_dir():
             raise RuntimeError(f"unsafe or missing profile directory: {profile.config_dir}")
         info = profile.config_dir.stat()

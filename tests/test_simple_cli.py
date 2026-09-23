@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from cc_swaper import cli, service, tmux_sessions
+from cc_swaper import cli, service, shared_mcp_plugins, shared_settings, tmux_sessions
 from cc_swaper.profiles import ProfileStore
 
 
@@ -363,6 +363,8 @@ def test_native_runs_selected_profile_and_holds_lock_for_claude_lifetime(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-claude")
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
     monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(shared_settings, "prepare_shared_settings", lambda *_args: ([], {}))
+    monkeypatch.setattr(shared_mcp_plugins, "prepare_shared_mcp_plugins", lambda *_args: ([], {}))
     observed: dict[str, object] = {}
 
     def fake_claude(binary: str, args: list[str], env: dict[str, str]) -> int:
@@ -387,6 +389,79 @@ def test_native_runs_selected_profile_and_holds_lock_for_claude_lifetime(
     # The lock is released after the direct Claude process returns.
     with cli._profile_lock(ProfileStore(store.home), "work", exclusive=True):
         pass
+
+
+def test_native_applies_shared_overlays_only_to_normal_managed_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.select("work")
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    calls: list[str] = []
+    launches: list[tuple[list[str], dict[str, str]]] = []
+
+    def settings_plan(_store: ProfileStore, profile) -> tuple[list[str], dict[str, str]]:
+        assert profile.name == "work"
+        calls.append("settings")
+        return ["--settings", "/private/settings.json", "--add-dir", "/private/view"], {
+            "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1"
+        }
+
+    def mcp_plan(_store: ProfileStore, profile, cwd: Path) -> tuple[list[str], dict[str, str]]:
+        assert profile.name == "work" and cwd == Path.cwd()
+        calls.append("mcp")
+        return ["--mcp-config", "/private/mcp.json"], {
+            "CLAUDE_CODE_PLUGIN_SEED_DIR": "/private/plugins"
+        }
+
+    monkeypatch.setattr(shared_settings, "prepare_shared_settings", settings_plan)
+    monkeypatch.setattr(shared_mcp_plugins, "prepare_shared_mcp_plugins", mcp_plan)
+    monkeypatch.setattr(
+        cli, "run_passthrough",
+        lambda _binary, args, env: launches.append((args, env)) or 0,
+    )
+
+    assert cli.main(["native", "--", "--model", "opus"]) == 0
+    assert calls == ["settings", "mcp"]
+    args, env = launches[-1]
+    assert args == [
+        "--settings", "/private/settings.json", "--add-dir", "/private/view",
+        "--mcp-config", "/private/mcp.json", "--model", "opus",
+    ]
+    assert env["CLAUDE_CONFIG_DIR"] == str(store.get("work").config_dir)
+    assert env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] == "1"
+    assert env["CLAUDE_CODE_PLUGIN_SEED_DIR"] == "/private/plugins"
+
+    calls.clear()
+    for admin_command in (
+        "auth", "auto-mode", "daemon", "mcp", "plugin", "remote-control",
+        "self-hosted-runner",
+    ):
+        assert cli.main(["native", "--", admin_command, "status"]) == 0
+        assert calls == []
+        assert launches[-1][0] == [admin_command, "status"]
+    for leading_flag in (
+        "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"
+    ):
+        assert cli.main(["native", "--", leading_flag, "daemon", "status"]) == 0
+        assert calls == []
+        assert launches[-1][0] == [leading_flag, "daemon", "status"]
+    assert cli.main(["native", "--", "--bare"]) == 0
+    assert calls == []
+    assert launches[-1][0] == ["--bare"]
+
+    assert cli.main(["native", "--", "--bg"]) == 2
+    assert "background Claude sessions are unavailable" in capsys.readouterr().err
+    assert calls == []
+    assert launches[-1][0] == ["--bare"]
+
+    store.select("main")
+    assert cli.main(["native", "--", "--model", "sonnet"]) == 0
+    assert calls == []
+    assert launches[-1][0] == ["--model", "sonnet"]
+    assert "CLAUDE_CONFIG_DIR" not in launches[-1][1]
+    assert cli.main(["native", "--", "--bg"]) == 0
+    assert launches[-1][0] == ["--bg"]
 
 
 @pytest.mark.parametrize("action", ["attach", "stop"])

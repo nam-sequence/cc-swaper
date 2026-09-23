@@ -210,7 +210,49 @@ def _native(store: ProfileStore, args: list[str]) -> int:
     profile_name = store.selected().name
     with _profile_lock(store, profile_name, exclusive=False):
         profile = store.get_fresh(profile_name)
-        return run_passthrough(claude_binary(), args, profile_environment(profile))
+        if profile.config_dir is not None and any(
+            argument.split("=", 1)[0] in {"--bg", "--background"}
+            for argument in args
+        ):
+            raise RuntimeError(
+                "background Claude sessions are unavailable for managed profiles; "
+                "run Claude in this terminal"
+            )
+        environment = profile_environment(profile)
+        forwarded = args
+        if profile.config_dir is not None and _uses_interactive_customizations(args):
+            from .shared_mcp_plugins import prepare_shared_mcp_plugins
+            from .shared_settings import prepare_shared_settings
+
+            settings_args, settings_env = prepare_shared_settings(store, profile)
+            mcp_args, mcp_env = prepare_shared_mcp_plugins(store, profile, Path.cwd())
+            environment.update(settings_env)
+            environment.update(mcp_env)
+            forwarded = [*settings_args, *mcp_args, *args]
+        return run_passthrough(claude_binary(), forwarded, environment)
+
+
+_NATIVE_ADMIN_COMMANDS = frozenset({
+    "agents", "attach", "auth", "auto-mode", "config", "daemon", "doctor",
+    "gateway", "import", "install", "kill", "logs", "mcp", "plugin",
+    "plugins", "project", "remote-control", "respawn", "rm", "self-hosted-runner",
+    "setup-token", "stop", "ultrareview", "update", "upgrade",
+})
+
+
+def _uses_interactive_customizations(args: list[str]) -> bool:
+    if args and args[0] in _NATIVE_ADMIN_COMMANDS:
+        return False
+    if (
+        len(args) >= 2
+        and args[0] in {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
+        and args[1] == "daemon"
+    ):
+        return False
+    return not any(
+        argument.split("=", 1)[0] in {"--bare", "--safe-mode", "--help", "--version", "-h", "-v"}
+        for argument in args
+    )
 
 
 def _legacy_session(store: ProfileStore, action: str, argv: list[str]) -> int:

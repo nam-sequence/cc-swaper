@@ -1,15 +1,15 @@
 # cc-swaper (`ccs`)
 
-A small CLI for Claude Code accounts. Add profiles, choose which account new Claude processes use, and check usage. Switching is manual. Profiles keep separate account configuration and share Claude's project session history. New Claude sessions run directly in the current terminal, without tmux, a background monitor, or automatic account switching.
+A small CLI for Claude Code accounts. Add profiles, choose which account new Claude processes use, and check usage. Switching is manual. Profiles keep separate sign-ins while sharing project session history and loading the default account's personal customizations in new sessions. Claude runs directly in the current terminal, without tmux, a background monitor, or automatic account switching.
 
 ## Install
 
 Requires Claude Code, Python 3.10+, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). The `claude` shell wrapper supports interactive Zsh; `ccs` works from any shell. `tmux` is no longer required.
 
-Install from the v0.7.2 release:
+Install from the v0.8.0 release:
 
 ```bash
-curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.7.2/install.sh
+curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.0/install.sh
 bash install.sh
 ```
 
@@ -37,7 +37,7 @@ To create a profile without opening the browser, use `ccs add work --no-login` a
 
 `ccs usage` invokes Claude Code's local `/usage` command for each profile, checking up to eight in parallel. The table shows loading states, percentage bars, 5-hour and 7-day windows, model-specific weekly limits when available, and Claude's reset times. Missing reset times display as **Reset time unavailable**. It does not show a subscription end date. Redirected output and `--json` omit the animation.
 
-To remove an added profile, run `ccs remove work` to log out and archive its profile data, or `ccs remove work --purge-data` to delete that profile's local data. Shared project transcripts are kept by both options. The default profile cannot be removed this way; neither option deletes `~/.claude`. Exit any Claude process using a profile before removing it.
+To remove an added profile, run `ccs remove work` to log out and archive its profile data, or `ccs remove work --purge-data` to delete that profile's local data. Shared project transcripts are kept by both options. The default profile cannot be removed this way; neither option deletes `~/.claude`. Exit any Claude process using a profile, including agents or background processes it started, before removing it.
 
 ## Migrating from v0.6
 
@@ -45,20 +45,24 @@ Installing v0.7 updates the Zsh wrapper and removes the LaunchAgent monitor. Ope
 
 Old tmux sessions remain running so their current work is not interrupted. They retain the behavior they started with, including possible automatic switching, until they exit. Use `ccs attach` and `ccs stop` for these existing sessions, or inspect them with `tmux -L cc-swaper list-sessions`. These commands are retained only for migration; new sessions are not created in tmux.
 
-The profile registry and sign-ins in `~/.config/cc-swaper` (or `$CC_SWAPER_HOME`) survive the upgrade. `ccs` does not read or store passwords or tokens. Claude Code handles its own credentials; `ccs` invokes `claude auth login` and `claude auth status` under each profile. The CLI removes inherited environment variables that could override a claude.ai login. Claude project settings still apply, so use the wrapper in projects whose configuration you trust.
+The profile registry and sign-ins in `~/.config/cc-swaper` (or `$CC_SWAPER_HOME`) survive the upgrade. `ccs` does not read or copy Claude OAuth credentials. Claude Code handles those credentials; `ccs` invokes `claude auth login` and `claude auth status` under each profile. The CLI removes inherited environment variables that could override a claude.ai login. Claude project settings still apply, so use the wrapper in projects whose configuration you trust.
 
 From v0.7.2, `ccs` accepts only an exact managed `projects` link to the user's `~/.claude/projects` directory and creates that link for new managed profiles. Existing physical `projects` directories are preserved; `ccs` does not merge or replace them automatically. Do not delete those directories to enable sharing. Shared transcripts and project auto memory are readable from every profile and may be sent to a different account when you resume them. Claude's `project purge` and transcript retention can affect this shared history for every profile.
+
+From v0.8.0, normal Claude launches under an added profile also load a private snapshot of the default account's selected user preferences, authored skills, agents, rules, and commands. The profile's own settings file and account-synced skills remain untouched; values already set in that profile take precedence over the shared snapshot. Account authentication, permissions, trust, and remote-control settings are excluded. Unknown or unsupported settings keys stay profile-local. The default account is the source of truth for shared customizations. The snapshot uses `--settings`, which Claude applies above project and local settings for that session; shared plugin enablement can therefore override a project-level plugin choice. Authentication commands and `ccs usage` do not load this snapshot. Managed profiles reject native `claude --bg` because ccs cannot safely retain their profile lock after Claude detaches.
+
+Marketplace plugins are offered from the default account's read-only plugin seed while each profile keeps its own synced plugins and mutable plugin state; marketplace entries with credential-bearing URLs are omitted. Credential-free user MCP definitions from the default account are passed to normal sessions through a private `--mcp-config` snapshot. By default, ccs skips definitions with headers, helpers, inline credential patterns, or a nonempty `env` map; the reviewed `FIRECRAWL_API_URL` with a credential-free URL is the only allowed environment entry. Other MCP definitions must be configured separately for that account. MCP OAuth sign-ins remain per account. To authenticate a shared MCP server, open a normal Claude session under the selected profile and use `/mcp`; the native `claude mcp` command does not load the temporary shared server list. Generated snapshots live inside each private managed profile and can contain MCP connection details; `ccs` never prints their values. Main-account plugin code, command-valued settings such as `statusLine`, and shared MCP commands run as your OS user inside the selected profile's Claude process. `CLAUDE_CONFIG_DIR` separates Claude's stored account data; it does not restrict those commands from reading other files or inherited environment variables available to your OS user. Restart a running Claude process to pick up changes to the default account's settings or resources.
 
 To uninstall later, run `ccs shell uninstall`, then `uv tool uninstall cc-swaper`. This leaves the profile registry and Claude's own data intact.
 
 ## Build a release
 
-Run `bash scripts/build-release.sh` to build `dist/release-v0.7.2/`:
+Run `bash scripts/build-release.sh` to build `dist/release-v0.8.0/`:
 
 | Asset | Purpose |
 | --- | --- |
-| `cc_swaper-0.7.2-py3-none-any.whl` | Installable wheel |
-| `cc_swaper-0.7.2.tar.gz` | Source distribution |
+| `cc_swaper-0.8.0-py3-none-any.whl` | Installable wheel |
+| `cc_swaper-0.8.0.tar.gz` | Source distribution |
 | `install.sh` | Version-pinned standalone installer |
 | `SHA256SUMS` | SHA-256 hashes for the other three assets |
 
