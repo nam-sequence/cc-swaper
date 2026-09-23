@@ -14,6 +14,7 @@ uv.lock
 *.credentials.json
 /profiles.json
 /sessions.json
+/background-sessions.json
 /monitor*.json
 /pending-removal.json
 /claude.zsh

@@ -17,6 +17,7 @@ import secrets
 import shutil
 import stat
 import tempfile
+import uuid
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,7 +27,9 @@ from typing import Any
 _STATE_VERSION = 1
 _PROFILES_FILENAME = "profiles.json"
 _SESSIONS_FILENAME = "sessions.json"
+_BACKGROUND_SESSIONS_FILENAME = "background-sessions.json"
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+_RUN_ID = re.compile(r"[0-9a-f]{12}\Z")
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,7 @@ class ProfileStore:
 
         self._state_path = self.home / _PROFILES_FILENAME
         self._sessions_path = self.home / _SESSIONS_FILENAME
+        self._background_sessions_path = self.home / _BACKGROUND_SESSIONS_FILENAME
         self._pending_removal_path = self.home / "pending-removal.json"
         self.shared_projects = _absolute_path(Path.home() / ".claude" / "projects")
         with _metadata_lock(self.home):
@@ -318,8 +322,8 @@ class ProfileStore:
                     raise ValueError("archive directory is not private")
                 if destination.exists() or destination.is_symlink():
                     raise FileExistsError(destination)
-                if self._pending_removal_path.exists() or self._pending_removal_path.is_symlink():
-                    raise RuntimeError("another profile removal needs recovery")
+            if self._pending_removal_path.exists() or self._pending_removal_path.is_symlink():
+                raise RuntimeError("another profile removal needs recovery")
 
             if self._sessions_path.is_symlink():
                 raise ValueError(f"refusing symlink metadata file: {self._sessions_path}")
@@ -329,6 +333,12 @@ class ProfileStore:
                 cwd: session
                 for cwd, session in sessions.items()
                 if not (isinstance(session, dict) and session.get("profile") == name)
+            }
+            background_existed = self._background_sessions_path.exists()
+            background_before = self._load_background_sessions()
+            remaining_background = {
+                run_id: run for run_id, run in background_before.items()
+                if run.get("profile") != name and run.get("transcript_profile") != name
             }
 
             next_state = self._copy_state()
@@ -343,33 +353,41 @@ class ProfileStore:
                 )
                 next_state["selection_revision"] += 1
 
-            if destination is not None:
-                _write_json_atomic(
-                    self._pending_removal_path,
-                    {
-                        "version": _STATE_VERSION,
-                        "name": name,
-                        "source": str(config_dir),
-                        "destination": str(destination),
-                        "sessions_existed": sessions_exist,
-                        "sessions_before": sessions,
-                        "purge": purge_data,
-                    },
-                )
+            _write_json_atomic(
+                self._pending_removal_path,
+                {
+                    "version": _STATE_VERSION,
+                    "name": name,
+                    "source": str(config_dir),
+                    "destination": str(destination) if destination is not None else None,
+                    "sessions_existed": sessions_exist,
+                    "sessions_before": sessions,
+                    "background_existed": background_existed,
+                    "background_before": background_before,
+                    "purge": purge_data,
+                },
+            )
             moved = False
             sessions_changed = False
+            background_changed = False
             try:
                 if destination is not None:
                     config_dir.rename(destination)
                     moved = True
+                if remaining_background != background_before:
+                    background_changed = True
+                    _write_json_atomic(
+                        self._background_sessions_path,
+                        {"version": _STATE_VERSION, "runs": remaining_background},
+                    )
                 # Write sessions first so no committed state can retain a
                 # session pointing at an unregistered profile.
                 if remaining_sessions != sessions:
+                    sessions_changed = True
                     _write_json_atomic(
                         self._sessions_path,
                         {"version": _STATE_VERSION, "sessions": remaining_sessions},
                     )
-                    sessions_changed = True
                 self._write_state(next_state)
             except BaseException:
                 # Atomic replace may have committed before a later fsync or
@@ -385,7 +403,7 @@ class ProfileStore:
                     )
                 except (OSError, ValueError):
                     committed = False
-                if moved and committed:
+                if committed:
                     raise
                 rollback_ok = True
                 if moved:
@@ -401,13 +419,24 @@ class ProfileStore:
                         )
                     except OSError:
                         rollback_ok = False
-                if rollback_ok and destination is not None:
+                if background_changed:
+                    try:
+                        if background_existed:
+                            _write_json_atomic(
+                                self._background_sessions_path,
+                                {"version": _STATE_VERSION, "runs": background_before},
+                            )
+                        else:
+                            self._background_sessions_path.unlink(missing_ok=True)
+                    except OSError:
+                        rollback_ok = False
+                if rollback_ok:
                     self._pending_removal_path.unlink(missing_ok=True)
                 raise
             self._state = next_state
-            if destination is not None and not purge_data:
-                # If this unlink fails, recovery sees an unregistered profile
-                # at the destination and only removes the stale journal.
+            if not purge_data:
+                # If this unlink fails, recovery sees the committed registry
+                # state and only removes the stale journal.
                 try:
                     self._pending_removal_path.unlink()
                 except OSError:
@@ -440,24 +469,31 @@ class ProfileStore:
         name = _validate_profile_name(payload.get("name"))
         raw_source = payload.get("source")
         raw_destination = payload.get("destination")
-        if not isinstance(raw_source, str) or not isinstance(raw_destination, str):
+        if not isinstance(raw_source, str) or (
+            raw_destination is not None and not isinstance(raw_destination, str)
+        ):
             raise ValueError("profile-removal journal has invalid paths")
         source = Path(raw_source)
-        destination = Path(raw_destination)
-        if source != self.profiles_dir / name or destination.parent != self.home / "removed":
+        destination = Path(raw_destination) if raw_destination is not None else None
+        if source != self.profiles_dir / name:
             raise ValueError("profile-removal journal has unsafe paths")
-        if not re.fullmatch(rf"{re.escape(name)}-\d{{8}}T\d{{6}}Z-[0-9a-f]{{8}}", destination.name):
-            raise ValueError("profile-removal journal has an invalid destination name")
         purge = payload.get("purge", False)
         if not isinstance(purge, bool):
             raise ValueError("profile-removal journal has an invalid purge flag")
-        archive_root = destination.parent
-        if archive_root.is_symlink() or not archive_root.is_dir():
-            raise ValueError("profile-removal archive directory is unsafe")
-        archive_info = archive_root.stat()
-        if archive_info.st_uid != os.getuid() or stat.S_IMODE(archive_info.st_mode) & 0o077:
-            raise ValueError("profile-removal archive directory is not private")
-        if source.is_symlink() or destination.is_symlink():
+        if destination is None and purge:
+            raise ValueError("profile-removal journal cannot purge without an archive")
+        if destination is not None:
+            if destination.parent != self.home / "removed":
+                raise ValueError("profile-removal journal has unsafe paths")
+            if not re.fullmatch(rf"{re.escape(name)}-\d{{8}}T\d{{6}}Z-[0-9a-f]{{8}}", destination.name):
+                raise ValueError("profile-removal journal has an invalid destination name")
+            archive_root = destination.parent
+            if archive_root.is_symlink() or not archive_root.is_dir():
+                raise ValueError("profile-removal archive directory is unsafe")
+            archive_info = archive_root.stat()
+            if archive_info.st_uid != os.getuid() or stat.S_IMODE(archive_info.st_mode) & 0o077:
+                raise ValueError("profile-removal archive directory is not private")
+        if source.is_symlink() or (destination is not None and destination.is_symlink()):
             raise ValueError("profile-removal journal points at a symlink")
         with _try_recovery_profile_lock(self.home, name) as acquired:
             if not acquired:
@@ -469,29 +505,88 @@ class ProfileStore:
                 isinstance(record, dict) and record.get("name") == name
                 for record in state["profiles"]
             )
-            if registered and destination.is_dir() and not source.exists():
-                destination.rename(source)
-            elif registered and source.is_dir() and not destination.exists():
+            if destination is None and source.is_dir():
                 pass
-            elif not registered and destination.is_dir() and not source.exists():
+            elif destination is not None and registered and destination.is_dir() and not source.exists():
+                destination.rename(source)
+            elif destination is not None and registered and source.is_dir() and not destination.exists():
+                pass
+            elif destination is not None and not registered and destination.is_dir() and not source.exists():
                 if purge:
                     shutil.rmtree(destination)
-            elif not registered and purge and not destination.exists() and not source.exists():
+            elif destination is not None and not registered and purge and not destination.exists() and not source.exists():
                 pass
             else:
                 raise RuntimeError("profile removal needs manual recovery")
-            if registered and "sessions_before" in payload:
+            if registered:
+                self._state = self._load_state()
+            if "sessions_before" in payload:
                 previous = payload["sessions_before"]
                 existed = payload.get("sessions_existed")
                 if not isinstance(previous, dict) or not isinstance(existed, bool):
                     raise ValueError("profile-removal journal has invalid session backup")
-                if existed:
+                current_sessions = (
+                    self._load_sessions() if self._sessions_path.exists() else {}
+                ) if registered else (
+                    _read_json(self._sessions_path).get("sessions", {})
+                    if self._sessions_path.exists() else {}
+                )
+                if not isinstance(current_sessions, dict):
+                    raise ValueError("profile-removal journal found invalid session metadata")
+                merged_sessions = dict(current_sessions)
+                if registered:
+                    for cwd, record in previous.items():
+                        if (
+                            isinstance(record, dict)
+                            and record.get("profile") == name
+                            and cwd not in merged_sessions
+                        ):
+                            merged_sessions[cwd] = record
+                else:
+                    merged_sessions = {
+                        cwd: record for cwd, record in merged_sessions.items()
+                        if not (isinstance(record, dict) and record.get("profile") == name)
+                    }
+                if merged_sessions != current_sessions:
                     _write_json_atomic(
                         self._sessions_path,
-                        {"version": _STATE_VERSION, "sessions": previous},
+                        {"version": _STATE_VERSION, "sessions": merged_sessions},
                     )
-                elif self._sessions_path.exists():
-                    self._sessions_path.unlink()
+            if "background_before" in payload:
+                previous_runs = payload["background_before"]
+                existed = payload.get("background_existed")
+                if not isinstance(previous_runs, dict) or not isinstance(existed, bool):
+                    raise ValueError("profile-removal journal has invalid background session backup")
+                current_runs = (
+                    self._load_background_sessions() if self._background_sessions_path.exists() else {}
+                ) if registered else (
+                    _read_json(self._background_sessions_path).get("runs", {})
+                    if self._background_sessions_path.exists() else {}
+                )
+                if not isinstance(current_runs, dict):
+                    raise ValueError("profile-removal journal found invalid background metadata")
+                merged_runs = dict(current_runs)
+                if registered:
+                    for run_id, record in previous_runs.items():
+                        if (
+                            isinstance(record, dict)
+                            and (record.get("profile") == name or record.get("transcript_profile") == name)
+                            and run_id not in merged_runs
+                        ):
+                            merged_runs[run_id] = record
+                else:
+                    merged_runs = {
+                        run_id: record for run_id, record in merged_runs.items()
+                        if not (
+                            isinstance(record, dict)
+                            and (record.get("profile") == name or record.get("transcript_profile") == name)
+                        )
+                    }
+                if merged_runs != current_runs:
+                    _write_json_atomic(
+                        self._background_sessions_path,
+                        {"version": _STATE_VERSION, "runs": merged_runs},
+                    )
             pending.unlink()
 
     def get(self, name: str) -> Profile:
@@ -500,6 +595,13 @@ class ProfileStore:
             if record["name"] == name:
                 return self._profile_from_record(record)
         raise KeyError(name)
+
+    def get_fresh(self, name: str) -> Profile:
+        """Recheck membership after acquiring the profile's lifetime lock."""
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            return self.get(name)
 
     def all(self) -> list[Profile]:
         """Return profiles in their insertion order."""
@@ -630,6 +732,115 @@ class ProfileStore:
                 self._sessions_path,
                 {"version": _STATE_VERSION, "sessions": sessions},
             )
+
+    def background_sessions(self) -> dict[str, dict[str, str | None]]:
+        """Return independently recorded state for managed tmux runs."""
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            return self._load_background_sessions()
+
+    def background_session(self, run_id: str) -> dict[str, str | None] | None:
+        if not _RUN_ID.fullmatch(run_id):
+            raise ValueError("invalid managed run ID")
+        return self.background_sessions().get(run_id)
+
+    def set_background_session(
+        self,
+        run_id: str,
+        cwd: Path,
+        session_id: str,
+        profile_name: str,
+        transcript_path: Path | None = None,
+        *,
+        transcript_profile_name: str | None = None,
+    ) -> None:
+        """Update one run without overwriting another run in the same project."""
+
+        if not _RUN_ID.fullmatch(run_id):
+            raise ValueError("invalid managed run ID")
+        session_id = str(uuid.UUID(session_id))
+        profile_name = _validate_profile_name(profile_name)
+        transcript_profile_name = _validate_profile_name(
+            transcript_profile_name or profile_name
+        )
+        if transcript_path is not None and not transcript_path.is_absolute():
+            raise ValueError("transcript_path must be absolute")
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            self.get(profile_name)
+            self.get(transcript_profile_name)
+            records = self._load_background_sessions()
+            records[run_id] = {
+                "cwd": _cwd_key(cwd),
+                "id": session_id,
+                "profile": profile_name,
+                "transcript_profile": transcript_profile_name,
+                "path": str(transcript_path) if transcript_path is not None else None,
+            }
+            _write_json_atomic(
+                self._background_sessions_path,
+                {"version": _STATE_VERSION, "runs": records},
+            )
+
+    def remove_background_session(self, run_id: str) -> None:
+        if not _RUN_ID.fullmatch(run_id):
+            raise ValueError("invalid managed run ID")
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            records = self._load_background_sessions()
+            if run_id in records:
+                del records[run_id]
+                _write_json_atomic(
+                    self._background_sessions_path,
+                    {"version": _STATE_VERSION, "runs": records},
+                )
+
+    def _load_background_sessions(self) -> dict[str, dict[str, str | None]]:
+        path = self._background_sessions_path
+        if path.is_symlink():
+            raise ValueError(f"refusing symlink metadata file: {path}")
+        if not path.exists():
+            return {}
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("version") != _STATE_VERSION:
+            raise ValueError(f"unsupported background session metadata in {path}")
+        raw_runs = payload.get("runs")
+        if not isinstance(raw_runs, dict):
+            raise ValueError("background session metadata has an invalid runs map")
+        runs: dict[str, dict[str, str | None]] = {}
+        for run_id, record in raw_runs.items():
+            if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+                raise ValueError("background session metadata has an invalid run ID")
+            if not isinstance(record, dict):
+                raise ValueError("background session metadata has an invalid record")
+            cwd = record.get("cwd")
+            session_id = record.get("id")
+            profile = record.get("profile")
+            transcript_profile = record.get("transcript_profile", profile)
+            transcript = record.get("path")
+            if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                raise ValueError("background session metadata has an invalid cwd")
+            if not isinstance(session_id, str):
+                raise ValueError("background session metadata has an invalid session ID")
+            try:
+                canonical_id = str(uuid.UUID(session_id))
+            except ValueError:
+                raise ValueError("background session metadata has an invalid session ID") from None
+            profile = _validate_profile_name(profile)
+            transcript_profile = _validate_profile_name(transcript_profile)
+            registered = {item["name"] for item in self._state["profiles"]}
+            if profile not in registered or transcript_profile not in registered:
+                raise ValueError("background session metadata names an unknown profile")
+            if transcript is not None and (
+                not isinstance(transcript, str) or not Path(transcript).is_absolute()
+            ):
+                raise ValueError("background session metadata has an invalid transcript path")
+            runs[run_id] = {
+                "cwd": cwd, "id": canonical_id, "profile": profile,
+                "transcript_profile": transcript_profile, "path": transcript,
+            }
+        return runs
 
     def _add_profile(self, name: str, *, kind: str) -> Profile:
         profile_dir = self.profiles_dir / name

@@ -1,4 +1,4 @@
-"""Manage one persistent tmux session for each Claude project.
+"""Manage persistent tmux sessions for Claude project invocations.
 
 The background runner intentionally keeps tmux concerns in a small adapter.
 The command inside a session is still ``ccs`` in foreground mode, so the
@@ -15,6 +15,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -27,6 +28,10 @@ _CLAUDE_ENV = "CC_SWAPER_CLAUDE_BIN"
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 _SESSION_SLUG = re.compile(r"[^a-z0-9]+")
 _SOCKET_NAME = re.compile(r"[A-Za-z0-9_-]+\Z")
+_UUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+_RUN_ID = re.compile(r"[0-9a-f]{12}\Z")
 _UNSAFE_TMUX_ENV = (
     "ANTHROPIC_",
     "CLAUDE_CODE_",
@@ -54,6 +59,7 @@ _UNSAFE_TMUX_ENV_EXACT = frozenset(
         "ZDOTDIR",
         "TMUX_TMPDIR",
         "CC_SWAPER_HOME",
+        "CC_SWAPER_RUN_ID",
         "CC_SWAPER_TMUX_SOCKET",
     }
 )
@@ -72,7 +78,7 @@ def _project_slug(cwd: Path) -> str:
 
 
 def session_name(cwd: Path) -> str:
-    """Return the stable tmux session name for a canonical project path.
+    """Return the legacy stable tmux name for a canonical project path.
 
     The short readable portion helps users identify a session in ``tmux``;
     the path digest keeps projects with the same basename distinct.
@@ -81,6 +87,18 @@ def session_name(cwd: Path) -> str:
     canonical = _canonical_cwd(cwd)
     digest = hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()[:12]
     return f"ccs-{_project_slug(canonical)}-{digest}"
+
+
+def _uuid_value(value: str, label: str) -> str:
+    """Validate and normalize a canonical UUID used in managed metadata."""
+
+    if not isinstance(value, str) or not _UUID.fullmatch(value.lower()):
+        raise ValueError(f"{label} must be a UUID")
+    return value.lower()
+
+
+def _managed_session_name(cwd: Path, run_id: str) -> str:
+    return f"{session_name(cwd)}-{run_id}"
 
 
 def _trusted_executable(candidate: Path | str | None, *, label: str, lookup: str) -> Path:
@@ -197,11 +215,27 @@ class TmuxSessions:
         store_home: Path,
         socket: str,
         selection_token: str | None = None,
+        run_session_id: str | None = None,
+        source_session_id: str | None = None,
+        run_id: str | None = None,
     ) -> str:
         if mode not in {"run", "resume", "switch"}:
             raise ValueError("mode must be one of: run, resume, switch")
         if any("\x00" in str(arg) for arg in claude_args):
             raise ValueError("Claude arguments cannot contain NUL bytes")
+
+        if mode == "run":
+            if run_session_id is None:
+                raise ValueError("run_session_id is required for run mode")
+            run_session_id = _uuid_value(run_session_id, "run_session_id")
+        elif run_session_id is not None:
+            raise ValueError("run_session_id is only valid for run mode")
+        if source_session_id is not None:
+            source_session_id = _uuid_value(source_session_id, "source_session_id")
+            if mode not in {"resume", "switch"}:
+                raise ValueError("source_session_id is only valid for resume or switch mode")
+        if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id must contain 12 lowercase hexadecimal characters")
 
         if mode == "switch":
             command = [str(ccs_binary), "switch", "--foreground", profile_name]
@@ -213,6 +247,10 @@ class TmuxSessions:
                 "--profile",
                 profile_name,
             ]
+        if mode == "run":
+            command.extend(("--managed-session-id", run_session_id))
+        elif mode == "switch" and source_session_id is not None:
+            command.extend(("--source-session", source_session_id))
         if no_auto:
             command.append("--no-auto")
         if selection_token is not None:
@@ -221,7 +259,13 @@ class TmuxSessions:
             command.extend(("--selection-token", selection_token))
 
         raw_args = [str(arg) for arg in claude_args]
-        if mode == "resume" and raw_args and raw_args[0] != "--":
+        if mode == "resume" and source_session_id is not None:
+            if raw_args and raw_args[0] != "--":
+                if raw_args[0] != source_session_id:
+                    raise ValueError("source_session_id conflicts with the resume session ID")
+                raw_args.pop(0)
+            command.append(source_session_id)
+        elif mode == "resume" and raw_args and raw_args[0] != "--":
             # ``resume`` has one optional positional session ID.  Keep it
             # before the remainder marker so an explicit ID reaches ccs.
             command.append(raw_args.pop(0))
@@ -235,15 +279,12 @@ class TmuxSessions:
             "/usr/bin/env",
             f"{_CLAUDE_ENV}={claude_binary}",
             f"CC_SWAPER_HOME={store_home}",
+            f"CC_SWAPER_RUN_ID={run_id}",
             f"CC_SWAPER_TMUX_SOCKET={socket}",
         ]
         if config_dir is not None:
             environment.append(f"CLAUDE_CONFIG_DIR={config_dir}")
         return shlex.join([*environment, *command])
-
-    def _target(self, cwd: Path) -> tuple[Path, str]:
-        canonical = _canonical_cwd(cwd)
-        return canonical, session_name(canonical)
 
     @staticmethod
     def _exact_target(name: str, *, session_option: bool = False) -> str:
@@ -253,32 +294,53 @@ class TmuxSessions:
         return f"={name}:" if session_option else f"={name}"
 
     def exists(self, cwd: Path) -> bool:
-        """Return whether the project has a session on the cc-swaper socket."""
+        """Return whether the project has any valid managed tmux session."""
 
-        _, name = self._target(cwd)
-        result = self._tmux(["has-session", "-t", self._exact_target(name)])
-        return result.returncode == 0
+        return bool(self.list_sessions_for_cwd(cwd))
 
     def _verified_session(self, cwd: Path, name: str) -> dict[str, Any]:
         canonical = _canonical_cwd(cwd)
-        for item in self.list_sessions():
-            if item["name"] == name and item["cwd"] == str(canonical):
+        for item in self.list_sessions_for_cwd(canonical):
+            if item["name"] == name:
                 return item
         raise RuntimeError(f"tmux session {name} is missing or has invalid cc-swaper metadata")
 
+    def _select_session(
+        self,
+        cwd: Path,
+        session_name: str | None,
+        run_id: str | None,
+    ) -> dict[str, Any]:
+        if session_name is not None and run_id is not None:
+            raise ValueError("specify either a session name or run_id, not both")
+        sessions = self.list_sessions_for_cwd(cwd)
+        if session_name is not None:
+            matches = [item for item in sessions if item["name"] == session_name]
+        elif run_id is not None:
+            if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+                raise ValueError("run_id must contain 12 lowercase hexadecimal characters")
+            selected_run_id = run_id
+            matches = [item for item in sessions if item["run_id"] == selected_run_id]
+        else:
+            matches = sessions
+
+        if not matches:
+            selected = session_name or run_id
+            if selected is None:
+                raise RuntimeError(f"no valid cc-swaper tmux session for {_canonical_cwd(cwd)}")
+            raise RuntimeError(
+                f"tmux session {selected} is missing or has invalid cc-swaper metadata"
+            )
+        if len(matches) > 1:
+            names = ", ".join(item["name"] for item in matches)
+            raise RuntimeError(
+                f"multiple background sessions exist for {_canonical_cwd(cwd)}; "
+                f"specify a session name or run_id: {names}"
+            )
+        return matches[0]
+
     def _cleanup_session(self, name: str) -> None:
         self._tmux(["kill-session", "-t", self._exact_target(name)])
-
-    def _session_is_dead(self, name: str) -> bool | None:
-        result = self._tmux(
-            ["list-panes", "-t", self._exact_target(name), "-F", "#{pane_dead}"]
-        )
-        if result.returncode != 0:
-            return None
-        state = _status_output(result).splitlines()
-        if not state:
-            return None
-        return state[0].split("\t", 1)[0] in {"1", "true", "on"}
 
     def start(
         self,
@@ -290,8 +352,10 @@ class TmuxSessions:
         *,
         no_auto: bool = False,
         selection_token: str | None = None,
+        run_session_id: str | None = None,
+        source_session_id: str | None = None,
     ) -> str:
-        """Start one project session and return its deterministic name.
+        """Start a uniquely named project session and return its tmux name.
 
         Sessions are created detached first even when ``detach=False``.  That
         allows metadata and ``remain-on-exit`` to be set before an interactive
@@ -299,11 +363,19 @@ class TmuxSessions:
         monitor.
         """
 
-        canonical, name = self._target(cwd)
+        canonical = _canonical_cwd(cwd)
         if not canonical.is_dir():
             raise ValueError(f"project directory does not exist: {canonical}")
         profile = self._profile(profile_name)
         claude_binary = self._claude_binary()
+        if mode == "run":
+            if run_session_id is None:
+                run_session_id = str(uuid.uuid4())
+            run_session_id = _uuid_value(run_session_id, "run_session_id")
+        if source_session_id is not None:
+            source_session_id = _uuid_value(source_session_id, "source_session_id")
+        run_id = uuid.uuid4().hex[:12]
+        name = _managed_session_name(canonical, run_id)
         command = self._inner_args(
             self.ccs_binary,
             claude_binary,
@@ -315,18 +387,10 @@ class TmuxSessions:
             self.store.home,
             self.socket,
             selection_token,
+            run_session_id,
+            source_session_id,
+            run_id,
         )
-
-        if self.exists(canonical):
-            self._verified_session(canonical, name)
-            # A dead pane is a retained record from a previous detached run.
-            # Remove that record so the next `claude` invocation can restart
-            # the project while an active session remains a hard conflict.
-            dead = self._session_is_dead(name)
-            if dead is True:
-                self._cleanup_session(name)
-            else:
-                raise RuntimeError(f"a background session already exists for {canonical}: {name}")
 
         created = self._tmux(
             [
@@ -343,11 +407,16 @@ class TmuxSessions:
             raise self._failure(created, f"could not create tmux session {name}")
 
         try:
-            for option, value in (
+            claude_session_id = run_session_id if mode == "run" else source_session_id
+            tags = [
                 ("remain-on-exit", "on"),
                 ("@ccs_cwd", str(canonical)),
                 ("@ccs_initial_profile", profile.name),
-            ):
+                ("@ccs_run_id", run_id),
+            ]
+            if claude_session_id is not None:
+                tags.append(("@ccs_session_id", claude_session_id))
+            for option, value in tags:
                 tagged = self._tmux(
                     [
                         "set-option",
@@ -362,22 +431,32 @@ class TmuxSessions:
             # A command which exits immediately is still retained as a dead
             # session by remain-on-exit.  Confirm the server kept the session
             # before handing control back to the caller.
-            if not self.exists(canonical):
-                raise RuntimeError(f"tmux session {name} exited before it could be monitored")
+            try:
+                self._verified_session(canonical, name)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"tmux session {name} exited or has invalid metadata before it could be monitored"
+                ) from exc
         except BaseException:
             self._cleanup_session(name)
             raise
 
         if not detach:
-            if self.attach(canonical) != 0:
+            if self.attach(canonical, session_name=name) != 0:
                 raise RuntimeError(f"could not attach to tmux session {name}")
         return name
 
-    def attach(self, cwd: Path) -> int:
-        """Attach the terminal to the project's existing session."""
+    def attach(
+        self,
+        cwd: Path,
+        session_name: str | None = None,
+        *,
+        run_id: str | None = None,
+    ) -> int:
+        """Attach to one verified session, requiring a selector when ambiguous."""
 
-        canonical, name = self._target(cwd)
-        self._verified_session(canonical, name)
+        selected = self._select_session(cwd, session_name, run_id)
+        name = selected["name"]
         current_socket = os.environ.get("TMUX", "").split(",", 1)[0]
         same_socket = bool(current_socket and Path(current_socket).name == self.socket)
         command = "switch-client" if same_socket else "attach-session"
@@ -388,11 +467,17 @@ class TmuxSessions:
         )
         return result.returncode
 
-    def stop(self, cwd: Path) -> int:
-        """Stop the project's tmux session."""
+    def stop(
+        self,
+        cwd: Path,
+        session_name: str | None = None,
+        *,
+        run_id: str | None = None,
+    ) -> int:
+        """Stop one verified session, requiring a selector when ambiguous."""
 
-        canonical, name = self._target(cwd)
-        self._verified_session(canonical, name)
+        selected = self._select_session(cwd, session_name, run_id)
+        name = selected["name"]
         result = self._tmux(["kill-session", "-t", self._exact_target(name)])
         return result.returncode
 
@@ -403,7 +488,8 @@ class TmuxSessions:
             [
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{session_attached}\t#{@ccs_cwd}\t#{@ccs_initial_profile}",
+                "#{session_name}\t#{session_attached}\t#{@ccs_cwd}\t#{@ccs_initial_profile}"
+                "\t#{@ccs_run_id}\t#{@ccs_session_id}",
             ]
         )
         if result.returncode != 0:
@@ -411,18 +497,39 @@ class TmuxSessions:
             return []
 
         sessions: list[dict[str, Any]] = []
-        for raw_line in _status_output(result).splitlines():
-            fields = raw_line.split("\t", 3)
-            if len(fields) != 4:
+        # Preserve a trailing empty session_id field for older managed or
+        # legacy sessions; str.strip() would remove its tab delimiter.
+        for raw_line in (result.stdout or "").rstrip("\r\n").splitlines():
+            fields = raw_line.split("\t", 5)
+            if len(fields) != 6:
                 continue
-            name, attached_raw, cwd_raw, profile = fields
+            name, attached_raw, cwd_raw, profile, run_id_raw, session_id_raw = fields
             if not name or not cwd_raw or not profile or not _PROFILE_NAME.fullmatch(profile):
                 continue
             try:
-                expected = session_name(Path(cwd_raw))
+                canonical = _canonical_cwd(Path(cwd_raw))
             except (OSError, RuntimeError, ValueError):
                 continue
-            if expected != name:
+            if not Path(cwd_raw).is_absolute() or str(canonical) != cwd_raw:
+                continue
+            try:
+                if run_id_raw:
+                    if not _RUN_ID.fullmatch(run_id_raw):
+                        continue
+                    if name != _managed_session_name(canonical, run_id_raw):
+                        continue
+                    run_id: str | None = run_id_raw
+                else:
+                    if name != session_name(canonical):
+                        continue
+                    run_id = None
+                if session_id_raw:
+                    session_id = _uuid_value(session_id_raw, "session_id")
+                    if session_id != session_id_raw:
+                        continue
+                else:
+                    session_id = None
+            except (OSError, RuntimeError, ValueError):
                 continue
             pane = self._tmux(
                 [
@@ -448,11 +555,19 @@ class TmuxSessions:
                     "cwd": cwd_raw or pane_cwd or None,
                     "initial_profile": profile or None,
                     "profile": profile or None,
+                    "run_id": run_id,
+                    "session_id": session_id,
                     "attached": attached_raw not in {"", "0", "false", "off"},
                     "dead": pane_dead,
                 }
             )
         return sessions
+
+    def list_sessions_for_cwd(self, cwd: Path) -> list[dict[str, Any]]:
+        """Return all valid managed sessions for a canonical project path."""
+
+        canonical = _canonical_cwd(cwd)
+        return [item for item in self.list_sessions() if item["cwd"] == str(canonical)]
 
 
 __all__ = ["TmuxSessions", "session_name"]

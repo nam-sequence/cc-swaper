@@ -215,16 +215,28 @@ def _snapshot(store: ProfileStore) -> dict[str, Any]:
         running_script if running_script.is_absolute() and running_script.name == "ccs"
         else _trusted_ccs_path()
     )
-    for item in TmuxSessions(store, ccs_binary=ccs_binary).list_sessions():
+    run_records = store.background_sessions()
+    inventory = TmuxSessions(store, ccs_binary=ccs_binary).list_sessions()
+    for item in inventory:
         cwd = Path(str(item.get("cwd") or ""))
-        record = store.last_transcript(cwd) if cwd.is_absolute() else None
+        run_id = item.get("run_id")
+        record = run_records.get(run_id) if isinstance(run_id, str) else None
+        if record is not None and record.get("cwd") != str(cwd.resolve()):
+            record = None
         sessions.append({
             "name": item.get("name"),
+            "run_id": run_id,
             "cwd": str(cwd) if cwd.is_absolute() else None,
             "attached": item.get("attached", False),
             "dead": item.get("dead", False),
-            "profile": record[0] if record else item.get("initial_profile"),
-            "session_id": store.last_session(cwd) if cwd.is_absolute() else None,
+            "profile": (
+                record.get("profile") if record else
+                item.get("initial_profile")
+            ),
+            "session_id": (
+                record.get("id") if record else
+                item.get("session_id")
+            ),
         })
     return {"pid": os.getpid(), "updated_at": time.time(), "sessions": sessions}
 

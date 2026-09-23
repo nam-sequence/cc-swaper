@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
 import shutil
@@ -14,6 +16,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -39,6 +42,8 @@ if args[:2] == ["auth", "status"]:
         print(json.dumps({"loggedIn": False, "authMethod": "none"}))
         sys.exit(1)
     profile = "secondary" if os.environ.get("CLAUDE_CONFIG_DIR") else "main"
+    if os.environ.get("FAKE_DISTINCT_MANAGED") and os.environ.get("CLAUDE_CONFIG_DIR"):
+        profile = Path(os.environ["CLAUDE_CONFIG_DIR"]).name
     email = "main@example.test" if os.environ.get("FAKE_DUPLICATE_ACCOUNT") else profile + "@example.test"
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "email": email, "orgId": "org1"}))
     sys.exit(0)
@@ -107,6 +112,15 @@ elif "--resume" in args:
     path = project / (sid + ".jsonl")
     path.write_text(source.read_text() + "forked\n")
     event_file.open("a").write(json.dumps({"type": "start", "session_id": sid, "transcript_path": str(path)}) + "\n")
+    if os.environ.get("FAKE_CHAIN_QUOTA") and os.environ.get("CLAUDE_CONFIG_DIR"):
+        profile_name = Path(os.environ["CLAUDE_CONFIG_DIR"]).name
+        if profile_name == "secondary":
+            event_file.open("a").write(json.dumps({"type": "limit", "session_id": sid, "transcript_path": str(path)}) + "\n")
+            print("SECONDARY_LIMIT", flush=True)
+            time.sleep(30)
+        if profile_name == "third":
+            print("THIRD_READY", flush=True)
+            time.sleep(30)
     print("RESUMED:" + sid, flush=True)
     if os.environ.get("FAKE_MODE") == "wait_after_resume":
         time.sleep(30)
@@ -158,9 +172,19 @@ def _ccs_source_wrapper(tmp_path: Path) -> tuple[Path, Path]:
     return ccs_wrapper, fake_bin
 
 
+def _started_session_name(output: str, project: Path) -> str:
+    match = re.search(r"Started background session (ccs-[a-z0-9-]+)\.", output)
+    assert match is not None, output
+    name = match.group(1)
+    assert name.startswith(session_name(project) + "-")
+    return name
+
+
 def _run_tty(
     env: dict[str, str], project: Path, command: tuple[str, ...] = ("run", "--foreground"),
     *, terminate_on: str | None = None, choice: str | None = None,
+    detach_on: str | None = None,
+    on_marker: tuple[str, Callable[[], None]] | None = None,
 ) -> tuple[int, str, list]:
     master, slave = pty.openpty()
     original_term = termios.tcgetattr(slave)
@@ -172,6 +196,8 @@ def _run_tty(
     output = bytearray()
     signal_sent = False
     choice_sent = False
+    detach_sent = False
+    marker_handled = False
     deadline = time.monotonic() + 15
     try:
         while time.monotonic() < deadline:
@@ -184,6 +210,12 @@ def _run_tty(
                 if choice and not choice_sent and "Enter a number or account name:" in output.decode(errors="replace"):
                     os.write(master, choice.encode())
                     choice_sent = True
+                if detach_on and not detach_sent and detach_on in output.decode(errors="replace"):
+                    os.write(master, b"\x02d")
+                    detach_sent = True
+                if on_marker and not marker_handled and on_marker[0] in output.decode(errors="replace"):
+                    on_marker[1]()
+                    marker_handled = True
                 if terminate_on and not signal_sent and terminate_on in output.decode(errors="replace"):
                     process.send_signal(signal.SIGTERM)
                     signal_sent = True
@@ -471,6 +503,62 @@ def test_auto_switch_waits_for_failed_turn_to_flush(tmp_path: Path) -> None:
     assert "late persisted" in second_file.read_text()
 
 
+def test_later_quota_handoff_keeps_previous_transcript_profile_locked(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    added = subprocess.run(
+        [sys.executable, "-m", "cc_swaper", "add", "third", "--no-login"],
+        env=env, cwd=project, capture_output=True, text=True, timeout=5,
+    )
+    assert added.returncode == 0, added.stderr
+    env["FAKE_CHAIN_QUOTA"] = "1"
+    env["FAKE_DISTINCT_MANAGED"] = "1"
+    removal: list[subprocess.CompletedProcess[str]] = []
+    duplicate_resume: list[subprocess.CompletedProcess[str]] = []
+
+    def try_remove_secondary() -> None:
+        removal.append(subprocess.run(
+            [sys.executable, "-m", "cc_swaper", "remove", "secondary"],
+            env=env, cwd=project, capture_output=True, text=True, timeout=5,
+        ))
+        third_dir = tmp_path / "store" / "profiles" / "third" / "projects" / "test-project"
+        third_id = next(third_dir.glob("*.jsonl")).stem
+        digest = hashlib.sha256(third_id.encode()).hexdigest()[:24]
+        lock_path = tmp_path / "store" / "locks" / f"conversation-{digest}.lock"
+        deadline = time.monotonic() + 3
+        locked = False
+        while time.monotonic() < deadline:
+            if lock_path.exists():
+                with lock_path.open("r+") as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        locked = True
+                    else:
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+            if locked:
+                break
+            time.sleep(0.02)
+        assert locked
+        duplicate_resume.append(subprocess.run(
+            [sys.executable, "-m", "cc_swaper", "resume", "--foreground", third_id],
+            env=env, cwd=project, capture_output=True, text=True, timeout=5,
+        ))
+
+    code, output, _ = _run_tty(
+        env, project, terminate_on="THIRD_READY",
+        on_marker=("THIRD_READY", try_remove_secondary),
+    )
+    assert code == 128 + signal.SIGTERM, output
+    assert "SECONDARY_LIMIT" in output and "THIRD_READY" in output
+    assert len(removal) == 1
+    assert removal[0].returncode != 0
+    assert "currently in use" in removal[0].stderr
+    assert len(duplicate_resume) == 1
+    assert duplicate_resume[0].returncode != 0
+    assert "already running" in duplicate_resume[0].stderr
+    assert (tmp_path / "store" / "profiles" / "secondary").is_dir()
+
+
 def test_sigterm_restores_terminal_and_stops_child(tmp_path: Path) -> None:
     env, _, project = _setup(tmp_path)
     env["FAKE_MODE"] = "wait_no_quota"
@@ -635,7 +723,6 @@ def test_detached_tmux_session_keeps_auto_switching(
     socket = "ccs-test-" + uuid.uuid4().hex[:12]
     env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
     env["CC_SWAPER_TMUX_SOCKET"] = socket
-    name = session_name(project)
     try:
         launched = subprocess.run(
             [str(ccs_wrapper), "run"], env=env, cwd=project,
@@ -643,6 +730,7 @@ def test_detached_tmux_session_keeps_auto_switching(
         )
         assert launched.returncode == 0, launched.stderr
         assert "Started background session" in launched.stdout
+        name = _started_session_name(launched.stdout, project)
         sessions_file = tmp_path / "store" / "sessions.json"
         deadline = time.monotonic() + 12
         record = None
@@ -664,7 +752,7 @@ def test_detached_tmux_session_keeps_auto_switching(
         assert snapshot["sessions"][0]["profile"] == "secondary"
     finally:
         subprocess.run(
-            [shutil.which("tmux") or "tmux", "-L", socket, "kill-session", "-t", f"={name}"],
+            [shutil.which("tmux") or "tmux", "-L", socket, "kill-server"],
             env=env, capture_output=True, text=True, check=False,
         )
 
@@ -681,11 +769,11 @@ def test_manual_menu_starts_detached_session_on_selected_profile(tmp_path: Path)
     env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
     env["CC_SWAPER_TMUX_SOCKET"] = socket
     env["FAKE_MODE"] = "wait_after_resume"
-    name = session_name(project)
     try:
         code, output, _ = _run_tty(env, project, ("switch",), choice="2\n")
         assert code == 0, output
         assert "Started background session" in output
+        _started_session_name(output, project)
 
         target_dir = tmp_path / "store" / "profiles" / "secondary" / "projects" / "test-project"
         deadline = time.monotonic() + 12
@@ -704,7 +792,7 @@ def test_manual_menu_starts_detached_session_on_selected_profile(tmp_path: Path)
         assert main_file.read_text() == "original transcript\n"
     finally:
         subprocess.run(
-            [shutil.which("tmux") or "tmux", "-L", socket, "kill-session", "-t", f"={name}"],
+            [shutil.which("tmux") or "tmux", "-L", socket, "kill-server"],
             env=env, capture_output=True, text=True, check=False,
         )
 
@@ -722,7 +810,6 @@ def test_background_attach_detach_and_stop_cleans_child(tmp_path: Path) -> None:
         "TERM": "xterm-256color",
     })
     env.pop("TMUX", None)
-    name = session_name(project)
     tmux = shutil.which("tmux") or "tmux"
     try:
         launched = subprocess.run(
@@ -730,6 +817,7 @@ def test_background_attach_detach_and_stop_cleans_child(tmp_path: Path) -> None:
             capture_output=True, text=True, timeout=6,
         )
         assert launched.returncode == 0, launched.stderr
+        name = _started_session_name(launched.stdout, project)
         deadline = time.monotonic() + 8
         pid_file = Path(env["FAKE_PID_FILE"])
         while time.monotonic() < deadline and not pid_file.exists():
@@ -789,6 +877,112 @@ def test_background_attach_detach_and_stop_cleans_child(tmp_path: Path) -> None:
             pytest.fail("Claude child survived ccs stop")
     finally:
         subprocess.run(
-            [tmux, "-L", socket, "kill-session", "-t", f"={name}"],
+            [tmux, "-L", socket, "kill-server"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_two_background_runs_in_one_project_are_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, fake_home, project = _setup(tmp_path)
+    ccs_wrapper, fake_bin = _ccs_source_wrapper(tmp_path)
+    socket = "ccs-test-" + uuid.uuid4().hex[:12]
+    env.update({
+        "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+        "CC_SWAPER_TMUX_SOCKET": socket,
+        "FAKE_MODE": "wait_no_quota",
+    })
+    tmux = shutil.which("tmux") or "tmux"
+    try:
+        launched = [
+            subprocess.run(
+                [str(ccs_wrapper), "run"], env=env, cwd=project,
+                capture_output=True, text=True, timeout=6,
+            )
+            for _ in range(2)
+        ]
+        assert all(result.returncode == 0 for result in launched), launched
+        names = [_started_session_name(result.stdout, project) for result in launched]
+        assert names[0] != names[1]
+        run_ids = [name.rsplit("-", 1)[1] for name in names]
+
+        sidecar = tmp_path / "store" / "background-sessions.json"
+        deadline = time.monotonic() + 8
+        records = {}
+        while time.monotonic() < deadline:
+            if sidecar.exists():
+                records = json.loads(sidecar.read_text()).get("runs", {})
+            if all(run_id in records and records[run_id].get("path") for run_id in run_ids):
+                break
+            time.sleep(0.1)
+        assert set(run_ids).issubset(records)
+        assert records[run_ids[0]]["id"] != records[run_ids[1]]["id"]
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("PATH", env["PATH"])
+        monkeypatch.setenv("CC_SWAPER_TMUX_SOCKET", socket)
+        snapshot = _snapshot(ProfileStore(tmp_path / "store"))
+        rows = [row for row in snapshot["sessions"] if row["cwd"] == str(project)]
+        assert {row["run_id"] for row in rows} == set(run_ids)
+        assert {row["session_id"] for row in rows} == {
+            records[run_ids[0]]["id"], records[run_ids[1]]["id"],
+        }
+
+        stopped = subprocess.run(
+            [str(ccs_wrapper), "stop", "--session", run_ids[0]],
+            env=env, cwd=project, capture_output=True, text=True, timeout=6,
+        )
+        assert stopped.returncode == 0, stopped.stderr
+        first = subprocess.run(
+            [tmux, "-L", socket, "has-session", "-t", f"={names[0]}"],
+            env=env, capture_output=True, text=True,
+        )
+        second = subprocess.run(
+            [tmux, "-L", socket, "has-session", "-t", f"={names[1]}"],
+            env=env, capture_output=True, text=True,
+        )
+        assert first.returncode != 0 and second.returncode == 0
+        remaining = json.loads(sidecar.read_text())["runs"]
+        assert run_ids[0] not in remaining and run_ids[1] in remaining
+    finally:
+        subprocess.run(
+            [tmux, "-L", socket, "kill-server"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_interactive_run_attaches_new_session_then_detaches_without_stopping(
+    tmp_path: Path,
+) -> None:
+    env, _, project = _setup(tmp_path)
+    _ccs_wrapper, fake_bin = _ccs_source_wrapper(tmp_path)
+    socket = "ccs-test-" + uuid.uuid4().hex[:12]
+    env.update({
+        "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+        "CC_SWAPER_TMUX_SOCKET": socket,
+        "FAKE_MODE": "wait_no_quota",
+        "TERM": "xterm-256color",
+    })
+    env.pop("TMUX", None)
+    tmux = shutil.which("tmux") or "tmux"
+    try:
+        code, output, _ = _run_tty(env, project, ("run",), detach_on="WAITING")
+        assert code == 0, output
+        assert "Detached from background session" in output
+        match = re.search(r"Detached from background session (ccs-[a-z0-9-]+);", output)
+        assert match is not None, output
+        name = match.group(1)
+        assert name.startswith(session_name(project) + "-")
+        still_running = subprocess.run(
+            [tmux, "-L", socket, "has-session", "-t", f"={name}"],
+            env=env, capture_output=True, text=True,
+        )
+        assert still_running.returncode == 0
+    finally:
+        subprocess.run(
+            [tmux, "-L", socket, "kill-server"],
             env=env, capture_output=True, text=True, check=False,
         )

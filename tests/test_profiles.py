@@ -197,7 +197,11 @@ def test_pending_removal_restores_sessions_if_registry_was_not_committed(tmp_pat
     store.set_last_session(
         cwd, "session-1", profile_name="work", transcript_path=transcript
     )
+    run_id = "a1b2c3d4e5f6"
+    conversation_id = "550e8400-e29b-41d4-a716-446655440000"
+    store.set_background_session(run_id, cwd, conversation_id, "work", transcript)
     original_sessions = json.loads((home / "sessions.json").read_text())["sessions"]
+    original_background = store.background_sessions()
     archive = home / "removed"
     archive.mkdir(mode=0o700)
     destination = archive / "work-20260923T000000Z-a1b2c3d4"
@@ -206,15 +210,32 @@ def test_pending_removal_restores_sessions_if_registry_was_not_committed(tmp_pat
         "version": 1, "name": "work", "source": str(managed.config_dir),
         "destination": str(destination), "sessions_existed": True,
         "sessions_before": original_sessions,
+        "background_existed": True, "background_before": original_background,
     }))
     journal.chmod(0o600)
     managed.config_dir.rename(destination)
-    (home / "sessions.json").write_text(json.dumps({"version": 1, "sessions": {}}))
+    other_cwd = tmp_path / "other-project"
+    other_cwd.mkdir()
+    other_id = "550e8400-e29b-41d4-a716-446655440001"
+    other_record = {"id": other_id, "profile": "personal", "path": str(tmp_path / "other.jsonl")}
+    (home / "sessions.json").write_text(json.dumps({
+        "version": 1, "sessions": {str(other_cwd): other_record},
+    }))
+    other_run = {
+        "cwd": str(other_cwd), "id": other_id, "profile": "personal",
+        "transcript_profile": "personal", "path": str(tmp_path / "other.jsonl"),
+    }
+    (home / "background-sessions.json").write_text(json.dumps({
+        "version": 1, "runs": {"b1c2d3e4f5a6": other_run},
+    }))
 
     reopened = ProfileStore(home)
     assert reopened.get("work").config_dir == managed.config_dir
     assert reopened.last_session(cwd) == "session-1"
     assert reopened.last_transcript(cwd) == ("work", transcript)
+    assert reopened.background_session(run_id) == original_background[run_id]
+    assert reopened.last_transcript(other_cwd) == ("personal", Path(other_record["path"]))
+    assert reopened.background_session("b1c2d3e4f5a6") == other_run
 
 
 def test_pending_purge_is_completed_on_next_open(tmp_path: Path) -> None:
@@ -267,6 +288,112 @@ def test_session_metadata_is_global_and_atomic(tmp_path: Path) -> None:
     reopened = ProfileStore(store_home)
     assert reopened.last_session(cwd) == "session-456"
     assert reopened.last_transcript(cwd) == ("personal", transcript)
+
+
+def test_background_session_records_are_independent_in_one_project(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    first_id = "550e8400-e29b-41d4-a716-446655440000"
+    second_id = "550e8400-e29b-41d4-a716-446655440001"
+    first_path = tmp_path / f"{first_id}.jsonl"
+    second_path = tmp_path / f"{second_id}.jsonl"
+    store.set_background_session("a1b2c3d4e5f6", cwd, first_id, "main", first_path)
+    another = ProfileStore(home)
+    another.set_background_session("b1c2d3e4f5a6", cwd, second_id, "main", second_path)
+
+    records = ProfileStore(home).background_sessions()
+    assert set(records) == {"a1b2c3d4e5f6", "b1c2d3e4f5a6"}
+    assert records["a1b2c3d4e5f6"]["id"] == first_id
+    assert records["b1c2d3e4f5a6"]["path"] == str(second_path)
+    assert _mode(home / "background-sessions.json") == 0o600
+
+    store.remove_background_session("a1b2c3d4e5f6")
+    assert set(ProfileStore(home).background_sessions()) == {"b1c2d3e4f5a6"}
+
+
+def test_removing_transcript_owner_prunes_failed_cross_profile_run(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    source = store.add_managed("source")
+    store.add_managed("target")
+    assert source.config_dir is not None
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    transcript = source.config_dir / "projects" / "project" / f"{session_id}.jsonl"
+    store.set_background_session(
+        "a1b2c3d4e5f6", cwd, session_id, "target", transcript,
+        transcript_profile_name="source",
+    )
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    store.remove_managed(
+        "source", archive_to=archive / "source-20260923T000000Z-a1b2c3d4"
+    )
+    assert ProfileStore(home).background_session("a1b2c3d4e5f6") is None
+
+
+def test_no_archive_removal_restores_run_records_after_precommit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("second")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    store.set_last_session(cwd, session_id, profile_name="second", transcript_path=transcript)
+    store.set_background_session("a1b2c3d4e5f6", cwd, session_id, "second", transcript)
+
+    def fail_before_commit(_next_state):
+        raise OSError("state write failed")
+
+    monkeypatch.setattr(store, "_write_state", fail_before_commit)
+    with pytest.raises(OSError, match="state write failed"):
+        store.remove_managed("second")
+    reopened = ProfileStore(home)
+    assert reopened.get("second").config_dir is not None
+    assert reopened.last_session(cwd) == session_id
+    assert reopened.background_session("a1b2c3d4e5f6") is not None
+    assert not (home / "pending-removal.json").exists()
+
+
+def test_no_archive_removal_recovers_after_committed_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    managed = store.add_managed("second")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    store.set_last_session(cwd, session_id, profile_name="second", transcript_path=transcript)
+    store.set_background_session("a1b2c3d4e5f6", cwd, session_id, "second", transcript)
+    original_write = store._write_state
+
+    def fail_after_commit(next_state):
+        original_write(next_state)
+        raise OSError("post-commit fsync failed")
+
+    monkeypatch.setattr(store, "_write_state", fail_after_commit)
+    with pytest.raises(OSError, match="post-commit fsync failed"):
+        store.remove_managed("second")
+    assert (home / "pending-removal.json").exists()
+    reopened = ProfileStore(home)
+    with pytest.raises(KeyError):
+        reopened.get("second")
+    assert managed.config_dir is not None and managed.config_dir.is_dir()
+    assert reopened.last_session(cwd) is None
+    assert reopened.background_session("a1b2c3d4e5f6") is None
+    assert not (home / "pending-removal.json").exists()
 
 
 def test_delayed_selection_preserves_newer_choice_even_after_aba(tmp_path: Path) -> None:
@@ -362,6 +489,51 @@ def test_concurrent_session_updates_keep_different_projects(
         str(projects[0].resolve()): "session-0",
         str(projects[1].resolve()): "session-1",
     }
+
+
+def test_concurrent_background_updates_keep_same_project_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process flock regression requires the fork start method")
+    home = tmp_path / "store"
+    ProfileStore(home).add_default("main")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    run_ids = ["a1b2c3d4e5f6", "b1c2d3e4f5a6"]
+    session_ids = [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "550e8400-e29b-41d4-a716-446655440001",
+    ]
+    original_write = profiles_module._write_json_atomic
+
+    def delayed_write(path: Path, payload: object) -> None:
+        if path.name == "background-sessions.json":
+            time.sleep(0.05)
+        original_write(path, payload)
+
+    monkeypatch.setattr(profiles_module, "_write_json_atomic", delayed_write)
+    context = multiprocessing.get_context("fork")
+    start = context.Barrier(2)
+
+    def update(index: int) -> None:
+        store = ProfileStore(home)
+        start.wait(timeout=5)
+        store.set_background_session(run_ids[index], cwd, session_ids[index], "main")
+
+    workers = [context.Process(target=update, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=5)
+    assert [worker.exitcode for worker in workers] == [0, 0]
+    records = ProfileStore(home).background_sessions()
+    assert set(records) == set(run_ids)
+    assert {record["id"] for record in records.values()} == set(session_ids)
 
 
 @pytest.mark.parametrize(

@@ -103,6 +103,46 @@ def test_launchagent_snapshot_uses_its_absolute_ccs_script(
     assert seen == [fake_ccs]
 
 
+def test_snapshot_keeps_same_project_runs_distinct_and_legacy_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProfileStore(tmp_path / "store")
+    store.add_default("main")
+    store.add_managed("second")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    first_id = "550e8400-e29b-41d4-a716-446655440000"
+    second_id = "550e8400-e29b-41d4-a716-446655440001"
+    store.set_background_session("a1b2c3d4e5f6", cwd, first_id, "main")
+    store.set_background_session("b1c2d3e4f5a6", cwd, second_id, "second")
+    store.set_last_session(cwd, second_id)
+    fake_ccs = tmp_path / "ccs"
+    fake_ccs.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(service, "_trusted_ccs_path", lambda: fake_ccs)
+
+    class FakeTmux:
+        def __init__(self, _store, *, ccs_binary):
+            assert ccs_binary == fake_ccs
+
+        def list_sessions(self):
+            return [
+                {"name": "first", "cwd": str(cwd), "run_id": "a1b2c3d4e5f6", "session_id": first_id,
+                 "initial_profile": "main", "attached": False, "dead": False},
+                {"name": "second", "cwd": str(cwd), "run_id": "b1c2d3e4f5a6", "session_id": second_id,
+                 "initial_profile": "main", "attached": True, "dead": False},
+                {"name": "legacy", "cwd": str(cwd), "run_id": None, "session_id": None,
+                 "initial_profile": "main", "attached": False, "dead": False},
+            ]
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    rows = service._snapshot(store)["sessions"]
+    assert [(row["run_id"], row["session_id"], row["profile"]) for row in rows] == [
+        ("a1b2c3d4e5f6", first_id, "main"),
+        ("b1c2d3e4f5a6", second_id, "second"),
+        (None, None, "main"),
+    ]
+
+
 def test_service_plist_persists_custom_tmux_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,75 @@ def test_run_defaults_to_detached_tmux_session(
     assert "ccs attach" in capsys.readouterr().out
 
 
+def test_foreground_run_rechecks_profile_after_removal_wins_start_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    store.add_managed("second")
+
+    @contextmanager
+    def removal_wins(_store, name, *, exclusive):
+        assert name == "second" and not exclusive
+        store.remove_managed("second")
+        yield
+
+    monkeypatch.setattr(cli, "_profile_lock", removal_wins)
+    with pytest.raises(KeyError):
+        cli._run_session(
+            store, resume=False, explicit_session=None, profile_name="second",
+            no_auto=False, passthrough=[],
+        )
+    assert not (store.home / "sessions.json").exists()
+    assert not (store.home / "background-sessions.json").exists()
+
+
+def test_forged_managed_run_id_outside_ccs_tmux_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    monkeypatch.setenv("CC_SWAPER_RUN_ID", "a1b2c3d4e5f6")
+    monkeypatch.delenv("TMUX", raising=False)
+    store = ProfileStore()
+    store.add_default("main")
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/trusted/claude")
+    monkeypatch.setattr(cli, "_require_login", lambda _profile, _binary: None)
+    assert cli.main(["run", "--foreground"]) == 2
+    assert "only valid inside its cc-swaper tmux socket" in capsys.readouterr().err
+    assert not (store.home / "background-sessions.json").exists()
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+def test_explicit_attach_requires_tty_before_session_creation(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    assert cli.main([command, "--attach"]) == 2
+    assert "requires an interactive terminal" in capsys.readouterr().err
+    assert not (store.home / "sessions.json").exists()
+    assert not (store.home / "background-sessions.json").exists()
+
+
+def test_conversation_lock_is_global_to_a_transcript_id(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "store")
+    first = "550e8400-e29b-41d4-a716-446655440000"
+    second = "550e8400-e29b-41d4-a716-446655440001"
+    with cli._conversation_lock(store, first):
+        with pytest.raises(RuntimeError, match="already running"):
+            with cli._conversation_lock(store, first):
+                pass
+        with cli._conversation_lock(store, second):
+            pass
+
+
 def test_attach_and_stop_target_current_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -46,27 +116,229 @@ def test_attach_and_stop_target_current_project(
     monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
     project = tmp_path / "project"
     project.mkdir()
-    actions: list[tuple[str, Path]] = []
+    actions: list[tuple[str, Path, str]] = []
+    name = "ccs-project-legacy"
 
     class FakeTmux:
         def __init__(self, _store):
             pass
 
-        def exists(self, cwd):
-            return True
+        def list_sessions_for_cwd(self, cwd):
+            return [{"name": name, "run_id": None, "initial_profile": "main", "dead": False}]
 
-        def attach(self, cwd):
-            actions.append(("attach", cwd))
+        def attach(self, cwd, session_name=None):
+            actions.append(("attach", cwd, session_name))
             return 0
 
-        def stop(self, cwd):
-            actions.append(("stop", cwd))
+        def stop(self, cwd, session_name=None):
+            actions.append(("stop", cwd, session_name))
             return 0
 
     monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
     assert cli.main(["attach", "--project", str(project)]) == 0
     assert cli.main(["stop", "--project", str(project)]) == 0
-    assert actions == [("attach", project), ("stop", project)]
+    assert actions == [("attach", project, name), ("stop", project, name)]
+
+
+def test_attach_picker_targets_only_chosen_same_project_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    actions: list[tuple[str, str]] = []
+    sessions = [
+        {"name": "ccs-project-a1b2c3d4e5f6", "run_id": "a1b2c3d4e5f6", "initial_profile": "main", "dead": False},
+        {"name": "ccs-project-b1c2d3e4f5a6", "run_id": "b1c2d3e4f5a6", "initial_profile": "main", "dead": False},
+    ]
+
+    class FakeTmux:
+        def __init__(self, _store):
+            pass
+
+        def list_sessions_for_cwd(self, _cwd):
+            return sessions
+
+        def attach(self, _cwd, session_name=None):
+            actions.append(("attach", session_name))
+            return 0
+
+        def stop(self, _cwd, session_name=None):
+            actions.append(("stop", session_name))
+            return 0
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    menu = Tty()
+    monkeypatch.setattr(cli.sys, "stdin", Tty("2\n"))
+    monkeypatch.setattr(cli.sys, "stdout", menu)
+    assert cli.main(["attach"]) == 0
+    assert "Choose a session to attach" in menu.getvalue()
+    assert actions == [("attach", sessions[1]["name"])]
+
+    assert cli.main(["stop", "--session", "a1b2c3d4e5f6"]) == 0
+    assert actions[-1] == ("stop", sessions[0]["name"])
+
+
+@pytest.mark.parametrize("command", ["attach", "stop"])
+def test_ambiguous_session_requires_selector_when_not_interactive(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    class FakeTmux:
+        def __init__(self, _store):
+            pass
+
+        def list_sessions_for_cwd(self, _cwd):
+            return [
+                {"name": "first", "run_id": "a1b2c3d4e5f6", "dead": False},
+                {"name": "second", "run_id": "b1c2d3e4f5a6", "dead": False},
+            ]
+
+        def attach(self, *_args, **_kwargs):
+            raise AssertionError("ambiguous session was attached")
+
+        def stop(self, *_args, **_kwargs):
+            raise AssertionError("ambiguous session was stopped")
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    assert cli.main([command]) == 2
+    assert f"ccs {command} --session <run-id>" in capsys.readouterr().err
+
+
+def test_resume_attach_reuses_active_conversation_instead_of_starting_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    transcript = tmp_path / ".claude" / "projects" / "test-project" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+    store.set_last_session(project, session_id, profile_name="main", transcript_path=transcript)
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/trusted/claude")
+    monkeypatch.setattr(cli, "_require_login", lambda _profile, _binary: None)
+    actions: list[str] = []
+
+    class FakeTmux:
+        def __init__(self, _store):
+            pass
+
+        def list_sessions_for_cwd(self, _cwd):
+            return [{
+                "name": "ccs-project-a1b2c3d4e5f6", "run_id": "a1b2c3d4e5f6",
+                "session_id": session_id, "dead": False,
+            }]
+
+        def attach(self, _cwd, session_name=None):
+            actions.append(session_name)
+            return 0
+
+        def start(self, *_args, **_kwargs):
+            raise AssertionError("resume opened a duplicate writer")
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    assert cli._background_session(
+        store, mode="resume", profile_name="main", claude_args=[],
+        no_auto=False, attach=True,
+    ) == 0
+    assert actions == ["ccs-project-a1b2c3d4e5f6"]
+
+
+def test_resume_refuses_unknown_legacy_writer_after_new_run_changes_last_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    old_id = "550e8400-e29b-41d4-a716-446655440000"
+    new_id = "550e8400-e29b-41d4-a716-446655440001"
+    root = tmp_path / ".claude" / "projects" / "test-project"
+    root.mkdir(parents=True)
+    for session_id in (old_id, new_id):
+        (root / f"{session_id}.jsonl").touch()
+    store.set_last_session(project, new_id, profile_name="main", transcript_path=root / f"{new_id}.jsonl")
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/trusted/claude")
+    monkeypatch.setattr(cli, "_require_login", lambda _profile, _binary: None)
+
+    class FakeTmux:
+        def __init__(self, _store):
+            pass
+
+        def list_sessions_for_cwd(self, _cwd):
+            return [
+                {"name": "ccs-project-legacy", "run_id": None, "session_id": None, "dead": False},
+                {"name": "ccs-project-a1b2c3d4e5f6", "run_id": "a1b2c3d4e5f6",
+                 "session_id": new_id, "dead": False},
+            ]
+
+        def attach(self, *_args, **_kwargs):
+            raise AssertionError("unverified legacy transcript was attached")
+
+        def start(self, *_args, **_kwargs):
+            raise AssertionError("duplicate legacy writer was started")
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    with pytest.raises(RuntimeError, match="legacy background session is active"):
+        cli._background_session(
+            store, mode="resume", profile_name="main", claude_args=[],
+            source_session_id=old_id, no_auto=False, attach=True,
+        )
+
+
+def test_resume_refuses_sole_unknown_legacy_session_without_last_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/trusted/claude")
+    monkeypatch.setattr(cli, "_require_login", lambda _profile, _binary: None)
+    attached: list[str] = []
+
+    class FakeTmux:
+        def __init__(self, _store):
+            pass
+
+        def list_sessions_for_cwd(self, _cwd):
+            return [{"name": "ccs-project-legacy", "run_id": None,
+                     "session_id": None, "dead": False}]
+
+        def attach(self, _cwd, session_name=None):
+            attached.append(session_name)
+            return 0
+
+    monkeypatch.setattr("cc_swaper.tmux_sessions.TmuxSessions", FakeTmux)
+    with pytest.raises(RuntimeError, match="conversation ID is unknown"):
+        cli._background_session(
+            store, mode="resume", profile_name="main", claude_args=[],
+            no_auto=False, attach=True,
+        )
+    assert attached == []
 
 
 def test_status_escapes_terminal_control_characters(

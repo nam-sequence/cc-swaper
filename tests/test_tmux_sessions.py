@@ -59,6 +59,8 @@ class FakeTmux:
                             str(state["attached"]),
                             str(options.get("@ccs_cwd", "")),
                             str(options.get("@ccs_initial_profile", "")),
+                            str(options.get("@ccs_run_id", "")),
+                            str(options.get("@ccs_session_id", "")),
                         ]
                     )
                 )
@@ -129,12 +131,15 @@ def test_session_name_uses_canonical_path_slug_and_digest(tmp_path: Path) -> Non
     assert len(first.rsplit("-", 1)[-1]) == 12
 
 
-def test_start_pins_profile_binary_quotes_args_and_rejects_duplicate(
+def test_start_pins_profile_binary_quotes_args_and_tags_invocation(
     manager: tuple[TmuxSessions, FakeTmux, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, root = manager
     project = root / "project with spaces; $HOME"
     project.mkdir()
+    monkeypatch.setenv("CC_SWAPER_RUN_ID", "caller-controlled")
+    run_session_id = "550e8400-e29b-41d4-a716-446655440000"
 
     name = sessions.start(
         project,
@@ -142,24 +147,37 @@ def test_start_pins_profile_binary_quotes_args_and_rejects_duplicate(
         "run",
         ["--model", "sonnet; echo unsafe", "--label", "a b"],
         no_auto=True,
+        run_session_id=run_session_id,
     )
+    assert name.startswith(f"{session_name(project)}-")
+    run_id = name.removeprefix(f"{session_name(project)}-")
+    assert len(run_id) == 12
+    assert all(character in "0123456789abcdef" for character in run_id)
     command = fake.sessions[name]["command"]
     assert isinstance(command, str)
     parsed = shlex.split(command)
     profile = sessions.store.get("work")
-    assert parsed[:10] == [
+    assert parsed[:6] == [
         "/usr/bin/env",
         f"CC_SWAPER_CLAUDE_BIN={root / 'bin' / 'claude'}",
         f"CC_SWAPER_HOME={sessions.store.home}",
+        f"CC_SWAPER_RUN_ID={run_id}",
         "CC_SWAPER_TMUX_SOCKET=test-cc-swaper",
         f"CLAUDE_CONFIG_DIR={profile.config_dir}",
+    ]
+    ccs_index = parsed.index(str(root / "bin" / "ccs"))
+    assert parsed[ccs_index : ccs_index + 7] == [
         str(root / "bin" / "ccs"),
         "run",
         "--foreground",
         "--profile",
         "work",
+        "--managed-session-id",
+        parsed[ccs_index + 6],
     ]
-    assert parsed[10:] == [
+    session_id = parsed[parsed.index("--managed-session-id") + 1]
+    assert session_id == run_session_id
+    assert parsed[ccs_index + 7 :] == [
         "--no-auto",
         "--",
         "--model",
@@ -171,13 +189,20 @@ def test_start_pins_profile_binary_quotes_args_and_rejects_duplicate(
         "remain-on-exit": "on",
         "@ccs_cwd": str(project.resolve()),
         "@ccs_initial_profile": "work",
+        "@ccs_run_id": run_id,
+        "@ccs_session_id": session_id,
     }
     assert fake.calls[0][1:3] == ["-L", "test-cc-swaper"]
     assert not any(key.startswith("ANTHROPIC_") for key in fake.environments[0])
+    assert "CC_SWAPER_RUN_ID" not in fake.environments[0]
     assert sessions.exists(project)
 
-    with pytest.raises(RuntimeError, match="already exists"):
-        sessions.start(project, "work", "run", [])
+    sibling = sessions.start(project, "work", "run", [])
+    assert sibling != name
+    listed = sessions.list_sessions_for_cwd(project)
+    assert len(listed) == 2
+    generated_id = next(item["session_id"] for item in listed if item["name"] == sibling)
+    assert isinstance(generated_id, str) and len(generated_id) == 36
 
 
 def test_resume_explicit_id_switch_order_and_attach_stop(
@@ -192,13 +217,14 @@ def test_resume_explicit_id_switch_order_and_attach_stop(
         project,
         "work",
         "resume",
-        [session_id],
+        [],
         detach=False,
         no_auto=True,
+        source_session_id=session_id,
     )
     command = shlex.split(fake.sessions[name]["command"])
     ccs_index = command.index(str(root / "bin" / "ccs"))
-    assert command[ccs_index : ccs_index + 8] == [
+    assert command[ccs_index : ccs_index + 7] == [
         str(root / "bin" / "ccs"),
         "resume",
         "--foreground",
@@ -213,7 +239,7 @@ def test_resume_explicit_id_switch_order_and_attach_stop(
     assert not sessions.exists(project)
 
 
-def test_start_replaces_a_retained_dead_session(
+def test_start_creates_new_invocation_without_removing_dead_sibling(
     manager: tuple[TmuxSessions, FakeTmux, Path],
 ) -> None:
     sessions, fake, root = manager
@@ -224,8 +250,10 @@ def test_start_replaces_a_retained_dead_session(
 
     second = sessions.start(project, "main", "run", [])
 
-    assert second == first
-    assert len([call for call in fake.calls if call[3] == "new-session"]) == 2
+    assert second != first
+    assert first in fake.sessions and second in fake.sessions
+    assert len(sessions.list_sessions_for_cwd(project)) == 2
+    assert next(item for item in sessions.list_sessions_for_cwd(project) if item["name"] == first)["dead"]
 
 
 def test_list_sessions_exposes_tags_attached_and_dead_state(
@@ -250,6 +278,8 @@ def test_list_sessions_exposes_tags_attached_and_dead_state(
             "cwd": str(project.resolve()),
             "initial_profile": "main",
             "profile": "main",
+            "run_id": name.removeprefix(f"{session_name(project)}-"),
+            "session_id": None,
             "attached": False,
             "dead": True,
         }
@@ -262,6 +292,38 @@ def test_list_sessions_exposes_tags_attached_and_dead_state(
         "--foreground",
         "main",
     ]
+
+
+def test_switch_passes_source_session_id_and_token_safely(
+    manager: tuple[TmuxSessions, FakeTmux, Path],
+) -> None:
+    sessions, fake, root = manager
+    project = root / "switch"
+    project.mkdir()
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    name = sessions.start(
+        project,
+        "work",
+        "switch",
+        ["--model", "sonnet; echo unsafe"],
+        source_session_id=session_id,
+        selection_token="token with spaces; echo unsafe",
+    )
+    command = shlex.split(fake.sessions[name]["command"])
+    ccs_index = command.index(str(root / "bin" / "ccs"))
+    assert command[ccs_index : ccs_index + 8] == [
+        str(root / "bin" / "ccs"),
+        "switch",
+        "--foreground",
+        "work",
+        "--source-session",
+        session_id,
+        "--selection-token",
+        "token with spaces; echo unsafe",
+    ]
+    assert "sonnet; echo unsafe" in command
+    assert fake.sessions[name]["options"]["@ccs_session_id"] == session_id
 
 
 def test_attach_uses_attach_across_tmux_sockets_and_switch_within_same_socket(
@@ -295,10 +357,61 @@ def test_predictable_name_without_ccs_metadata_is_not_attached_or_killed(
         "options": {}, "attached": 0, "dead": True,
     }
 
+    created = sessions.start(project, "main", "run", [])
+    assert created != name
+    assert sessions.list_sessions_for_cwd(project) == [
+        item for item in sessions.list_sessions() if item["name"] == created
+    ]
     with pytest.raises(RuntimeError, match="invalid cc-swaper metadata"):
-        sessions.start(project, "main", "run", [])
+        sessions.attach(project, session_name=name)
     with pytest.raises(RuntimeError, match="invalid cc-swaper metadata"):
-        sessions.attach(project)
-    with pytest.raises(RuntimeError, match="invalid cc-swaper metadata"):
-        sessions.stop(project)
+        sessions.stop(project, session_name=name)
     assert name in fake.sessions
+
+
+def test_legacy_session_is_listed_and_implicitly_selected_when_unique(
+    manager: tuple[TmuxSessions, FakeTmux, Path],
+) -> None:
+    sessions, fake, root = manager
+    project = root / "legacy"
+    project.mkdir()
+    name = session_name(project)
+    fake.sessions[name] = {
+        "cwd": str(project.resolve()),
+        "command": "ccs run --foreground",
+        "options": {
+            "@ccs_cwd": str(project.resolve()),
+            "@ccs_initial_profile": "main",
+        },
+        "attached": 0,
+        "dead": False,
+    }
+
+    listed = sessions.list_sessions_for_cwd(project)
+    assert len(listed) == 1
+    assert listed[0]["name"] == name
+    assert listed[0]["run_id"] is None
+    assert sessions.attach(project) == 0
+    assert sessions.stop(project) == 0
+    assert name not in fake.sessions
+
+
+def test_ambiguous_attach_and_stop_require_exact_selector(
+    manager: tuple[TmuxSessions, FakeTmux, Path],
+) -> None:
+    sessions, fake, root = manager
+    project = root / "ambiguous"
+    project.mkdir()
+    first = sessions.start(project, "main", "run", [])
+    second = sessions.start(project, "main", "run", [])
+
+    with pytest.raises(RuntimeError, match="multiple background sessions"):
+        sessions.attach(project)
+    with pytest.raises(RuntimeError, match="multiple background sessions"):
+        sessions.stop(project)
+
+    first_record = next(item for item in sessions.list_sessions_for_cwd(project) if item["name"] == first)
+    assert sessions.stop(project, run_id=first_record["run_id"]) == 0
+    assert first not in fake.sessions
+    assert second in fake.sessions
+    assert sessions.attach(project, session_name=second) == 0

@@ -18,7 +18,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Iterator
 
@@ -140,7 +140,7 @@ def _reported_transcript(profile: Profile, session_id: str | None, path: Path | 
 
 
 @contextmanager
-def _project_lock(store: ProfileStore, cwd: Path) -> Iterator[None]:
+def _conversation_lock(store: ProfileStore, session_id: str) -> Iterator[None]:
     lock_dir = store.home / "locks"
     if lock_dir.is_symlink():
         raise RuntimeError(f"unsafe lock directory: {lock_dir}")
@@ -148,8 +148,8 @@ def _project_lock(store: ProfileStore, cwd: Path) -> Iterator[None]:
     lock_info = lock_dir.stat()
     if lock_info.st_uid != os.getuid() or stat.S_IMODE(lock_info.st_mode) & 0o077:
         raise RuntimeError(f"lock directory is not private: {lock_dir}")
-    digest = hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:24]
-    path = lock_dir / f"{digest}.lock"
+    digest = hashlib.sha256(_session_id(session_id).encode()).hexdigest()[:24]
+    path = lock_dir / f"conversation-{digest}.lock"
     fd = os.open(
         path,
         os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
@@ -162,7 +162,9 @@ def _project_lock(store: ProfileStore, cwd: Path) -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError("another ccs session is already running in this directory") from exc
+            raise RuntimeError(
+                "this Claude conversation is already running; use 'ccs attach'"
+            ) from exc
         yield
     finally:
         os.close(fd)
@@ -244,6 +246,33 @@ def _choose_profile_name(store: ProfileStore, command: str) -> str | None:
         print(f"Invalid choice. Enter a number from 1 to {len(profiles)}, or 0 to cancel.")
 
 
+def _choose_managed_session(sessions: list[dict[str, object]], action: str) -> str | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise RuntimeError(
+            f"multiple sessions exist in this project; use 'ccs {action} --session <run-id>'"
+        )
+    print(f"Choose a session to {action}:")
+    for index, item in enumerate(sessions, start=1):
+        state = "exited" if item.get("dead") else (
+            "attached" if item.get("attached") else "detached"
+        )
+        run_id = item.get("run_id") or "legacy"
+        profile = item.get("initial_profile") or "?"
+        print(f"  {index}. {run_id}  {profile}  {state}  {item['name']}")
+    print("  0. Cancel")
+    while True:
+        try:
+            choice = input("Enter a session number: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not choice or choice == "0":
+            return None
+        if choice.isdecimal() and 1 <= int(choice) <= len(sessions):
+            return str(sessions[int(choice) - 1]["name"])
+        print(f"Invalid choice. Enter a number from 1 to {len(sessions)}, or 0 to cancel.")
+
+
 def _encode_selection_snapshot(snapshot: SelectionSnapshot) -> str:
     return json.dumps(
         {"name": snapshot.name, "revision": snapshot.revision}, separators=(",", ":")
@@ -311,26 +340,65 @@ def _background_session(
     claude_args: list[str],
     no_auto: bool,
     selection_snapshot: SelectionSnapshot | None = None,
+    source_session_id: str | None = None,
+    attach: bool = False,
 ) -> int:
     from .tmux_sessions import TmuxSessions
 
     profile = store.get(profile_name)
-    _require_login(profile, claude_binary())
     cwd = Path.cwd().resolve()
+    manager = TmuxSessions(store)
     if mode in {"resume", "switch"}:
-        explicit = claude_args[0] if mode == "resume" and claude_args else None
+        explicitly_chosen_source = source_session_id is not None or (
+            mode == "resume" and bool(claude_args)
+        )
+        active = [item for item in manager.list_sessions_for_cwd(cwd) if not item.get("dead")]
+        unknown_legacy = [
+            item for item in active
+            if item.get("run_id") is None and item.get("session_id") is None
+        ]
+        explicit = source_session_id or (claude_args[0] if mode == "resume" and claude_args else None)
+        if explicit is None and store.last_session(cwd) is None and unknown_legacy:
+            raise RuntimeError(
+                "a legacy background session is active but its conversation ID is unknown; "
+                f"use 'ccs attach --session {unknown_legacy[0]['name']}'"
+            )
         session_id = _session_id(explicit or store.last_session(cwd) or "")
         if _transcript(store, session_id) is None:
             raise RuntimeError(f"transcript for {session_id} was not found")
+        for item in active:
+            run_id = item.get("run_id")
+            record = store.background_session(run_id) if isinstance(run_id, str) else None
+            active_id = record.get("id") if record else item.get("session_id")
+            if active_id is None and run_id is None:
+                continue
+            if active_id == session_id:
+                if mode == "resume" and attach:
+                    return manager.attach(cwd, session_name=str(item["name"]))
+                raise RuntimeError(
+                    f"conversation {session_id} is already active; "
+                    f"use 'ccs attach --session {item['name']}'"
+                )
+        if unknown_legacy:
+            raise RuntimeError(
+                "a legacy background session is active and its conversation ID cannot be verified; "
+                f"use 'ccs attach --session {unknown_legacy[0]['name']}' or stop it before resuming"
+            )
+    _require_login(profile, claude_binary())
     extra = (
         {"selection_token": _encode_selection_snapshot(selection_snapshot)}
         if selection_snapshot is not None else {}
     )
-    name = TmuxSessions(store).start(
-        cwd, profile.name, mode, claude_args, detach=True, no_auto=no_auto, **extra
+    if mode in {"resume", "switch"}:
+        extra["source_session_id"] = session_id
+    name = manager.start(
+        cwd, profile.name, mode, claude_args, detach=not attach, no_auto=no_auto, **extra
     )
-    print(f"Started background session {name}.")
-    print("Use 'ccs attach' to interact; detach with Ctrl-b d.")
+    if attach:
+        print(f"Detached from background session {name}; it is still running.")
+    else:
+        print(f"Started background session {name}.")
+        print(f"Use 'ccs attach --session {name}' to interact; detach with Ctrl-b d.")
     return 0
 
 
@@ -344,6 +412,36 @@ def _run_session(
     passthrough: list[str],
     continue_now: bool = False,
     selection_snapshot: SelectionSnapshot | None = None,
+    managed_session_id: str | None = None,
+) -> int:
+    chosen = _select_profile(store, profile_name)
+    with ExitStack() as lifetime_locks:
+        lifetime_locks.enter_context(_profile_lock(store, chosen.name, exclusive=False))
+        # A removal can win before the lock. Reload after acquisition so an
+        # archived or replaced profile is never launched from a stale object.
+        store.get_fresh(chosen.name)
+        return _run_session_impl(
+            store, resume=resume, explicit_session=explicit_session,
+            profile_name=chosen.name, no_auto=no_auto, passthrough=passthrough,
+            continue_now=continue_now, selection_snapshot=selection_snapshot,
+            managed_session_id=managed_session_id,
+            lifetime_locks=lifetime_locks, locked_profiles={chosen.name},
+        )
+
+
+def _run_session_impl(
+    store: ProfileStore,
+    *,
+    resume: bool,
+    explicit_session: str | None,
+    profile_name: str | None,
+    no_auto: bool,
+    passthrough: list[str],
+    continue_now: bool = False,
+    selection_snapshot: SelectionSnapshot | None = None,
+    managed_session_id: str | None = None,
+    lifetime_locks: ExitStack,
+    locked_profiles: set[str],
 ) -> int:
     binary = claude_binary()
     profile = _select_profile(store, profile_name)
@@ -357,7 +455,17 @@ def _run_session(
     ):
         raise RuntimeError("Claude Code simple/safe mode disables hooks required for auto-switch")
     cwd = Path.cwd().resolve()
+    run_id = os.environ.get("CC_SWAPER_RUN_ID")
+    if run_id is not None and not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        raise ValueError("invalid managed run ID")
+    if run_id is not None:
+        tmux_socket = os.environ.get("TMUX", "").split(",", 1)[0]
+        expected_socket = os.environ.get("CC_SWAPER_TMUX_SOCKET", "cc-swaper")
+        if Path(tmux_socket).name != expected_socket:
+            raise RuntimeError("managed run ID is only valid inside its cc-swaper tmux socket")
     if resume:
+        if managed_session_id is not None:
+            raise ValueError("managed session ID cannot be used with resume")
         session_id = _session_id(explicit_session or store.last_session(cwd) or "")
         recorded = store.last_transcript(cwd) if explicit_session is None else None
         if recorded is not None:
@@ -380,11 +488,23 @@ def _run_session(
         if continue_now:
             initial_args.append(CONTINUATION_PROMPT)
     else:
-        session_id = str(uuid.uuid4())
+        session_id = _session_id(managed_session_id) if managed_session_id else str(uuid.uuid4())
         initial_args = [*claude_args, "--session-id", session_id]
         forked = False
 
-    with _project_lock(store, cwd):
+    source_owner = _transcript_owner(store, transcript) if resume else None
+    if source_owner is not None and source_owner not in locked_profiles:
+        lifetime_locks.enter_context(_profile_lock(store, source_owner, exclusive=False))
+        locked_profiles.add(source_owner)
+        store.get_fresh(source_owner)
+    locked_conversations = {session_id}
+
+    def hold_conversation(new_id: str) -> None:
+        if new_id not in locked_conversations:
+            lifetime_locks.enter_context(_conversation_lock(store, new_id))
+            locked_conversations.add(new_id)
+
+    with _conversation_lock(store, session_id):
         if resume:
             owner_name = _transcript_owner(store, transcript)
             if owner_name is None or not _safe_transcript(
@@ -396,6 +516,11 @@ def _run_session(
             )
         else:
             store.set_last_session(cwd, session_id)
+        if run_id is not None:
+            store.set_background_session(
+                run_id, cwd, session_id, profile.name, transcript if resume else None,
+                transcript_profile_name=source_owner if resume else profile.name,
+            )
         needs_initial_select = selection_snapshot is not None
 
         def mark_selected() -> None:
@@ -406,30 +531,51 @@ def _run_session(
                 needs_initial_select = False
 
         attempted = {profile.name}
+        pending_selection: str | None = None
         while True:
             print(f"\r\nccs: Claude Code profile '{profile.name}'\r\n", file=sys.stderr)
             with tempfile.TemporaryDirectory(prefix="run-", dir=store.home) as run_dir:
                 event_file = Path(run_dir) / "events.jsonl"
                 event_file.touch(mode=0o600)
                 with _profile_lock(store, profile.name, exclusive=False):
+                    profile = store.get_fresh(profile.name)
+                    _require_login(profile, binary)
+                    if pending_selection == profile.name:
+                        store.select(profile.name)
+                        pending_selection = None
                     with HookMonitor(
                         event_file,
                         profile_projects=_projects_dir(profile),
                         expected_session_id=None if forked else session_id,
                     ) as monitor:
+                        recorded_started_id: str | None = None
+
+                        def on_started() -> None:
+                            nonlocal recorded_started_id
+                            if monitor.session_id is not None:
+                                hold_conversation(monitor.session_id)
+                            mark_selected()
+                            if (
+                                run_id is not None
+                                and monitor.session_id is not None
+                                and monitor.session_id != recorded_started_id
+                            ):
+                                store.set_background_session(
+                                    run_id, cwd, monitor.session_id, profile.name,
+                                    monitor.transcript_path,
+                                )
+                                recorded_started_id = monitor.session_id
+
                         launch_args = ["--settings", hook_settings(event_file), *initial_args]
                         if no_auto:
                             environment = profile_environment(profile)
-                            if needs_initial_select:
-                                code = run_passthrough(
-                                    binary, launch_args, environment, monitor=monitor,
-                                    on_session_started=mark_selected,
-                                )
-                            else:
-                                code = run_passthrough(binary, launch_args, environment)
+                            code = run_passthrough(
+                                binary, launch_args, environment, monitor=monitor,
+                                on_session_started=on_started,
+                            )
                             monitor.poll()
                             if monitor.session_id is not None or code == 0:
-                                mark_selected()
+                                on_started()
                             if monitor.session_id and _reported_transcript(
                                 profile, monitor.session_id, monitor.transcript_path
                             ):
@@ -437,15 +583,21 @@ def _run_session(
                                     cwd, monitor.session_id, profile_name=profile.name,
                                     transcript_path=monitor.transcript_path,
                                 )
+                                if run_id is not None:
+                                    store.set_background_session(
+                                        run_id, cwd, monitor.session_id, profile.name,
+                                        monitor.transcript_path,
+                                    )
                             return code
                         result = run_interactive(
                             binary,
                             launch_args,
                             profile_environment(profile),
                             monitor=monitor,
-                            on_session_started=mark_selected if needs_initial_select else None,
+                            on_session_started=on_started,
                         )
             if result.session_id:
+                hold_conversation(result.session_id)
                 reported = _reported_transcript(
                     profile, result.session_id, result.transcript_path
                 )
@@ -454,6 +606,10 @@ def _run_session(
                     store.set_last_session(
                         cwd, session_id, profile_name=profile.name, transcript_path=reported
                     )
+                    if run_id is not None:
+                        store.set_background_session(
+                            run_id, cwd, session_id, profile.name, reported
+                        )
             if not result.exhausted:
                 return result.returncode
             if forked and result.session_id is None:
@@ -477,8 +633,13 @@ def _run_session(
                     f"all signed-in profiles have been tried; resume session {session_id} after a limit resets",
                     75,
                 )
-            store.select(following.name)
+            if following.name not in locked_profiles:
+                lifetime_locks.enter_context(_profile_lock(store, following.name, exclusive=False))
+                locked_profiles.add(following.name)
+            following = store.get_fresh(following.name)
+            _require_login(following, binary)
             profile = following
+            pending_selection = following.name
             attempted.add(profile.name)
             print(
                 f"\r\nccs: usage limit detected; resuming session {session_id} with '{profile.name}'\r\n",
@@ -515,22 +676,32 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="start an interactive Claude Code session")
     run.add_argument("--profile")
     run.add_argument("--foreground", action="store_true", help="run directly in this terminal")
+    run_output = run.add_mutually_exclusive_group()
+    run_output.add_argument("--attach", action="store_true", help="attach to the new background session")
+    run_output.add_argument("--detach", action="store_true", help="return to the shell after starting")
     run.add_argument("--no-auto", action="store_true", help="do not switch on usage limit")
+    run.add_argument("--managed-session-id", help=argparse.SUPPRESS)
     run.add_argument("claude_args", nargs=argparse.REMAINDER)
     resume = commands.add_parser("resume", help="resume the last session in this directory")
     resume.add_argument("session", nargs="?", help="optional session UUID")
     resume.add_argument("--profile")
     resume.add_argument("--foreground", action="store_true", help="run directly in this terminal")
+    resume_output = resume.add_mutually_exclusive_group()
+    resume_output.add_argument("--attach", action="store_true", help="attach to the resumed background session")
+    resume_output.add_argument("--detach", action="store_true", help="return to the shell after starting")
     resume.add_argument("--no-auto", action="store_true")
     switch = commands.add_parser("switch", help="select another profile and continue the last session")
     switch.add_argument("name", nargs="?", help="profile name (omit to choose from a list)")
     switch.add_argument("--foreground", action="store_true", help="run directly in this terminal")
     switch.add_argument("--no-auto", action="store_true")
     switch.add_argument("--selection-token", help=argparse.SUPPRESS)
+    switch.add_argument("--source-session", help=argparse.SUPPRESS)
     attach = commands.add_parser("attach", help="attach to this project's background session")
     attach.add_argument("--project", type=Path)
+    attach.add_argument("--session", help="managed run ID or full tmux session name")
     stop = commands.add_parser("stop", help="stop this project's background session")
     stop.add_argument("--project", type=Path)
+    stop.add_argument("--session", help="managed run ID or full tmux session name")
     native = commands.add_parser("native", help="run a native Claude command with the selected profile")
     native.add_argument("claude_args", nargs=argparse.REMAINDER)
     shell_command = commands.add_parser("shell", help="manage the interactive Zsh claude wrapper")
@@ -642,8 +813,9 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(session, dict):
                     attachment = "exited" if session.get("dead") else ("attached" if session.get("attached") else "detached")
                     fields = (
-                        session.get("name") or "?", attachment,
+                        session.get("run_id") or "legacy", session.get("name") or "?", attachment,
                         session.get("profile") or "?", session.get("cwd") or "?",
+                        session.get("session_id") or "?",
                     )
                     print("  ".join(json.dumps(str(value), ensure_ascii=True) for value in fields))
             if state.get("error"):
@@ -751,9 +923,39 @@ def main(argv: list[str] | None = None) -> int:
 
             cwd = (args.project or Path.cwd()).resolve()
             manager = TmuxSessions(store)
-            if not manager.exists(cwd):
-                raise RuntimeError(f"no background session for {cwd}")
-            return manager.attach(cwd) if args.command == "attach" else manager.stop(cwd)
+            candidates = manager.list_sessions_for_cwd(cwd)
+            if args.command == "attach":
+                candidates = [item for item in candidates if not item.get("dead")]
+            if not candidates:
+                raise RuntimeError(f"no {'active ' if args.command == 'attach' else ''}background session for {cwd}")
+            if args.session:
+                selected = next(
+                    (
+                        item for item in candidates
+                        if item.get("run_id") == args.session or item.get("name") == args.session
+                    ),
+                    None,
+                )
+                if selected is None:
+                    raise RuntimeError(f"managed session '{args.session}' was not found in {cwd}")
+                target = str(selected["name"])
+            elif len(candidates) == 1:
+                selected = candidates[0]
+                target = str(selected["name"])
+            else:
+                target = _choose_managed_session(candidates, args.command)
+                if target is None:
+                    print("Session selection canceled.")
+                    return 0
+                selected = next(item for item in candidates if item["name"] == target)
+            result = (
+                manager.attach(cwd, session_name=target)
+                if args.command == "attach"
+                else manager.stop(cwd, session_name=target)
+            )
+            if result == 0 and args.command == "stop" and isinstance(selected.get("run_id"), str):
+                store.remove_background_session(str(selected["run_id"]))
+            return result
         if args.command == "remove":
             profile = store.get(args.name)
             if profile.config_dir is None:
@@ -806,31 +1008,52 @@ def main(argv: list[str] | None = None) -> int:
                     store, mode="switch", profile_name=name,
                     claude_args=[], no_auto=args.no_auto,
                     selection_snapshot=selection_snapshot,
+                    source_session_id=args.source_session,
                 )
             return _run_session(
-                store, resume=True, explicit_session=None, profile_name=name,
+                store, resume=True, explicit_session=args.source_session, profile_name=name,
                 no_auto=args.no_auto, passthrough=[], continue_now=True,
                 selection_snapshot=selection_snapshot,
             )
         if args.command == "run":
+            if args.managed_session_id is not None and not args.foreground:
+                raise ValueError("managed session ID requires --foreground")
+            if args.foreground and (args.attach or args.detach):
+                raise ValueError("--foreground cannot be combined with --attach or --detach")
+            if args.attach and not (sys.stdin.isatty() and sys.stdout.isatty()):
+                raise ValueError("--attach requires an interactive terminal; use --detach instead")
             forwarded = _claude_args(args.claude_args, auto=not args.no_auto)
             direct_only = any(arg in {"-p", "--print", "--bg", "--background"} for arg in forwarded)
+            if direct_only and args.attach:
+                raise ValueError("--attach requires an interactive Claude session")
             if not args.foreground and not direct_only:
+                attach = args.attach or (
+                    not args.detach and sys.stdin.isatty() and sys.stdout.isatty()
+                )
                 chosen = args.profile or store.selected().name
                 return _background_session(
                     store, mode="run", profile_name=chosen,
-                    claude_args=forwarded, no_auto=args.no_auto,
+                    claude_args=forwarded, no_auto=args.no_auto, attach=attach,
                 )
             return _run_session(
                 store, resume=False, explicit_session=None, profile_name=args.profile,
                 no_auto=args.no_auto, passthrough=args.claude_args,
+                managed_session_id=args.managed_session_id,
             )
         if args.command == "resume":
+            if args.foreground and (args.attach or args.detach):
+                raise ValueError("--foreground cannot be combined with --attach or --detach")
+            if args.attach and not (sys.stdin.isatty() and sys.stdout.isatty()):
+                raise ValueError("--attach requires an interactive terminal; use --detach instead")
             if not args.foreground:
+                attach = args.attach or (
+                    not args.detach and sys.stdin.isatty() and sys.stdout.isatty()
+                )
                 chosen = args.profile or store.selected().name
                 return _background_session(
                     store, mode="resume", profile_name=chosen,
                     claude_args=[args.session] if args.session else [], no_auto=args.no_auto,
+                    attach=attach,
                 )
             return _run_session(
                 store, resume=True, explicit_session=args.session, profile_name=args.profile,

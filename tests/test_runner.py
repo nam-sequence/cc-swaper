@@ -26,12 +26,14 @@ def test_profile_environment_omits_default_config_and_credential_overrides(
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: secret")
     monkeypatch.setenv("NODE_OPTIONS", "--require ./malicious.js")
+    monkeypatch.setenv("CC_SWAPER_RUN_ID", "a1b2c3d4e5f6")
 
     default_env = profile_environment(Profile("main", None))
     assert "CLAUDE_CONFIG_DIR" not in default_env
     assert not any(key in default_env for key in (
         "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
         "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "NODE_OPTIONS",
+        "CC_SWAPER_RUN_ID",
     ))
     config_dir = tmp_path / "second"
     config_dir.mkdir()
