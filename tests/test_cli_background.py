@@ -107,7 +107,7 @@ def test_switch_without_name_offers_numbered_profiles_and_keeps_named_form(
     )
 
     assert cli.main(["switch"]) == 0
-    assert "1. main (đang chọn)" in output.getvalue()
+    assert "1. main (selected)" in output.getvalue()
     assert "2. second" in output.getvalue()
     assert calls[0]["profile_name"] == "second"
     # The detached child owns selection once its Claude session starts.

@@ -13,7 +13,7 @@ def _clean(value: object) -> str:
 
 def _bar(value: object, width: int = 10) -> str:
     if not isinstance(value, int) or isinstance(value, bool):
-        return "chưa có dữ liệu"
+        return "No data"
     filled = min(width, max(0, (value * width + 50) // 100))
     return f"[{'█' * filled}{'░' * (width - filled)}] {value}%"
 
@@ -65,9 +65,9 @@ def render_usage_table(
             report = reports.get(name)
             account = name
             if report is None:
-                rows.append((account, "—", "—", pending.get(name, "Đang tải")))
+                rows.append((account, "—", "—", pending.get(name, "Loading")))
             elif "error" in report:
-                rows.append((account, "—", "—", f"Lỗi: {report['error']}"))
+                rows.append((account, "—", "—", f"Error: {report['error']}"))
             else:
                 plan = report.get("plan")
                 if plan:
@@ -77,8 +77,8 @@ def render_usage_table(
                 five_percent = five_hour.get("used_percent") if isinstance(five_hour, dict) else None
                 seven_percent = seven_day.get("used_percent") if isinstance(seven_day, dict) else None
                 rows.append((account, _bar(five_percent, bar_width),
-                             _bar(seven_percent, bar_width), "✓ Xong"))
-        return _grid(("Account", "5 giờ", "7 ngày", "Trạng thái"), rows, widths)
+                             _bar(seven_percent, bar_width), "✓ Done"))
+        return _grid(("Account", "5-hour", "7-day", "Status"), rows, widths)
 
     if columns < 80:
         widths = (9, 12, 16, max(12, columns - 9 - 12 - 16 - 13))
@@ -90,22 +90,22 @@ def render_usage_table(
     for name in names:
         report = reports.get(name)
         if report is None:
-            rows.append((name, "5 giờ / 7 ngày", "—", pending.get(name, "Đang tải")))
+            rows.append((name, "5-hour / 7-day", "—", pending.get(name, "Loading")))
             continue
         if "error" in report:
-            rows.append((name, "Lỗi", "—", str(report["error"])))
+            rows.append((name, "Error", "—", str(report["error"])))
             continue
         plan = report.get("plan")
         account = f"{name} ({plan})" if plan else name
         metrics: list[tuple[str, object]] = [
-            ("5 giờ", report.get("five_hour")),
-            ("7 ngày", report.get("seven_day")),
+            ("5-hour", report.get("five_hour")),
+            ("7-day", report.get("seven_day")),
         ]
         model_weekly = report.get("model_weekly")
         if isinstance(model_weekly, list):
             for item in model_weekly:
                 if isinstance(item, dict):
-                    metrics.append((f"7 ngày ({item.get('model', '?')})", item))
+                    metrics.append((f"7-day ({item.get('model', '?')})", item))
         for index, (label, metric) in enumerate(metrics):
             percent = metric.get("used_percent") if isinstance(metric, dict) else None
             reset = metric.get("resets_at") if isinstance(metric, dict) else None
@@ -113,9 +113,9 @@ def render_usage_table(
                 account if index == 0 else "",
                 label,
                 _bar(percent, bar_width),
-                str(reset) if reset else "chưa có mốc reset",
+                str(reset) if reset else "Reset time unavailable",
             ))
-    return _grid(("Account", "Mốc", "Đã dùng", "Reset / trạng thái"), rows, widths)
+    return _grid(("Account", "Window", "Used", "Reset / status"), rows, widths)
 
 
 class LiveUsageTable:

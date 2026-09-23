@@ -215,15 +215,15 @@ def _choose_profile_name(store: ProfileStore, command: str) -> str | None:
     if not profiles:
         raise RuntimeError("no account profiles are configured; run 'ccs init'")
     selected = store.selected().name
-    print("Chọn account:")
+    print("Choose an account:")
     for index, profile in enumerate(profiles, start=1):
-        marker = " (đang chọn)" if profile.name == selected else ""
+        marker = " (selected)" if profile.name == selected else ""
         display_name = f"@{profile.name}" if profile.name.isdecimal() else profile.name
         print(f"  {index}. {display_name}{marker}")
-    print("  0. Hủy")
+    print("  0. Cancel")
     while True:
         try:
-            choice = input("Nhập số hoặc tên account: ").strip()
+            choice = input("Enter a number or account name: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -241,7 +241,7 @@ def _choose_profile_name(store: ProfileStore, command: str) -> str | None:
             for profile in profiles:
                 if choice == profile.name:
                     return profile.name
-        print(f"Lựa chọn không hợp lệ. Nhập số từ 1 đến {len(profiles)}, hoặc 0 để hủy.")
+        print(f"Invalid choice. Enter a number from 1 to {len(profiles)}, or 0 to cancel.")
 
 
 def _encode_selection_snapshot(snapshot: SelectionSnapshot) -> str:
@@ -595,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "use":
             name = args.name or _choose_profile_name(store, "use")
             if name is None:
-                print("Đã hủy chọn account.")
+                print("Account selection canceled.")
                 return 0
             store.select(name)
             print(f"Selected '{name}'. Run 'ccs resume' to continue the last session here.")
@@ -705,8 +705,8 @@ def main(argv: list[str] | None = None) -> int:
                                     elapsed = time.monotonic() - started
                                     pending = {
                                         name: (
-                                            f"{frames[frame % len(frames)]} Đang tải {elapsed:.1f}s"
-                                            if future.running() else "Chờ lượt"
+                                            f"{frames[frame % len(frames)]} Loading {elapsed:.1f}s"
+                                            if future.running() else "Queued"
                                         )
                                         for future, name in pending_futures.items()
                                     }
@@ -732,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
                             future.cancel()
                         raise
             except KeyboardInterrupt:
-                print("Đã hủy kiểm tra usage.", file=sys.stderr)
+                print("Usage check canceled.", file=sys.stderr)
                 return 130
 
             reports = [reports_by_name[name] for name in names]
@@ -793,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             name = args.name or _choose_profile_name(store, "switch")
             if name is None:
-                print("Đã hủy chuyển account.")
+                print("Account switch canceled.")
                 return 0
             if args.selection_token is not None and not args.foreground:
                 raise ValueError("internal selection token requires --foreground")

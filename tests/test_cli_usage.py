@@ -45,15 +45,15 @@ def test_usage_lists_all_profiles_with_bars_and_resets(
     assert cli.main(["usage"]) == 0
     output = capsys.readouterr().out
     assert set(calls) == {"main", "second"}
-    assert "| Account" in output and "| Mốc" in output
+    assert "| Account" in output and "| Window" in output
     assert "main (max)" in output and "second (max)" in output
     assert "[██░░░░░░░░] 23%" in output
     assert "[██████████] 100%" in output
     assert "[██░░░░░░░░] 18%" in output
-    assert "7 ngày (Fable)" in output
+    assert "7-day (Fable)" in output
     assert "[░░░░░░░░░░] 0%" in output
     assert "Sep 25 at 1:59am" in output
-    assert "chưa có mốc reset" in output
+    assert "Reset time unavailable" in output
     assert "subscription ends at" not in output
     lines = output.splitlines()
     second_row = next(index for index, line in enumerate(lines) if "second (max)" in line)
@@ -65,7 +65,7 @@ def test_usage_lists_all_profiles_with_bars_and_resets(
 def test_loading_table_separates_account_rows() -> None:
     table = render_usage_table(
         ["main", "second"], {},
-        {"main": "Đang tải", "second": "Chờ lượt"},
+        {"main": "Loading", "second": "Queued"},
         columns=80, compact=True,
     )
     lines = table.splitlines()
@@ -121,10 +121,10 @@ def test_usage_shows_loading_inside_interactive_table_only(
     assert cli.main(["usage", "main"]) == 0
     output = screen.getvalue()
     assert "\x1b[?1049h" in output and "\x1b[?1049l" in output
-    assert "Đang tải" in output and "main" in output
+    assert "Loading" in output and "main" in output
     final_table = output.split("\x1b[?1049l", 1)[1]
     assert "[███░░░░░░░] 25%" in final_table
-    assert "Đang tải" not in final_table
+    assert "Loading" not in final_table
 
     screen.seek(0)
     screen.truncate()
@@ -167,7 +167,7 @@ def test_live_table_updates_one_account_while_another_is_loading(
             return True
 
         def write(self, value: str) -> int:
-            if "second (max)" in value and "✓ Xong" in value and "Đang tải" in value:
+            if "second (max)" in value and "✓ Done" in value and "Loading" in value:
                 first_row_updated.set()
             return super().write(value)
 
@@ -189,7 +189,7 @@ def test_live_table_updates_one_account_while_another_is_loading(
     assert first_row_updated.is_set()
     final_table = screen.getvalue().split("\x1b[?1049l", 1)[1]
     assert "main (max)" in final_table and "second (max)" in final_table
-    assert "Đang tải" not in final_table
+    assert "Loading" not in final_table
 
 
 def test_usage_ctrl_c_cancels_running_checks(
@@ -251,4 +251,4 @@ def test_usage_reports_one_profile_failure_without_losing_other_results(
     assert cli.main(["usage"]) == 1
     table = capsys.readouterr().out
     assert "main (max)" in table
-    assert "Lỗi" in table and "Claude usage command timed out" in table
+    assert "Error" in table and "Claude usage command timed out" in table

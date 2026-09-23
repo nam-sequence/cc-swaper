@@ -181,7 +181,7 @@ def _run_tty(
                     output.extend(os.read(master, 65536))
                 except OSError:
                     break
-                if choice and not choice_sent and "Nhập số hoặc tên account:" in output.decode(errors="replace"):
+                if choice and not choice_sent and "Enter a number or account name:" in output.decode(errors="replace"):
                     os.write(master, choice.encode())
                     choice_sent = True
                 if terminate_on and not signal_sent and terminate_on in output.decode(errors="replace"):
