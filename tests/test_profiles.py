@@ -269,6 +269,48 @@ def test_session_metadata_is_global_and_atomic(tmp_path: Path) -> None:
     assert reopened.last_transcript(cwd) == ("personal", transcript)
 
 
+def test_delayed_selection_preserves_newer_choice_even_after_aba(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("second")
+    store.add_managed("third")
+    observed = store.selection_snapshot()
+
+    another = ProfileStore(home)
+    another.select("third")
+    another.select("main")
+    assert store.select_if_unchanged(observed, "second") is False
+    assert ProfileStore(home).selected().name == "main"
+
+    current = store.selection_snapshot()
+    assert store.select_if_unchanged(current, "second") is True
+    assert ProfileStore(home).selected().name == "second"
+
+
+def test_delayed_selection_detects_older_writer_without_revision(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("second")
+    state_file = home / "profiles.json"
+    legacy = json.loads(state_file.read_text())
+    legacy.pop("selection_revision")
+    state_file.write_text(json.dumps(legacy))
+
+    observed = store.selection_snapshot()
+    assert "selection_revision" in json.loads(state_file.read_text())
+    # An older running CLI writes a state file without the new field.
+    state_file.write_text(json.dumps(legacy))
+    assert store.select_if_unchanged(observed, "second") is False
+    # A newer CLI then adds an unrelated profile, restoring the field at its
+    # legacy default. The old token still must not become valid again.
+    ProfileStore(home).add_managed("third")
+    assert "selection_revision" in json.loads(state_file.read_text())
+    assert store.select_if_unchanged(observed, "second") is False
+    assert ProfileStore(home).selected().name == "main"
+
+
 def test_concurrent_session_updates_keep_different_projects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

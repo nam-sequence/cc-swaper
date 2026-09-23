@@ -13,6 +13,7 @@ import json
 import fcntl
 import os
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -40,6 +41,14 @@ class Profile:
 
     name: str
     config_dir: Path | None
+
+
+@dataclass(frozen=True)
+class SelectionSnapshot:
+    """The exact profile-selection revision observed before a session starts."""
+
+    name: str | None
+    revision: int
 
 
 def _default_store_home() -> Path:
@@ -332,6 +341,7 @@ class ProfileStore:
                 next_state["selected"] = (
                     next_state["profiles"][0]["name"] if next_state["profiles"] else None
                 )
+                next_state["selection_revision"] += 1
 
             if destination is not None:
                 _write_json_atomic(
@@ -507,14 +517,50 @@ class ProfileStore:
         with _metadata_lock(self.home):
             self._state = self._load_state()
             profile = self.get(name)
-            if self._state.get("selected") == name:
-                return profile
-
             next_state = self._copy_state()
             next_state["selected"] = name
+            next_state["selection_revision"] += 1
             self._write_state(next_state)
             self._state = next_state
             return profile
+
+    def selection_snapshot(self) -> SelectionSnapshot:
+        """Read a selection token while holding the metadata lock."""
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            if not self._state["_selection_revision_present"]:
+                # Upgrade old metadata before issuing a token. A still-running
+                # older CLI drops this field on its next write, which then
+                # makes the conditional selection fail closed.
+                upgraded = self._copy_state()
+                upgraded["selection_revision"] = secrets.randbits(63) or 1
+                self._write_state(upgraded)
+                self._state = upgraded
+            return SelectionSnapshot(
+                self._state.get("selected"),
+                self._state["selection_revision"],
+            )
+
+    def select_if_unchanged(self, snapshot: SelectionSnapshot, name: str) -> bool:
+        """Apply a delayed session selection without overwriting a newer choice."""
+
+        name = _validate_profile_name(name)
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            if (
+                not self._state["_selection_revision_present"]
+                or self._state.get("selected") != snapshot.name
+                or self._state["selection_revision"] != snapshot.revision
+            ):
+                return False
+            self.get(name)
+            next_state = self._copy_state()
+            next_state["selected"] = name
+            next_state["selection_revision"] += 1
+            self._write_state(next_state)
+            self._state = next_state
+            return True
 
     def last_session(self, cwd: Path) -> str | None:
         """Return the last session recorded for ``cwd``, if any."""
@@ -606,6 +652,7 @@ class ProfileStore:
         next_state["profiles"].append(record)
         if next_state.get("selected") is None:
             next_state["selected"] = name
+            next_state["selection_revision"] += 1
         self._write_state(next_state)
         self._state = next_state
         return Profile(name=name, config_dir=config_dir)
@@ -616,6 +663,7 @@ class ProfileStore:
             "shared_projects": self._state["shared_projects"],
             "profiles": [dict(record) for record in self._state["profiles"]],
             "selected": self._state.get("selected"),
+            "selection_revision": self._state["selection_revision"],
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -627,6 +675,8 @@ class ProfileStore:
                 "shared_projects": str(self.shared_projects),
                 "profiles": [],
                 "selected": None,
+                "selection_revision": 0,
+                "_selection_revision_present": True,
             }
 
         payload = _read_json(self._state_path)
@@ -676,6 +726,13 @@ class ProfileStore:
             )
 
         selected = payload.get("selected")
+        selection_revision = payload.get("selection_revision", 0)
+        if (
+            isinstance(selection_revision, bool)
+            or not isinstance(selection_revision, int)
+            or selection_revision < 0
+        ):
+            raise ValueError("profile metadata has an invalid selection revision")
         if selected is not None and selected not in names:
             raise ValueError("selected profile is not present in metadata")
         if profiles and selected is None:
@@ -690,6 +747,8 @@ class ProfileStore:
             "shared_projects": str(self.shared_projects),
             "profiles": profiles,
             "selected": selected,
+            "selection_revision": selection_revision,
+            "_selection_revision_present": "selection_revision" in payload,
         }
 
     def _load_sessions(self) -> dict[str, str | dict[str, str]]:

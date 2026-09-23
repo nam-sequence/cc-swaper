@@ -196,6 +196,7 @@ class TmuxSessions:
         no_auto: bool,
         store_home: Path,
         socket: str,
+        selection_token: str | None = None,
     ) -> str:
         if mode not in {"run", "resume", "switch"}:
             raise ValueError("mode must be one of: run, resume, switch")
@@ -214,6 +215,10 @@ class TmuxSessions:
             ]
         if no_auto:
             command.append("--no-auto")
+        if selection_token is not None:
+            if mode != "switch" or "\x00" in selection_token or len(selection_token) > 1024:
+                raise ValueError("invalid internal selection token")
+            command.extend(("--selection-token", selection_token))
 
         raw_args = [str(arg) for arg in claude_args]
         if mode == "resume" and raw_args and raw_args[0] != "--":
@@ -284,6 +289,7 @@ class TmuxSessions:
         detach: bool = True,
         *,
         no_auto: bool = False,
+        selection_token: str | None = None,
     ) -> str:
         """Start one project session and return its deterministic name.
 
@@ -308,6 +314,7 @@ class TmuxSessions:
             no_auto,
             self.store.home,
             self.socket,
+            selection_token,
         )
 
         if self.exists(canonical):

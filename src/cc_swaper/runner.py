@@ -14,12 +14,14 @@ import stat
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .process import run_cancelable
 from .profiles import Profile
 
 
@@ -78,18 +80,20 @@ def profile_environment(profile: Profile) -> dict[str, str]:
     return env
 
 
-def auth_details(profile: Profile, binary: str) -> dict[str, object] | None:
+def auth_details(
+    profile: Profile, binary: str, *, cancel_event: threading.Event | None = None
+) -> dict[str, object] | None:
     """Only ask Claude's supported status command; never read token files."""
     try:
-        result = subprocess.run(
-            [binary, "auth", "status", "--json"],
-            env=profile_environment(profile),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        command = [binary, "auth", "status", "--json"]
+        environment = profile_environment(profile)
+        if cancel_event is None:
+            result = subprocess.run(
+                command, env=environment, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        else:
+            result = run_cancelable(command, environment, 10, cancel_event)
         status = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
@@ -190,6 +194,7 @@ def run_interactive(
     env: dict[str, str],
     *,
     monitor: Any = None,
+    on_session_started: Callable[[], None] | None = None,
 ) -> RunResult:
     """Transparent PTY relay; only a quota hook can request a handoff."""
     input_fd = sys.stdin.fileno()
@@ -262,6 +267,9 @@ def run_interactive(
                     chunk = chunk[written:]
             if monitor is not None:
                 monitor.poll()
+                if on_session_started is not None and monitor.session_id is not None:
+                    on_session_started()
+                    on_session_started = None
             if monitor is not None and monitor.quota:
                 _wait_for_transcript_quiet(monitor.transcript_path)
                 child_status = _terminate_group(pid)
@@ -291,6 +299,8 @@ def run_interactive(
         return RunResult(128 + stop_signal, False)
     if monitor is not None:
         monitor.poll()
+        if on_session_started is not None and monitor.session_id is not None:
+            on_session_started()
     exhausted = exhausted or (monitor is not None and monitor.quota)
     reported_id = monitor.session_id if monitor is not None else None
     reported_path = monitor.transcript_path if monitor is not None else None
@@ -301,5 +311,34 @@ def run_interactive(
     return RunResult(os.waitstatus_to_exitcode(child_status), False, reported_id, reported_path)
 
 
-def run_passthrough(binary: str, args: list[str], env: dict[str, str]) -> int:
-    return subprocess.call([binary, *args], env=env)
+def run_passthrough(
+    binary: str,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    monitor: Any = None,
+    on_session_started: Callable[[], None] | None = None,
+) -> int:
+    if monitor is None:
+        return subprocess.call([binary, *args], env=env)
+
+    process = subprocess.Popen([binary, *args], env=env)
+    try:
+        while True:
+            monitor.poll()
+            if on_session_started is not None and monitor.session_id is not None:
+                on_session_started()
+                on_session_started = None
+            code = process.poll()
+            if code is not None:
+                return code
+            time.sleep(0.1)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise

@@ -12,9 +12,11 @@ import json
 import math
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from .process import ProcessCancelled, run_cancelable
 from .profiles import Profile
 from .runner import auth_details, profile_environment
 
@@ -221,19 +223,29 @@ def fetch_usage(
     profile: Profile,
     binary: str,
     timeout: float = 45,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> UsageSnapshot:
     """Fetch a usage snapshot using Claude's supported local command.
 
     ``auth_details`` is used for the display plan and to ensure a profile is
     signed in.  The actual usage call uses no session persistence, and all
-    arguments are passed directly to ``subprocess.run`` without a shell.
+    arguments are passed directly to a subprocess without a shell.
     """
 
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number")
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise UsageError("usage check cancelled")
+
     try:
-        status = auth_details(profile, binary)
+        status = (
+            auth_details(profile, binary, cancel_event=cancel_event)
+            if cancel_event is not None else auth_details(profile, binary)
+        )
+    except ProcessCancelled:
+        raise UsageError("usage check cancelled") from None
     except (OSError, RuntimeError):
         raise UsageError("could not read Claude authentication status") from None
     if not isinstance(status, Mapping) or not status.get("loggedIn"):
@@ -243,23 +255,21 @@ def fetch_usage(
     if method != "claude.ai" or provider not in (None, "firstParty"):
         raise UsageError("Claude profile does not use a supported claude.ai subscription")
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise UsageError("usage check cancelled")
+
     try:
-        result = subprocess.run(
-            [
-                binary,
-                "-p",
-                "--no-session-persistence",
-                "--output-format",
-                "json",
-                "/usage",
-            ],
-            env=profile_environment(profile),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        command = [binary, "-p", "--no-session-persistence", "--output-format", "json", "/usage"]
+        environment = profile_environment(profile)
+        if cancel_event is None:
+            result = subprocess.run(
+                command, env=environment, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        else:
+            result = run_cancelable(command, environment, timeout, cancel_event)
+    except ProcessCancelled:
+        raise UsageError("usage check cancelled") from None
     except subprocess.TimeoutExpired:
         raise UsageError("Claude usage command timed out") from None
     except OSError:

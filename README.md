@@ -39,8 +39,10 @@ ccs usage main                   # chỉ xem một profile
 ccs usage --json                 # dữ liệu có cấu trúc cho script
 ccs stop                         # dừng phiên nền của project hiện tại
 ccs run --foreground             # chạy trực tiếp trong terminal như trước
+ccs use                          # mở danh sách account, chọn cho lần chạy sau
 ccs use secondary                # sau khi thoát Claude, chọn profile cho lần chạy sau
 ccs resume                       # tiếp tục conversation cuối trong một phiên nền mới
+ccs switch                       # mở danh sách account, chọn và tiếp tục conversation
 ccs switch main                  # đổi thủ công và tiếp tục conversation cuối
 ccs run --no-auto -- -p "Hi"     # chế độ không tương tác, không tự chuyển
 ```
@@ -51,7 +53,9 @@ Sau cài đặt, mở terminal Zsh mới và gõ `claude`: `ccs` tạo một tmu
 
 Mỗi project có một phiên nền. Nếu phiên đang tồn tại, `claude` không mở thêm phiên thứ hai; dùng `ccs attach` để quay lại hoặc `ccs stop` để dừng trước khi khởi chạy lại.
 
-`ccs usage` gọi lệnh `/usage` cục bộ của Claude Code riêng cho từng profile, không tạo transcript hoặc lượt model. Trong terminal, lệnh hiện trạng thái tải cho từng account, rồi hiển thị thanh phần trăm và mốc reset 5 giờ/7 ngày đúng như Claude trả về, kể cả giới hạn 7 ngày theo model nếu có. Khi Claude không cung cấp mốc reset (ví dụ phiên 5 giờ đang ở 0%), CLI ghi rõ là chưa có dữ liệu thay vì tự tính. `ccs usage --json` giữ output có cấu trúc và không hiện animation. [Tài liệu `/usage`](https://code.claude.com/docs/en/commands).
+`ccs usage` gọi lệnh `/usage` cục bộ của Claude Code riêng cho từng profile, không tạo transcript hoặc lượt model. Lệnh kiểm tra tối đa tám account song song; trong terminal, bảng hiển thị trạng thái đang tải của từng account rồi cập nhật thanh phần trăm 5 giờ/7 ngày. Bảng cuối cùng có mốc reset và giới hạn 7 ngày theo model nếu có. Khi Claude không cung cấp mốc reset (ví dụ phiên 5 giờ đang ở 0%), CLI ghi rõ là chưa có dữ liệu thay vì tự tính. Khi redirect output hoặc dùng `ccs usage --json`, CLI chỉ in kết quả cuối, không dùng animation. [Tài liệu `/usage`](https://code.claude.com/docs/en/commands).
+
+`ccs switch` và `ccs use` không kèm tên sẽ mở menu đánh số khi chạy trong terminal; bạn cũng có thể nhập tên account (`@tên` nếu tên chỉ gồm số). Chọn `0` hoặc Enter để hủy. Trong script hoặc khi redirect input, truyền tên trực tiếp, ví dụ `ccs switch secondary`. Nếu project đang có phiên Claude chạy nền, dùng `ccs attach` để trở lại hoặc dừng phiên đó bằng `ccs stop` trước khi mở phiên thay thế.
 
 Để xoá account phụ khỏi CLI:
 

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from cc_swaper.profiles import Profile
+from cc_swaper.process import ProcessCancelled, run_cancelable
 from cc_swaper.usage import (
     UsageError,
     UsageSnapshot,
@@ -199,3 +207,95 @@ def test_fetch_usage_rejects_unsupported_auth(
     monkeypatch.setattr("cc_swaper.usage.auth_details", lambda profile, binary: status)
     with pytest.raises(UsageError, match="supported claude.ai"):
         fetch_usage(PROFILE, "/opt/claude")
+
+
+def test_cancel_stops_an_in_flight_usage_process(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    script = (
+        "import os,sys,time; "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    cancelled = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            run_cancelable,
+            [sys.executable, "-c", script, str(pid_file)],
+            dict(os.environ), 30, cancelled,
+        )
+        deadline = time.monotonic() + 3
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pid_file.exists()
+        cancelled.set()
+        with pytest.raises(ProcessCancelled, match="cancelled"):
+            future.result(timeout=3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+def test_fetch_usage_cancels_auth_status_before_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = tmp_path / "auth-pid"
+    binary = tmp_path / "fake-claude"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['CCS_AUTH_READY']).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("CCS_AUTH_READY", str(ready))
+    cancelled = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fetch_usage, PROFILE, str(binary), 45, cancel_event=cancelled)
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        cancelled.set()
+        with pytest.raises(UsageError, match="cancelled"):
+            future.result(timeout=3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(ready.read_text()), 0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group test requires POSIX")
+def test_cancel_stops_helper_after_usage_leader_exits(tmp_path: Path) -> None:
+    ready = tmp_path / "child-ready"
+    terminated = tmp_path / "child-terminated"
+    script = """
+import os, signal, sys, time
+from pathlib import Path
+if os.fork() == 0:
+    def stop(_signum, _frame):
+        Path(sys.argv[2]).write_text('terminated')
+        os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    Path(sys.argv[1]).write_text(str(os.getpid()))
+    time.sleep(30)
+    os._exit(0)
+os._exit(0)
+"""
+    cancelled = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                run_cancelable,
+                [sys.executable, "-c", script, str(ready), str(terminated)],
+                dict(os.environ), 30, cancelled,
+            )
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert ready.exists()
+            cancelled.set()
+            with pytest.raises(ProcessCancelled, match="cancelled"):
+                future.result(timeout=3)
+        assert terminated.read_text() == "terminated"
+    finally:
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass

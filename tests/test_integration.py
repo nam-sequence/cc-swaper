@@ -12,6 +12,7 @@ import sys
 import termios
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,11 @@ from pathlib import Path
 
 args = sys.argv[1:]
 if args[:2] == ["auth", "status"]:
+    if os.environ.get("FAKE_AUTH_WAIT_FILE"):
+        Path(os.environ["FAKE_AUTH_WAITING_MARKER"]).touch()
+        deadline = time.monotonic() + 10
+        while not Path(os.environ["FAKE_AUTH_WAIT_FILE"]).exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
     if os.environ.get("FAKE_AUTH_STATUS_FAIL"):
         sys.exit(1)
     if os.environ.get("CLAUDE_CONFIG_DIR") and (Path(os.environ["CLAUDE_CONFIG_DIR"]) / ".fake_logged_out").exists():
@@ -82,6 +88,14 @@ if "--session-id" in args:
         path.write_text("original transcript\nlate persisted\n")
     time.sleep(30)
 elif "--resume" in args:
+    if os.environ.get("FAKE_MODE") == "exit_127":
+        print("EXEC FAILED", flush=True)
+        sys.exit(127)
+    if os.environ.get("FAKE_DELAY_START_FILE"):
+        Path(os.environ["FAKE_WAITING_MARKER"]).touch()
+        deadline = time.monotonic() + 10
+        while not Path(os.environ["FAKE_DELAY_START_FILE"]).exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
     source = Path(args[args.index("--resume") + 1])
     if not source.is_file():
         print("SOURCE MISSING", flush=True)
@@ -94,6 +108,8 @@ elif "--resume" in args:
     path.write_text(source.read_text() + "forked\n")
     event_file.open("a").write(json.dumps({"type": "start", "session_id": sid, "transcript_path": str(path)}) + "\n")
     print("RESUMED:" + sid, flush=True)
+    if os.environ.get("FAKE_MODE") == "wait_after_resume":
+        time.sleep(30)
     sys.exit(0)
 else:
     print("BAD ARGS", flush=True)
@@ -144,7 +160,7 @@ def _ccs_source_wrapper(tmp_path: Path) -> tuple[Path, Path]:
 
 def _run_tty(
     env: dict[str, str], project: Path, command: tuple[str, ...] = ("run", "--foreground"),
-    *, terminate_on: str | None = None,
+    *, terminate_on: str | None = None, choice: str | None = None,
 ) -> tuple[int, str, list]:
     master, slave = pty.openpty()
     original_term = termios.tcgetattr(slave)
@@ -155,6 +171,7 @@ def _run_tty(
     )
     output = bytearray()
     signal_sent = False
+    choice_sent = False
     deadline = time.monotonic() + 15
     try:
         while time.monotonic() < deadline:
@@ -164,6 +181,9 @@ def _run_tty(
                     output.extend(os.read(master, 65536))
                 except OSError:
                     break
+                if choice and not choice_sent and "Nhập số hoặc tên account:" in output.decode(errors="replace"):
+                    os.write(master, choice.encode())
+                    choice_sent = True
                 if terminate_on and not signal_sent and terminate_on in output.decode(errors="replace"):
                     process.send_signal(signal.SIGTERM)
                     signal_sent = True
@@ -252,6 +272,192 @@ def test_manual_switch_forks_last_session(tmp_path: Path) -> None:
     second_file = next((tmp_path / "store" / "profiles" / "secondary" / "projects" / "test-project").glob("*.jsonl"))
     assert main_file.read_text() == "original transcript\n"
     assert second_file.read_text() == "original transcript\nforked\n"
+
+
+def test_manual_switch_menu_forks_last_session(tmp_path: Path) -> None:
+    env, home, project = _setup(tmp_path)
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    switch_code, switch_output, _ = _run_tty(
+        env, project, ("switch", "--foreground"), choice="2\n"
+    )
+    assert switch_code == 0, switch_output
+    assert "2. secondary" in switch_output
+    assert "RESUMED:" in switch_output
+    main_file = next((home / ".claude" / "projects" / "test-project").glob("*.jsonl"))
+    second_file = next((tmp_path / "store" / "profiles" / "secondary" / "projects" / "test-project").glob("*.jsonl"))
+    assert main_file.read_text() == "original transcript\n"
+    assert second_file.read_text() == "original transcript\nforked\n"
+
+
+def test_failed_manual_switch_does_not_change_selected_profile(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "cc_swaper", "switch", "--foreground", "secondary"],
+        env=env, cwd=project, capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 2
+    assert "session ID" in result.stderr
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "main"
+
+
+def test_switch_rolls_back_selection_when_target_profile_is_locked(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    lock_dir = tmp_path / "store" / "locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    lock = lock_dir / "profile-secondary.lock"
+    with lock.open("w+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        result = subprocess.run(
+            [sys.executable, "-m", "cc_swaper", "switch", "--foreground", "secondary"],
+            env=env, cwd=project, capture_output=True, text=True, timeout=5,
+        )
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    assert result.returncode == 2
+    assert "currently in use" in result.stderr
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "main"
+
+
+def test_switch_exec_failure_restores_selection_with_existing_target_transcript(
+    tmp_path: Path,
+) -> None:
+    env, _, project = _setup(tmp_path)
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+    switch_code, switch_output, _ = _run_tty(
+        env, project, ("switch", "--foreground", "secondary")
+    )
+    assert switch_code == 0, switch_output
+    use_result = subprocess.run(
+        [sys.executable, "-m", "cc_swaper", "use", "main"],
+        env=env, cwd=project, capture_output=True, text=True, timeout=5,
+    )
+    assert use_result.returncode == 0, use_result.stderr
+
+    env["FAKE_MODE"] = "exit_127"
+    failed_code, failed_output, _ = _run_tty(
+        env, project, ("switch", "--foreground", "secondary")
+    )
+    assert failed_code == 127, failed_output
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "main"
+
+
+def test_switch_start_does_not_override_a_newer_account_choice(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    add = subprocess.run(
+        [sys.executable, "-m", "cc_swaper", "add", "third", "--no-login"],
+        env=env, cwd=project, capture_output=True, text=True, timeout=5,
+    )
+    assert add.returncode == 0, add.stderr
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    release = tmp_path / "release-start"
+    waiting = tmp_path / "waiting-start"
+    env["FAKE_DELAY_START_FILE"] = str(release)
+    env["FAKE_WAITING_MARKER"] = str(waiting)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            _run_tty, env, project, ("switch", "--foreground", "secondary")
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not waiting.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert waiting.exists()
+            changed = subprocess.run(
+                [sys.executable, "-m", "cc_swaper", "use", "third"],
+                env=env, cwd=project, capture_output=True, text=True, timeout=5,
+            )
+            assert changed.returncode == 0, changed.stderr
+        finally:
+            release.touch()
+        code, output, _ = future.result(timeout=15)
+    assert code == 0, output
+    assert "RESUMED:" in output
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "third"
+
+
+def test_switch_preflight_does_not_override_a_newer_account_choice(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    add = subprocess.run(
+        [sys.executable, "-m", "cc_swaper", "add", "third", "--no-login"],
+        env=env, cwd=project, capture_output=True, text=True, timeout=5,
+    )
+    assert add.returncode == 0, add.stderr
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    release = tmp_path / "release-auth"
+    waiting = tmp_path / "waiting-auth"
+    env["FAKE_AUTH_WAIT_FILE"] = str(release)
+    env["FAKE_AUTH_WAITING_MARKER"] = str(waiting)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            _run_tty, env, project, ("switch", "--foreground", "secondary")
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not waiting.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert waiting.exists()
+            changed = subprocess.run(
+                [sys.executable, "-m", "cc_swaper", "use", "third"],
+                env=env, cwd=project, capture_output=True, text=True, timeout=5,
+            )
+            assert changed.returncode == 0, changed.stderr
+        finally:
+            release.touch()
+        code, output, _ = future.result(timeout=15)
+    assert code == 0, output
+    assert "RESUMED:" in output
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "third"
+
+
+def test_adding_account_does_not_cancel_in_progress_switch(tmp_path: Path) -> None:
+    env, _, project = _setup(tmp_path)
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    release = tmp_path / "release-start"
+    waiting = tmp_path / "waiting-start"
+    env["FAKE_DELAY_START_FILE"] = str(release)
+    env["FAKE_WAITING_MARKER"] = str(waiting)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            _run_tty, env, project, ("switch", "--foreground", "secondary")
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not waiting.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert waiting.exists()
+            added = subprocess.run(
+                [sys.executable, "-m", "cc_swaper", "add", "third", "--no-login"],
+                env=env, cwd=project, capture_output=True, text=True, timeout=5,
+            )
+            assert added.returncode == 0, added.stderr
+        finally:
+            release.touch()
+        code, output, _ = future.result(timeout=15)
+    assert code == 0, output
+    profiles = json.loads((tmp_path / "store" / "profiles.json").read_text())
+    assert profiles["selected"] == "secondary"
 
 
 def test_auto_switch_waits_for_failed_turn_to_flush(tmp_path: Path) -> None:
@@ -456,6 +662,46 @@ def test_detached_tmux_session_keeps_auto_switching(
         snapshot = _snapshot(ProfileStore(tmp_path / "store"))
         assert snapshot["sessions"][0]["name"] == name
         assert snapshot["sessions"][0]["profile"] == "secondary"
+    finally:
+        subprocess.run(
+            [shutil.which("tmux") or "tmux", "-L", socket, "kill-session", "-t", f"={name}"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_manual_menu_starts_detached_session_on_selected_profile(tmp_path: Path) -> None:
+    env, home, project = _setup(tmp_path)
+    env["FAKE_MODE"] = "normal"
+    initial_code, initial_output, _ = _run_tty(env, project)
+    assert initial_code == 0, initial_output
+
+    _ccs_wrapper, fake_bin = _ccs_source_wrapper(tmp_path)
+    socket = "ccs-test-" + uuid.uuid4().hex[:12]
+    env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
+    env["CC_SWAPER_TMUX_SOCKET"] = socket
+    env["FAKE_MODE"] = "wait_after_resume"
+    name = session_name(project)
+    try:
+        code, output, _ = _run_tty(env, project, ("switch",), choice="2\n")
+        assert code == 0, output
+        assert "Started background session" in output
+
+        target_dir = tmp_path / "store" / "profiles" / "secondary" / "projects" / "test-project"
+        deadline = time.monotonic() + 12
+        target_files: list[Path] = []
+        selected = None
+        while time.monotonic() < deadline:
+            selected = json.loads((tmp_path / "store" / "profiles.json").read_text())["selected"]
+            target_files = list(target_dir.glob("*.jsonl"))
+            if selected == "secondary" and target_files:
+                break
+            time.sleep(0.1)
+        assert selected == "secondary"
+        assert len(target_files) == 1
+        assert target_files[0].read_text() == "original transcript\nforked\n"
+        main_file = next((home / ".claude" / "projects" / "test-project").glob("*.jsonl"))
+        assert main_file.read_text() == "original transcript\n"
     finally:
         subprocess.run(
             [shutil.which("tmux") or "tmux", "-L", socket, "kill-session", "-t", f"={name}"],

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,7 @@ import pytest
 from cc_swaper.cli import _claude_args, _parser
 from cc_swaper.hooks import HookMonitor, hook_settings, minimal_event, write_event
 from cc_swaper.profiles import Profile
-from cc_swaper.runner import profile_environment
+from cc_swaper.runner import profile_environment, run_passthrough
 
 
 SESSION_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -132,3 +134,28 @@ def test_resume_parser_accepts_profile_after_session_id() -> None:
 def test_auto_rejects_modes_without_hooks_or_transcripts(flag: str) -> None:
     with pytest.raises(ValueError):
         _claude_args([flag], auto=True)
+
+
+def test_monitored_passthrough_notifies_before_session_exits(tmp_path: Path) -> None:
+    finished = tmp_path / "finished"
+
+    class Monitor:
+        session_id: str | None = None
+        polls = 0
+
+        def poll(self) -> None:
+            self.polls += 1
+            if self.polls >= 2:
+                self.session_id = SESSION_ID
+
+    monitor = Monitor()
+    seen_before_exit: list[bool] = []
+    code = run_passthrough(
+        sys.executable,
+        ["-c", "import sys,time; time.sleep(0.35); open(sys.argv[1], 'w').write('done')", str(finished)],
+        dict(os.environ), monitor=monitor,
+        on_session_started=lambda: seen_before_exit.append(not finished.exists()),
+    )
+    assert code == 0
+    assert seen_before_exit == [True]
+    assert finished.read_text() == "done"

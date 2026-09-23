@@ -16,13 +16,14 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from . import __version__
-from .profiles import Profile, ProfileStore
+from .profiles import Profile, ProfileStore, SelectionSnapshot
 from . import shell as shell_integration
 from . import service as monitor_service
 from .hooks import HookMonitor, hook_settings
@@ -35,6 +36,7 @@ from .runner import (
     run_interactive,
     run_passthrough,
 )
+from .usage_table import LiveUsageTable, render_usage_table
 
 
 CONTINUATION_PROMPT = (
@@ -55,49 +57,6 @@ HOOK_DISABLING_FLAGS = frozenset({"--bare", "--safe-mode"})
 def _error(message: str, code: int = 2) -> int:
     print(f"ccs: {message}", file=sys.stderr)
     return code
-
-
-def _usage_bar(percent: int | None, width: int = 20) -> str:
-    if percent is None:
-        return "không có dữ liệu"
-    filled = min(width, max(0, (percent * width + 50) // 100))
-    return f"[{'█' * filled}{'░' * (width - filled)}] {percent}% đã dùng"
-
-
-@contextmanager
-def _usage_progress(name: str, index: int, total: int, *, enabled: bool) -> Iterator[None]:
-    if not enabled:
-        yield
-        return
-
-    stopped = threading.Event()
-    started = time.monotonic()
-    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-    def animate() -> None:
-        frame = 0
-        while not stopped.is_set():
-            elapsed = time.monotonic() - started
-            sys.stderr.write(
-                f"\r\x1b[2K{frames[frame % len(frames)]} "
-                f"Đang kiểm tra usage {index}/{total}: {name} ({elapsed:.1f}s)"
-            )
-            sys.stderr.flush()
-            frame += 1
-            stopped.wait(0.12)
-
-    thread = threading.Thread(target=animate, daemon=True)
-    thread.start()
-    succeeded = False
-    try:
-        yield
-        succeeded = True
-    finally:
-        stopped.set()
-        thread.join()
-        sys.stderr.write("\r\x1b[2K")
-        mark = "✓" if succeeded else "!"
-        print(f"{mark} {name} ({time.monotonic() - started:.1f}s)", file=sys.stderr)
 
 
 def _claude_args(args: list[str], auto: bool) -> list[str]:
@@ -244,6 +203,73 @@ def _select_profile(store: ProfileStore, name: str | None) -> Profile:
     return store.get(name) if name else store.selected()
 
 
+def _choose_profile_name(store: ProfileStore, command: str) -> str | None:
+    """Choose a profile without changing selection until the caller acts."""
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise RuntimeError(
+            f"'{command}' needs an interactive terminal to choose an account; "
+            f"use 'ccs {command} <profile>'"
+        )
+    profiles = store.all()
+    if not profiles:
+        raise RuntimeError("no account profiles are configured; run 'ccs init'")
+    selected = store.selected().name
+    print("Chọn account:")
+    for index, profile in enumerate(profiles, start=1):
+        marker = " (đang chọn)" if profile.name == selected else ""
+        display_name = f"@{profile.name}" if profile.name.isdecimal() else profile.name
+        print(f"  {index}. {display_name}{marker}")
+    print("  0. Hủy")
+    while True:
+        try:
+            choice = input("Nhập số hoặc tên account: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not choice or choice.casefold() in {"0", "q", "quit"}:
+            return None
+        if choice.startswith("@"):
+            for profile in profiles:
+                if choice[1:] == profile.name:
+                    return profile.name
+        if choice.isdecimal():
+            index = int(choice)
+            if 1 <= index <= len(profiles):
+                return profiles[index - 1].name
+        else:
+            for profile in profiles:
+                if choice == profile.name:
+                    return profile.name
+        print(f"Lựa chọn không hợp lệ. Nhập số từ 1 đến {len(profiles)}, hoặc 0 để hủy.")
+
+
+def _encode_selection_snapshot(snapshot: SelectionSnapshot) -> str:
+    return json.dumps(
+        {"name": snapshot.name, "revision": snapshot.revision}, separators=(",", ":")
+    )
+
+
+def _decode_selection_snapshot(raw: str) -> SelectionSnapshot:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError("invalid internal selection token") from None
+    if not isinstance(value, dict) or set(value) != {"name", "revision"}:
+        raise ValueError("invalid internal selection token")
+    name = value["name"]
+    revision = value["revision"]
+    if (
+        not isinstance(name, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+    ):
+        raise ValueError("invalid internal selection token")
+    return SelectionSnapshot(name, revision)
+
+
 def _require_login(profile: Profile, binary: str) -> None:
     logged_in, method = auth_status(profile, binary)
     if not logged_in:
@@ -284,6 +310,7 @@ def _background_session(
     profile_name: str,
     claude_args: list[str],
     no_auto: bool,
+    selection_snapshot: SelectionSnapshot | None = None,
 ) -> int:
     from .tmux_sessions import TmuxSessions
 
@@ -295,8 +322,12 @@ def _background_session(
         session_id = _session_id(explicit or store.last_session(cwd) or "")
         if _transcript(store, session_id) is None:
             raise RuntimeError(f"transcript for {session_id} was not found")
+    extra = (
+        {"selection_token": _encode_selection_snapshot(selection_snapshot)}
+        if selection_snapshot is not None else {}
+    )
     name = TmuxSessions(store).start(
-        cwd, profile.name, mode, claude_args, detach=True, no_auto=no_auto
+        cwd, profile.name, mode, claude_args, detach=True, no_auto=no_auto, **extra
     )
     print(f"Started background session {name}.")
     print("Use 'ccs attach' to interact; detach with Ctrl-b d.")
@@ -312,6 +343,7 @@ def _run_session(
     no_auto: bool,
     passthrough: list[str],
     continue_now: bool = False,
+    selection_snapshot: SelectionSnapshot | None = None,
 ) -> int:
     binary = claude_binary()
     profile = _select_profile(store, profile_name)
@@ -364,6 +396,15 @@ def _run_session(
             )
         else:
             store.set_last_session(cwd, session_id)
+        needs_initial_select = selection_snapshot is not None
+
+        def mark_selected() -> None:
+            nonlocal needs_initial_select
+            if needs_initial_select:
+                assert selection_snapshot is not None
+                store.select_if_unchanged(selection_snapshot, profile.name)
+                needs_initial_select = False
+
         attempted = {profile.name}
         while True:
             print(f"\r\nccs: Claude Code profile '{profile.name}'\r\n", file=sys.stderr)
@@ -378,8 +419,17 @@ def _run_session(
                     ) as monitor:
                         launch_args = ["--settings", hook_settings(event_file), *initial_args]
                         if no_auto:
-                            code = run_passthrough(binary, launch_args, profile_environment(profile))
+                            environment = profile_environment(profile)
+                            if needs_initial_select:
+                                code = run_passthrough(
+                                    binary, launch_args, environment, monitor=monitor,
+                                    on_session_started=mark_selected,
+                                )
+                            else:
+                                code = run_passthrough(binary, launch_args, environment)
                             monitor.poll()
+                            if monitor.session_id is not None or code == 0:
+                                mark_selected()
                             if monitor.session_id and _reported_transcript(
                                 profile, monitor.session_id, monitor.transcript_path
                             ):
@@ -393,6 +443,7 @@ def _run_session(
                             launch_args,
                             profile_environment(profile),
                             monitor=monitor,
+                            on_session_started=mark_selected if needs_initial_select else None,
                         )
             if result.session_id:
                 reported = _reported_transcript(
@@ -460,7 +511,7 @@ def _parser() -> argparse.ArgumentParser:
     list_command = commands.add_parser("list", help="list profiles and login state")
     list_command.add_argument("--show-identity", action="store_true", help="show login email and org")
     use = commands.add_parser("use", help="select a profile for the next session")
-    use.add_argument("name")
+    use.add_argument("name", nargs="?", help="profile name (omit to choose from a list)")
     run = commands.add_parser("run", help="start an interactive Claude Code session")
     run.add_argument("--profile")
     run.add_argument("--foreground", action="store_true", help="run directly in this terminal")
@@ -472,9 +523,10 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--foreground", action="store_true", help="run directly in this terminal")
     resume.add_argument("--no-auto", action="store_true")
     switch = commands.add_parser("switch", help="select another profile and continue the last session")
-    switch.add_argument("name")
+    switch.add_argument("name", nargs="?", help="profile name (omit to choose from a list)")
     switch.add_argument("--foreground", action="store_true", help="run directly in this terminal")
     switch.add_argument("--no-auto", action="store_true")
+    switch.add_argument("--selection-token", help=argparse.SUPPRESS)
     attach = commands.add_parser("attach", help="attach to this project's background session")
     attach.add_argument("--project", type=Path)
     stop = commands.add_parser("stop", help="stop this project's background session")
@@ -541,8 +593,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{marker} {profile.name:16} {state}")
             return 0
         if args.command == "use":
-            store.select(args.name)
-            print(f"Selected '{args.name}'. Run 'ccs resume' to continue the last session here.")
+            name = args.name or _choose_profile_name(store, "use")
+            if name is None:
+                print("Đã hủy chọn account.")
+                return 0
+            store.select(name)
+            print(f"Selected '{name}'. Run 'ccs resume' to continue the last session here.")
             return 0
         if args.command == "native":
             profile = store.selected()
@@ -599,18 +655,19 @@ def main(argv: list[str] | None = None) -> int:
             binary = claude_binary()
             names = list(dict.fromkeys(args.profiles)) if args.profiles else [p.name for p in store.all()]
             profiles = [store.get(name) for name in names]
+            if not profiles:
+                raise RuntimeError("no account profiles are configured; run 'ccs init'")
             checked_at = datetime.now(timezone.utc).isoformat()
-            reports: list[dict[str, object]] = []
-            failed = False
-            show_progress = not args.json and sys.stderr.isatty()
-            for index, profile in enumerate(profiles, start=1):
+            reports_by_name: dict[str, dict[str, object]] = {}
+            cancelled = threading.Event()
+
+            def collect(profile: Profile) -> dict[str, object]:
                 try:
-                    with _usage_progress(
-                        profile.name, index, len(profiles), enabled=show_progress
-                    ):
-                        with _profile_lock(store, profile.name, exclusive=False):
-                            snapshot = fetch_usage(profile, binary, timeout=args.timeout)
-                    reports.append({
+                    with _profile_lock(store, profile.name, exclusive=False):
+                        snapshot = fetch_usage(
+                            profile, binary, timeout=args.timeout, cancel_event=cancelled
+                        )
+                    return {
                         "profile": profile.name,
                         "plan": snapshot.plan,
                         "five_hour": {
@@ -625,10 +682,61 @@ def main(argv: list[str] | None = None) -> int:
                             {"model": label, "used_percent": percent, "resets_at": reset}
                             for label, percent, reset in snapshot.model_weekly
                         ],
-                    })
+                    }
                 except (UsageError, RuntimeError, OSError, ValueError) as exc:
-                    failed = True
-                    reports.append({"profile": profile.name, "error": str(exc)})
+                    return {"profile": profile.name, "error": str(exc)}
+
+            live_enabled = (
+                not args.json and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+            )
+            columns = min(120, shutil.get_terminal_size((100, 30)).columns)
+            started = time.monotonic()
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = 0
+            pending_futures = {}
+            try:
+                with ThreadPoolExecutor(max_workers=min(8, len(profiles))) as executor:
+                    try:
+                        for profile in profiles:
+                            pending_futures[executor.submit(collect, profile)] = profile.name
+                        with LiveUsageTable(sys.stdout, enabled=live_enabled) as live:
+                            while pending_futures:
+                                if live_enabled:
+                                    elapsed = time.monotonic() - started
+                                    pending = {
+                                        name: (
+                                            f"{frames[frame % len(frames)]} Đang tải {elapsed:.1f}s"
+                                            if future.running() else "Chờ lượt"
+                                        )
+                                        for future, name in pending_futures.items()
+                                    }
+                                    live.draw(render_usage_table(
+                                        names, reports_by_name, pending,
+                                        columns=columns, compact=True,
+                                    ))
+                                    frame += 1
+                                done, _ = wait(
+                                    pending_futures, timeout=0.15, return_when=FIRST_COMPLETED
+                                )
+                                for future in done:
+                                    name = pending_futures.pop(future)
+                                    try:
+                                        reports_by_name[name] = future.result()
+                                    except Exception:
+                                        reports_by_name[name] = {
+                                            "profile": name, "error": "could not read Claude usage"
+                                        }
+                    except KeyboardInterrupt:
+                        cancelled.set()
+                        for future in pending_futures:
+                            future.cancel()
+                        raise
+            except KeyboardInterrupt:
+                print("Đã hủy kiểm tra usage.", file=sys.stderr)
+                return 130
+
+            reports = [reports_by_name[name] for name in names]
+            failed = any("error" in report for report in reports)
             if args.json:
                 print(json.dumps({
                     "source": "Claude Code /usage",
@@ -636,30 +744,7 @@ def main(argv: list[str] | None = None) -> int:
                     "accounts": reports,
                 }, ensure_ascii=False, indent=2))
             else:
-                def safe(value: object) -> str:
-                    return "".join(char if char.isprintable() else "?" for char in str(value))
-
-                for report in reports:
-                    print(f"{safe(report['profile'])}:")
-                    if "error" in report:
-                        print(f"  lỗi: {safe(report['error'])}")
-                        continue
-                    plan = report.get("plan")
-                    if plan:
-                        print(f"  gói: {safe(plan)}")
-                    for label, key in (("5 giờ", "five_hour"), ("7 ngày", "seven_day")):
-                        item = report[key]
-                        assert isinstance(item, dict)
-                        percent = item.get("used_percent")
-                        reset = item.get("resets_at")
-                        reset_text = safe(reset) if reset else "Claude chưa cung cấp mốc reset"
-                        print(f"  {label}: {_usage_bar(percent)}")
-                        print(f"    reset: {reset_text}")
-                    for item in report["model_weekly"]:
-                        assert isinstance(item, dict)
-                        reset = item.get("resets_at")
-                        print(f"  7 ngày ({safe(item['model'])}): {_usage_bar(item['used_percent'])}")
-                        print(f"    reset: {safe(reset) if reset else 'Claude chưa cung cấp mốc reset'}")
+                print(render_usage_table(names, reports_by_name, {}, columns=columns))
             return 1 if failed else 0
         if args.command in {"attach", "stop"}:
             from .tmux_sessions import TmuxSessions
@@ -706,15 +791,26 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Removed '{profile.name}'. Local history was archived at {destination}.")
             return 0
         if args.command == "switch":
-            store.select(args.name)
+            name = args.name or _choose_profile_name(store, "switch")
+            if name is None:
+                print("Đã hủy chuyển account.")
+                return 0
+            if args.selection_token is not None and not args.foreground:
+                raise ValueError("internal selection token requires --foreground")
+            selection_snapshot = (
+                _decode_selection_snapshot(args.selection_token)
+                if args.selection_token is not None else store.selection_snapshot()
+            )
             if not args.foreground:
                 return _background_session(
-                    store, mode="switch", profile_name=args.name,
+                    store, mode="switch", profile_name=name,
                     claude_args=[], no_auto=args.no_auto,
+                    selection_snapshot=selection_snapshot,
                 )
             return _run_session(
-                store, resume=True, explicit_session=None, profile_name=args.name,
+                store, resume=True, explicit_session=None, profile_name=name,
                 no_auto=args.no_auto, passthrough=[], continue_now=True,
+                selection_snapshot=selection_snapshot,
             )
         if args.command == "run":
             forwarded = _claude_args(args.claude_args, auto=not args.no_auto)
