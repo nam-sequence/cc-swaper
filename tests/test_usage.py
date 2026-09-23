@@ -53,7 +53,6 @@ def test_parse_usage_output_preserves_reset_text_and_model_weekly() -> None:
     assert snapshot.weekly_percent == 18
     assert snapshot.weekly_reset_text == "Sep 25 at 1:59am (Asia/Saigon)"
     assert snapshot.model_weekly == [("Fable", 0, "Sep 25 at 2am (Asia/Saigon)")]
-    assert snapshot.subscription_end is None
 
 
 def test_parse_usage_text_allows_reset_to_be_absent_at_zero_percent() -> None:

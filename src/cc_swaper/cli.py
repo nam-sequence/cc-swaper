@@ -13,6 +13,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from contextlib import contextmanager
@@ -53,6 +55,49 @@ HOOK_DISABLING_FLAGS = frozenset({"--bare", "--safe-mode"})
 def _error(message: str, code: int = 2) -> int:
     print(f"ccs: {message}", file=sys.stderr)
     return code
+
+
+def _usage_bar(percent: int | None, width: int = 20) -> str:
+    if percent is None:
+        return "không có dữ liệu"
+    filled = min(width, max(0, (percent * width + 50) // 100))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {percent}% đã dùng"
+
+
+@contextmanager
+def _usage_progress(name: str, index: int, total: int, *, enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+
+    stopped = threading.Event()
+    started = time.monotonic()
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def animate() -> None:
+        frame = 0
+        while not stopped.is_set():
+            elapsed = time.monotonic() - started
+            sys.stderr.write(
+                f"\r\x1b[2K{frames[frame % len(frames)]} "
+                f"Đang kiểm tra usage {index}/{total}: {name} ({elapsed:.1f}s)"
+            )
+            sys.stderr.flush()
+            frame += 1
+            stopped.wait(0.12)
+
+    thread = threading.Thread(target=animate, daemon=True)
+    thread.start()
+    succeeded = False
+    try:
+        yield
+        succeeded = True
+    finally:
+        stopped.set()
+        thread.join()
+        sys.stderr.write("\r\x1b[2K")
+        mark = "✓" if succeeded else "!"
+        print(f"{mark} {name} ({time.monotonic() - started:.1f}s)", file=sys.stderr)
 
 
 def _claude_args(args: list[str], auto: bool) -> list[str]:
@@ -557,10 +602,14 @@ def main(argv: list[str] | None = None) -> int:
             checked_at = datetime.now(timezone.utc).isoformat()
             reports: list[dict[str, object]] = []
             failed = False
-            for profile in profiles:
+            show_progress = not args.json and sys.stderr.isatty()
+            for index, profile in enumerate(profiles, start=1):
                 try:
-                    with _profile_lock(store, profile.name, exclusive=False):
-                        snapshot = fetch_usage(profile, binary, timeout=args.timeout)
+                    with _usage_progress(
+                        profile.name, index, len(profiles), enabled=show_progress
+                    ):
+                        with _profile_lock(store, profile.name, exclusive=False):
+                            snapshot = fetch_usage(profile, binary, timeout=args.timeout)
                     reports.append({
                         "profile": profile.name,
                         "plan": snapshot.plan,
@@ -576,7 +625,6 @@ def main(argv: list[str] | None = None) -> int:
                             {"model": label, "used_percent": percent, "resets_at": reset}
                             for label, percent, reset in snapshot.model_weekly
                         ],
-                        "subscription_ends_at": None,
                     })
                 except (UsageError, RuntimeError, OSError, ValueError) as exc:
                     failed = True
@@ -604,17 +652,14 @@ def main(argv: list[str] | None = None) -> int:
                         assert isinstance(item, dict)
                         percent = item.get("used_percent")
                         reset = item.get("resets_at")
-                        percent_text = f"{percent}% đã dùng" if percent is not None else "không có dữ liệu"
                         reset_text = safe(reset) if reset else "Claude chưa cung cấp mốc reset"
-                        print(f"  {label}: {percent_text}; reset: {reset_text}")
+                        print(f"  {label}: {_usage_bar(percent)}")
+                        print(f"    reset: {reset_text}")
                     for item in report["model_weekly"]:
                         assert isinstance(item, dict)
                         reset = item.get("resets_at")
-                        print(
-                            f"  7 ngày ({safe(item['model'])}): {item['used_percent']}% đã dùng; "
-                            f"reset: {safe(reset) if reset else 'Claude chưa cung cấp mốc reset'}"
-                        )
-                    print("  subscription ends at: không có dữ liệu (xem Claude Settings > Billing)")
+                        print(f"  7 ngày ({safe(item['model'])}): {_usage_bar(item['used_percent'])}")
+                        print(f"    reset: {safe(reset) if reset else 'Claude chưa cung cấp mốc reset'}")
             return 1 if failed else 0
         if args.command in {"attach", "stop"}:
             from .tmux_sessions import TmuxSessions

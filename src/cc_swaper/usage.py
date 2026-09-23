@@ -39,9 +39,7 @@ class UsageSnapshot:
     """A point-in-time usage report for one configured profile.
 
     Reset values intentionally retain Claude's source wording, including the
-    timezone in parentheses when Claude provides one.  ``subscription_end``
-    is always ``None`` because Claude's local usage command does not expose a
-    reliable subscription end date.
+    timezone in parentheses when Claude provides one.
     """
 
     profile: Profile
@@ -51,7 +49,6 @@ class UsageSnapshot:
     weekly_percent: int | None
     weekly_reset_text: str | None
     model_weekly: list[tuple[str, int, str | None]] = field(default_factory=list)
-    subscription_end: str | None = None
 
 
 def _plan_from_auth(status: Mapping[str, Any]) -> str | None:

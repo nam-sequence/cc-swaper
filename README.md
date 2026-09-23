@@ -51,7 +51,7 @@ Sau cài đặt, mở terminal Zsh mới và gõ `claude`: `ccs` tạo một tmu
 
 Mỗi project có một phiên nền. Nếu phiên đang tồn tại, `claude` không mở thêm phiên thứ hai; dùng `ccs attach` để quay lại hoặc `ccs stop` để dừng trước khi khởi chạy lại.
 
-`ccs usage` gọi lệnh `/usage` cục bộ của Claude Code riêng cho từng profile, không tạo transcript hoặc lượt model. Lệnh hiển thị phần trăm đã dùng và mốc reset 5 giờ/7 ngày đúng như Claude trả về, kể cả giới hạn 7 ngày theo model nếu có. Khi Claude không cung cấp mốc reset (ví dụ phiên 5 giờ đang ở 0%), CLI ghi rõ là chưa có dữ liệu thay vì tự tính. Claude Code không cung cấp ngày kết thúc subscription qua lệnh này; trường đó hiện là “không có dữ liệu”, và bạn có thể kiểm tra tại Claude Settings > Billing. [Tài liệu `/usage`](https://code.claude.com/docs/en/commands), [thông tin billing](https://support.claude.com/en/articles/16607638-understanding-your-pro-or-max-plan-invoices).
+`ccs usage` gọi lệnh `/usage` cục bộ của Claude Code riêng cho từng profile, không tạo transcript hoặc lượt model. Trong terminal, lệnh hiện trạng thái tải cho từng account, rồi hiển thị thanh phần trăm và mốc reset 5 giờ/7 ngày đúng như Claude trả về, kể cả giới hạn 7 ngày theo model nếu có. Khi Claude không cung cấp mốc reset (ví dụ phiên 5 giờ đang ở 0%), CLI ghi rõ là chưa có dữ liệu thay vì tự tính. `ccs usage --json` giữ output có cấu trúc và không hiện animation. [Tài liệu `/usage`](https://code.claude.com/docs/en/commands).
 
 Để xoá account phụ khỏi CLI:
 
