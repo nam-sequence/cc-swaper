@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import shutil
 import stat
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,16 +20,13 @@ def _mode(path: Path) -> int:
 
 
 def test_default_and_managed_profiles_are_private_and_record_projects_anchor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    fake_home = tmp_path / "user-home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
-
     store = ProfileStore(tmp_path / "store")
     default = store.add_default("personal")
     managed = store.add_managed("work")
 
+    fake_home = Path.home()
     shared_projects = fake_home / ".claude" / "projects"
     assert store.shared_projects == shared_projects.absolute()
     assert default.config_dir is None
@@ -39,7 +39,9 @@ def test_default_and_managed_profiles_are_private_and_record_projects_anchor(
     assert _mode(default_dir) == 0o700
     assert _mode(managed_dir) == 0o700
     assert not (default_dir / "projects").exists()
-    assert not (managed_dir / "projects").exists()
+    assert (managed_dir / "projects").is_symlink()
+    assert os.readlink(managed_dir / "projects") == str(shared_projects)
+    assert shared_projects.is_dir()
 
     assert not (tmp_path / "store" / "profiles" / "work" / "credentials.json").exists()
 
@@ -80,6 +82,37 @@ def test_remove_managed_profile_selects_first_remaining_and_preserves_directory(
     assert removed_path.is_dir()
     assert [profile.name for profile in store.all()] == ["personal", "backup"]
     assert store.selected().name == "personal"
+
+
+@pytest.mark.parametrize("purge_data", [False, True])
+def test_remove_managed_archive_and_purge_keep_shared_projects(
+    tmp_path: Path, purge_data: bool,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("personal")
+    managed = store.add_managed("work")
+    assert managed.config_dir is not None
+    shared_marker = store.shared_projects / "shared-history-marker.txt"
+    shared_marker.write_text("shared", encoding="utf-8")
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    destination = archive / "work-20260923T000000Z-a1b2c3d4"
+
+    removed_path = store.remove_managed(
+        "work", archive_to=destination, purge_data=purge_data
+    )
+
+    assert removed_path == destination
+    assert shared_marker.read_text(encoding="utf-8") == "shared"
+    if purge_data:
+        assert destination.is_dir()
+        shutil.rmtree(destination)
+        store.finish_purge(destination)
+    else:
+        assert (destination / "projects").is_symlink()
+        assert os.readlink(destination / "projects") == str(store.shared_projects)
+    assert shared_marker.read_text(encoding="utf-8") == "shared"
 
 
 def test_remove_managed_cleans_session_metadata_for_that_profile(tmp_path: Path) -> None:
@@ -245,6 +278,8 @@ def test_pending_purge_is_completed_on_next_open(tmp_path: Path) -> None:
     managed = store.add_managed("work")
     assert managed.config_dir is not None
     (managed.config_dir / "old-history.txt").write_text("private")
+    shared_marker = store.shared_projects / "shared-history-marker.txt"
+    shared_marker.write_text("shared", encoding="utf-8")
     archive = home / "removed"
     archive.mkdir(mode=0o700)
     destination = archive / "work-20260923T000000Z-a1b2c3d4"
@@ -258,6 +293,7 @@ def test_pending_purge_is_completed_on_next_open(tmp_path: Path) -> None:
     assert [profile.name for profile in reopened.all()] == ["personal"]
     assert not destination.exists()
     assert not (home / "pending-removal.json").exists()
+    assert shared_marker.read_text(encoding="utf-8") == "shared"
 
 
 def test_session_metadata_is_global_and_atomic(tmp_path: Path) -> None:
@@ -569,6 +605,7 @@ def test_managed_profile_symlink_is_rejected_on_reopen(tmp_path: Path) -> None:
     store.add_default("personal")
     managed = store.add_managed("work")
     assert managed.config_dir is not None
+    (managed.config_dir / "projects").unlink()
     managed.config_dir.rmdir()
     external = tmp_path / "external"
     external.mkdir()
@@ -586,10 +623,143 @@ def test_managed_projects_symlink_is_rejected_on_reopen(tmp_path: Path) -> None:
     assert managed.config_dir is not None
     external = tmp_path / "external"
     external.mkdir()
-    (managed.config_dir / "projects").symlink_to(external, target_is_directory=True)
+    projects_link = managed.config_dir / "projects"
+    projects_link.unlink()
+    projects_link.symlink_to(external, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="managed projects directory"):
+    with pytest.raises(ValueError, match="managed projects"):
         ProfileStore(store_home)
+
+
+def test_managed_profile_with_legacy_regular_projects_directory_is_preserved(
+    tmp_path: Path,
+) -> None:
+    store_home = tmp_path / "store"
+    store = ProfileStore(store_home)
+    store.add_default("personal")
+    managed = store.add_managed("work")
+    assert managed.config_dir is not None
+    projects_path = managed.config_dir / "projects"
+    projects_path.unlink()
+    projects_path.mkdir()
+    marker = projects_path / "legacy-history-marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    reopened = ProfileStore(store_home)
+
+    assert reopened.get("work").config_dir == managed.config_dir
+    assert projects_path.is_dir()
+    assert not projects_path.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_managed_projects_dangling_shared_link_is_rejected_on_reopen(
+    tmp_path: Path,
+) -> None:
+    store_home = tmp_path / "store"
+    store = ProfileStore(store_home)
+    store.add_default("personal")
+    managed = store.add_managed("work")
+    assert managed.config_dir is not None
+    projects_link = managed.config_dir / "projects"
+    projects_link.unlink()
+    store.shared_projects.rmdir()
+    projects_link.symlink_to(store.shared_projects, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe shared projects directory"):
+        ProfileStore(store_home)
+
+
+@pytest.mark.parametrize("unsafe_component", ["parent", "projects"])
+def test_managed_projects_link_rejects_group_or_other_writable_target(
+    tmp_path: Path, unsafe_component: str,
+) -> None:
+    store_home = tmp_path / "store"
+    store = ProfileStore(store_home)
+    store.add_default("personal")
+    managed = store.add_managed("work")
+    assert managed.config_dir is not None
+    unsafe_path = (
+        store.shared_projects.parent
+        if unsafe_component == "parent"
+        else store.shared_projects
+    )
+    unsafe_path.chmod(_mode(unsafe_path) | 0o022)
+
+    with pytest.raises(ValueError, match="unsafe shared projects directory"):
+        ProfileStore(store_home)
+
+
+def test_managed_projects_link_rejects_writable_home_ancestor(
+    tmp_path: Path,
+) -> None:
+    store_home = tmp_path / "store"
+    store = ProfileStore(store_home)
+    store.add_default("personal")
+    store.add_managed("work")
+    Path.home().chmod(_mode(Path.home()) | 0o022)
+
+    with pytest.raises(ValueError, match="unsafe shared projects ancestor"):
+        ProfileStore(store_home)
+
+
+def test_managed_projects_link_allows_private_home_under_root_owned_sticky_tmp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_root = Path("/tmp")
+    info = tmp_root.stat()
+    if info.st_uid != 0 or not stat.S_IMODE(info.st_mode) & stat.S_ISVTX:
+        pytest.skip("/tmp is not a root-owned sticky directory")
+    with tempfile.TemporaryDirectory(dir=tmp_root, prefix="ccs-profile-test-") as raw_home:
+        monkeypatch.setenv("HOME", raw_home)
+        store = ProfileStore(Path(raw_home) / "store")
+        store.add_default("personal")
+        managed = store.add_managed("work")
+        assert managed.config_dir is not None
+        assert (managed.config_dir / "projects").is_symlink()
+
+
+def test_add_managed_write_failure_removes_new_link_and_empty_profile_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ProfileStore(tmp_path / "store")
+    store.add_default("personal")
+
+    def fail_write(_state: object) -> None:
+        raise OSError("simulated state write failure")
+
+    monkeypatch.setattr(store, "_write_state", fail_write)
+    with pytest.raises(OSError, match="simulated state write failure"):
+        store.add_managed("work")
+
+    profile_dir = store.profiles_dir / "work"
+    assert not profile_dir.exists()
+    assert not profile_dir.is_symlink()
+    assert store.shared_projects.is_dir()
+    assert [profile.name for profile in ProfileStore(store.home).all()] == ["personal"]
+
+
+def test_add_managed_post_commit_error_keeps_registered_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ProfileStore(tmp_path / "store")
+    store.add_default("personal")
+    original_write = store._write_state
+
+    def fail_after_commit(next_state: object) -> None:
+        original_write(next_state)
+        raise OSError("post-commit fsync failed")
+
+    monkeypatch.setattr(store, "_write_state", fail_after_commit)
+    with pytest.raises(OSError, match="post-commit fsync failed"):
+        store.add_managed("work")
+
+    reopened = ProfileStore(store.home)
+    managed = reopened.get("work")
+    assert managed.config_dir is not None
+    projects_link = managed.config_dir / "projects"
+    assert projects_link.is_symlink()
+    assert os.readlink(projects_link) == str(reopened.shared_projects)
 
 
 def test_managed_profile_with_public_permissions_is_rejected(tmp_path: Path) -> None:

@@ -1,10 +1,11 @@
 """Private profile and session state for the Claude account switcher.
 
 The profile store deliberately does not copy or inspect Claude credentials or
-transcripts.  A managed profile only gets a private directory.  The
-``shared_projects`` property records the user's existing Claude transcript
-anchor for the runner, which can pass an absolute transcript path to
-``--resume`` when it needs to continue work after a profile switch.
+transcripts. A managed profile gets a private config directory whose
+``projects`` entry links to the user's shared Claude project history. The
+``shared_projects`` property records that transcript anchor for the runner,
+which can pass an absolute transcript path to ``--resume`` after a profile
+switch.
 """
 
 from __future__ import annotations
@@ -82,6 +83,81 @@ def _ensure_private_dir(path: Path) -> None:
     # mkdir honours the process umask.  Explicitly apply the intended mode so
     # that an existing store created under a permissive umask is private too.
     os.chmod(path, 0o700)
+
+
+def _validate_shared_projects_ancestors(path: Path) -> None:
+    """Reject ancestors another OS user could replace before Claude opens data."""
+
+    directory = path.parent.parent
+    while True:
+        try:
+            info = directory.stat()
+        except OSError as exc:
+            raise ValueError(f"unsafe shared projects ancestor: {directory}") from exc
+        mode = stat.S_IMODE(info.st_mode)
+        # A root-owned sticky directory such as /tmp permits a private
+        # user-owned child: other users cannot replace that child's entry.
+        safe_sticky_root = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in (0, os.getuid())
+            or (mode & 0o022 and not safe_sticky_root)
+        ):
+            raise ValueError(f"unsafe shared projects ancestor: {directory}")
+        if directory == directory.parent:
+            break
+        directory = directory.parent
+
+
+def _validate_shared_projects_directory(path: Path) -> None:
+    """Require the shared projects directory and its parent to be safe."""
+
+    _validate_shared_projects_ancestors(path)
+
+    for directory in (path.parent, path):
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise ValueError(f"unsafe shared projects directory: {directory}") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ValueError(f"unsafe shared projects directory: {directory}")
+
+
+def _ensure_shared_projects_directory(path: Path) -> None:
+    """Create missing shared directories privately and validate existing ones."""
+
+    _validate_shared_projects_ancestors(path)
+    for directory in (path.parent, path):
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                # Another process may have created it. Validate the resulting
+                # directory below rather than trusting the race winner.
+                pass
+            info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ValueError(f"unsafe shared projects directory: {directory}")
+
+
+def _validate_managed_projects_link(link: Path, shared_projects: Path, name: str) -> None:
+    try:
+        raw_target = os.readlink(link)
+    except OSError as exc:
+        raise ValueError(f"managed projects directory is invalid for {name}") from exc
+    if raw_target != str(shared_projects):
+        raise ValueError(f"managed projects symlink has an unexpected target for {name}")
+    _validate_shared_projects_directory(shared_projects)
 
 
 def _read_json(path: Path) -> Any:
@@ -849,22 +925,75 @@ class ProfileStore:
         if profile_dir.exists() or profile_dir.is_symlink():
             raise FileExistsError(f"profile path already exists: {profile_dir}")
 
-        profile_dir.mkdir(mode=0o700)
-        os.chmod(profile_dir, 0o700)
-
         config_dir: Path | None = None if kind == "default" else profile_dir
-        record = {
-            "name": name,
-            "kind": kind,
-            "config_dir": None if config_dir is None else str(config_dir),
-            "projects_path": str(self.shared_projects),
-        }
-        next_state = self._copy_state()
-        next_state["profiles"].append(record)
-        if next_state.get("selected") is None:
-            next_state["selected"] = name
-            next_state["selection_revision"] += 1
-        self._write_state(next_state)
+        profile_dir_created = False
+        created_projects_link: tuple[Path, int, int] | None = None
+        try:
+            profile_dir.mkdir(mode=0o700)
+            profile_dir_created = True
+            os.chmod(profile_dir, 0o700)
+
+            if kind == "managed":
+                _ensure_shared_projects_directory(self.shared_projects)
+                projects_link = profile_dir / "projects"
+                projects_link.symlink_to(self.shared_projects, target_is_directory=True)
+                link_info = projects_link.lstat()
+                created_projects_link = (projects_link, link_info.st_dev, link_info.st_ino)
+
+            record = {
+                "name": name,
+                "kind": kind,
+                "config_dir": None if config_dir is None else str(config_dir),
+                "projects_path": str(self.shared_projects),
+            }
+            next_state = self._copy_state()
+            next_state["profiles"].append(record)
+            if next_state.get("selected") is None:
+                next_state["selected"] = name
+                next_state["selection_revision"] += 1
+            self._write_state(next_state)
+        except BaseException:
+            # A metadata error can occur after the atomic replace succeeded.
+            # Keep the link and directory if the registry already committed
+            # the profile, so the on-disk state remains usable.
+            try:
+                disk_state = _read_json(self._state_path)
+                disk_profiles = disk_state.get("profiles") if isinstance(disk_state, dict) else None
+                committed = isinstance(disk_profiles, list) and any(
+                    isinstance(item, dict)
+                    and item.get("name") == name
+                    and item.get("kind") == kind
+                    and item.get("config_dir") == (None if config_dir is None else str(config_dir))
+                    for item in disk_profiles
+                )
+            except (OSError, ValueError):
+                committed = False
+
+            if not committed:
+                if created_projects_link is not None:
+                    projects_link, device, inode = created_projects_link
+                    try:
+                        current = projects_link.lstat()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                    else:
+                        if (
+                            stat.S_ISLNK(current.st_mode)
+                            and current.st_dev == device
+                            and current.st_ino == inode
+                        ):
+                            try:
+                                projects_link.unlink()
+                            except OSError:
+                                pass
+                if profile_dir_created:
+                    try:
+                        profile_dir.rmdir()
+                    except OSError:
+                        pass
+            raise
         self._state = next_state
         return Profile(name=name, config_dir=config_dir)
 
@@ -923,8 +1052,18 @@ class ProfileStore:
                     raise ValueError(f"managed config directory is not private for {name}")
                 if not config_path.resolve().is_relative_to(self.profiles_dir.resolve()):
                     raise ValueError(f"config directory escapes profile store for {name}")
-                if (config_path / "projects").is_symlink():
-                    raise ValueError(f"managed projects directory is a symlink for {name}")
+                projects_path = config_path / "projects"
+                try:
+                    projects_info = projects_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISLNK(projects_info.st_mode):
+                        _validate_managed_projects_link(
+                            projects_path, self.shared_projects, name
+                        )
+                    elif not stat.S_ISDIR(projects_info.st_mode):
+                        raise ValueError(f"managed projects entry is not a directory for {name}")
             if raw_record.get("projects_path") != str(self.shared_projects):
                 raise ValueError(f"invalid projects directory for profile {name}")
             profiles.append(
