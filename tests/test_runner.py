@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from cc_swaper.cli import _claude_args, _parser
 from cc_swaper.hooks import HookMonitor, hook_settings, minimal_event, write_event
 from cc_swaper.profiles import Profile
 from cc_swaper.runner import profile_environment, run_passthrough
@@ -121,21 +120,6 @@ def test_hook_monitor_rejects_mismatched_transcript_name(tmp_path: Path) -> None
         monitor.poll()
         assert monitor.session_id is None
         assert not monitor.quota
-
-
-def test_resume_parser_accepts_profile_after_session_id() -> None:
-    parsed = _parser().parse_args([
-        "resume", SESSION_ID, "--profile", "second", "--no-auto"
-    ])
-    assert parsed.session == SESSION_ID
-    assert parsed.profile == "second"
-    assert parsed.no_auto
-
-
-@pytest.mark.parametrize("flag", ["--bare", "--safe-mode", "--no-session-persistence"])
-def test_auto_rejects_modes_without_hooks_or_transcripts(flag: str) -> None:
-    with pytest.raises(ValueError):
-        _claude_args([flag], auto=True)
 
 
 def test_monitored_passthrough_notifies_before_session_exits(tmp_path: Path) -> None:

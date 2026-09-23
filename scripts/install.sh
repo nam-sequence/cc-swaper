@@ -14,7 +14,7 @@ while (($#)); do
       ;;
     -h|--help)
       printf '%s\n' 'Usage: install.sh [--no-setup]' \
-        'Install ccs with uv. By default, initialize and configure ccs after installation.' \
+        'Install ccs with uv. By default, initialize profiles and the Zsh wrapper.' \
         'Use --no-setup to install the CLI without running ccs init or ccs setup.'
       exit 0
       ;;
@@ -135,6 +135,15 @@ else
   fi
 
   install_target=$wheel_path
+fi
+
+# Remove the v0.6 always-on monitor before replacing its ccs executable.
+# This does not stop any existing tmux/Claude sessions.
+if [[ "$(uname -s)" == Darwin ]] && command -v ccs >/dev/null 2>&1; then
+  installed_version=$(ccs --version 2>/dev/null || true)
+  if [[ "$installed_version" =~ ^ccs\ 0\.[0-6]\.[0-9]+$ ]]; then
+    ccs service uninstall
+  fi
 fi
 
 uv tool install --force "$install_target"

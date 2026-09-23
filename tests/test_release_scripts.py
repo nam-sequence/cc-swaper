@@ -60,6 +60,7 @@ def test_checkout_no_setup_installs_project_without_running_ccs(
         fake_bin / "uv",
         '#!/bin/sh\nprintf "%s\\n" "$@" > "$UV_LOG"\n',
     )
+    _write_executable(fake_bin / "ccs", '#!/bin/sh\nprintf "ccs 0.7.0\\n"\n')
     env = os.environ.copy()
     env.update({"PATH": f"{fake_bin}{os.pathsep}{env['PATH']}", "UV_LOG": str(uv_log)})
 
@@ -77,6 +78,7 @@ def test_checkout_no_setup_installs_project_without_running_ccs(
 def test_checkout_default_still_initializes_and_sets_up_ccs(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    _write_executable(fake_bin / "uname", '#!/bin/sh\nprintf "Darwin\\n"\n')
     uv_log = tmp_path / "uv.log"
     ccs_log = tmp_path / "ccs.log"
     _write_executable(
@@ -102,7 +104,105 @@ def test_checkout_default_still_initializes_and_sets_up_ccs(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert uv_log.read_text(encoding="utf-8").splitlines()[:3] == ["tool", "install", "--force"]
-    assert ccs_log.read_text(encoding="utf-8").splitlines() == ["list", "init", "setup"]
+    assert ccs_log.read_text(encoding="utf-8").splitlines() == ["--version", "list", "init", "setup"]
+
+
+def test_upgrade_stops_old_monitor_before_replacing_cli(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "uname", '#!/bin/sh\nprintf "Darwin\\n"\n')
+    actions = tmp_path / "actions.log"
+    _write_executable(
+        fake_bin / "ccs",
+        '#!/bin/sh\n'
+        'if [ "$1" = --version ]; then printf "ccs 0.6.0\\n"; exit 0; fi\n'
+        'printf "ccs %s\\n" "$*" >> "$ACTIONS"\n',
+    )
+    _write_executable(
+        fake_bin / "uv",
+        '#!/bin/sh\nprintf "uv %s\\n" "$*" >> "$ACTIONS"\n',
+    )
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}{os.pathsep}{env['PATH']}", "ACTIONS": str(actions)})
+
+    result = _run_bash(INSTALLER, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert actions.read_text(encoding="utf-8").splitlines() == [
+        "ccs service uninstall",
+        f"uv tool install --force {ROOT}",
+        "ccs list",
+        "ccs setup",
+    ]
+
+
+def test_no_setup_still_removes_old_macos_monitor(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    actions = tmp_path / "actions.log"
+    _write_executable(fake_bin / "uname", '#!/bin/sh\nprintf "Darwin\\n"\n')
+    _write_executable(
+        fake_bin / "ccs",
+        '#!/bin/sh\n'
+        'if [ "$1" = --version ]; then printf "ccs 0.6.0\\n"; exit 0; fi\n'
+        'printf "ccs %s\\n" "$*" >> "$ACTIONS"\n',
+    )
+    _write_executable(fake_bin / "uv", '#!/bin/sh\nprintf "uv %s\\n" "$*" >> "$ACTIONS"\n')
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}{os.pathsep}{env['PATH']}", "ACTIONS": str(actions)})
+
+    result = _run_bash(INSTALLER, "--no-setup", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert actions.read_text(encoding="utf-8").splitlines() == [
+        "ccs service uninstall",
+        f"uv tool install --force {ROOT}",
+    ]
+
+
+def test_linux_upgrade_skips_macos_service_cleanup(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    actions = tmp_path / "actions.log"
+    _write_executable(fake_bin / "uname", '#!/bin/sh\nprintf "Linux\\n"\n')
+    _write_executable(
+        fake_bin / "ccs",
+        '#!/bin/sh\n'
+        'if [ "$1" = --version ]; then printf "ccs 0.6.0\\n"; exit 0; fi\n'
+        'printf "ccs %s\\n" "$*" >> "$ACTIONS"\n',
+    )
+    _write_executable(fake_bin / "uv", '#!/bin/sh\nprintf "uv %s\\n" "$*" >> "$ACTIONS"\n')
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}{os.pathsep}{env['PATH']}", "ACTIONS": str(actions)})
+
+    result = _run_bash(INSTALLER, "--no-setup", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert actions.read_text(encoding="utf-8").splitlines() == [
+        f"uv tool install --force {ROOT}",
+    ]
+
+
+def test_upgrade_keeps_old_cli_when_monitor_removal_fails(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    uv_log = tmp_path / "uv.log"
+    _write_executable(fake_bin / "uname", '#!/bin/sh\nprintf "Darwin\\n"\n')
+    _write_executable(
+        fake_bin / "ccs",
+        '#!/bin/sh\n'
+        'if [ "$1" = --version ]; then printf "ccs 0.6.0\\n"; exit 0; fi\n'
+        'if [ "$1" = service ] && [ "$2" = uninstall ]; then exit 9; fi\n'
+        'exit 0\n',
+    )
+    _write_executable(fake_bin / "uv", '#!/bin/sh\nprintf "called\\n" > "$UV_LOG"\n')
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}{os.pathsep}{env['PATH']}", "UV_LOG": str(uv_log)})
+
+    result = _run_bash(INSTALLER, "--no-setup", env=env)
+
+    assert result.returncode == 9
+    assert not uv_log.exists()
 
 
 def test_installer_reports_missing_uv_before_installing(tmp_path: Path) -> None:
@@ -146,6 +246,7 @@ def _standalone_fixture(
         fake_bin / "uv",
         '#!/bin/sh\nprintf "%s\\n" "$@" > "$UV_LOG"\n',
     )
+    _write_executable(fake_bin / "ccs", '#!/bin/sh\nprintf "ccs 0.7.0\\n"\n')
     _write_executable(
         fake_bin / "curl",
         "#!/bin/sh\n"
