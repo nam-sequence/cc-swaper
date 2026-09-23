@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-swaper"
+version = "0.4.0"
+description = "Switch between separately authenticated Claude Code accounts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ccs = "cc_swaper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
