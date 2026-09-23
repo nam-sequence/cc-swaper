@@ -11,6 +11,7 @@ import pytest
 from cc_swaper import cli
 from cc_swaper.profiles import ProfileStore
 from cc_swaper.usage import UsageError, UsageSnapshot
+from cc_swaper.usage_table import render_usage_table
 
 
 def _store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProfileStore:
@@ -54,6 +55,23 @@ def test_usage_lists_all_profiles_with_bars_and_resets(
     assert "Sep 25 at 1:59am" in output
     assert "chưa có mốc reset" in output
     assert "subscription ends at" not in output
+    lines = output.splitlines()
+    second_row = next(index for index, line in enumerate(lines) if "second (max)" in line)
+    assert lines[second_row - 1].startswith("+")
+    # Top, header, account boundary, bottom: no divider within 5h/7d/model rows.
+    assert sum(line.startswith("+") for line in lines) == 4
+
+
+def test_loading_table_separates_account_rows() -> None:
+    table = render_usage_table(
+        ["main", "second"], {},
+        {"main": "Đang tải", "second": "Chờ lượt"},
+        columns=80, compact=True,
+    )
+    lines = table.splitlines()
+    second_row = next(index for index, line in enumerate(lines) if "| second" in line)
+    assert lines[second_row - 1].startswith("+")
+    assert sum(line.startswith("+") for line in lines) == 4
 
 
 def test_usage_json_uses_null_for_unavailable_reset(

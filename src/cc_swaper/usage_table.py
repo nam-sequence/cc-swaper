@@ -34,7 +34,9 @@ def _grid(headers: Sequence[str], rows: Sequence[Sequence[str]], widths: Sequenc
         ]
 
     lines = [border, *render_row(headers), border]
-    for row in rows:
+    for index, row in enumerate(rows):
+        if index > 0 and row[0]:
+            lines.append(border)
         lines.extend(render_row(row))
     lines.append(border)
     return "\n".join(lines)
