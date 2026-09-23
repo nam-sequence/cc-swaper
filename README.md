@@ -6,10 +6,10 @@ A small CLI for Claude Code accounts. Add profiles, choose which account new Cla
 
 Requires Claude Code, Python 3.10+, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). The `claude` shell wrapper supports interactive Zsh; `ccs` works from any shell. `tmux` is no longer required.
 
-Install from the v0.7.0 release:
+Install from the v0.7.1 release:
 
 ```bash
-curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.7.0/install.sh
+curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.7.1/install.sh
 bash install.sh
 ```
 
@@ -22,7 +22,7 @@ For a local checkout, run `bash scripts/install.sh`. With a manual `uv tool inst
 ```bash
 ccs list                        # * marks the selected account
 ccs add work                    # add a profile and sign in via Claude Code
-ccs switch                      # choose from a numbered list
+ccs switch                      # use Up/Down, Enter to select, Esc to cancel
 ccs switch work                 # select by name
 claude                          # native Claude with the selected account
 claude -c                       # continue within that account
@@ -51,12 +51,12 @@ To uninstall later, run `ccs shell uninstall`, then `uv tool uninstall cc-swaper
 
 ## Build a release
 
-Run `bash scripts/build-release.sh` to build `dist/release-v0.7.0/`:
+Run `bash scripts/build-release.sh` to build `dist/release-v0.7.1/`:
 
 | Asset | Purpose |
 | --- | --- |
-| `cc_swaper-0.7.0-py3-none-any.whl` | Installable wheel |
-| `cc_swaper-0.7.0.tar.gz` | Source distribution |
+| `cc_swaper-0.7.1-py3-none-any.whl` | Installable wheel |
+| `cc_swaper-0.7.1.tar.gz` | Source distribution |
 | `install.sh` | Version-pinned standalone installer |
 | `SHA256SUMS` | SHA-256 hashes for the other three assets |
 

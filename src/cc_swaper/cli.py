@@ -7,10 +7,12 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import stat
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -80,33 +82,126 @@ def _choose_profile_name(store: ProfileStore) -> str | None:
     if not profiles:
         raise RuntimeError("no account profiles are configured; run 'ccs init'")
     selected = store.selected().name
-    print("Choose an account:")
-    for index, profile in enumerate(profiles, start=1):
-        marker = " (selected)" if profile.name == selected else ""
-        name = f"@{profile.name}" if profile.name.isdecimal() else profile.name
-        print(f"  {index}. {name}{marker}")
-    print("  0. Cancel")
-    while True:
+    try:
+        columns = os.get_terminal_size(sys.stdout.fileno()).columns
+    except OSError:
+        columns = 80
+    if columns < 1:
+        columns = 80
+    option_width = max(0, columns - 1)
+
+    def render(cursor: int) -> None:
+        sys.stdout.write("\x1b[u")
+        for index, profile in enumerate(profiles):
+            name = f"@{profile.name}" if profile.name.isdecimal() else profile.name
+            marker = " (selected)" if profile.name == selected else ""
+            pointer = "> " if index == cursor else "  "
+            row = (pointer + name + marker)[:option_width]
+            sys.stdout.write("\r\x1b[2K" + row)
+            if index + 1 < len(profiles):
+                sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def read_key(fd: int) -> str:
+        """Read one menu key, bounding waits for partial ANSI sequences."""
+
+        def read_byte(timeout: float | None) -> bytes | None:
+            ready, _, _ = select.select([fd], [], [], timeout)
+            if not ready:
+                return None
+            return os.read(fd, 1)
+
+        first = read_byte(None)
+        if first in (b"\r", b"\n"):
+            return "enter"
+        if first in (b"\x03", b"\x1a"):
+            return "cancel"
+        if first in (b"", None):
+            return "cancel"
+        if first != b"\x1b":
+            return "ignore"
+
+        # A lone Esc cancels promptly. CSI and SS3 arrow sequences may arrive
+        # byte by byte, so only wait a short, bounded time for their remainder.
+        prefix = read_byte(0.08)
+        if prefix is None or prefix == b"":
+            return "cancel"
+        if prefix not in (b"[", b"O"):
+            return "ignore"
+
+        deadline = time.monotonic() + 0.12
+        sequence_length = 0
+        while sequence_length < 32:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "ignore"
+            byte = read_byte(remaining)
+            if byte is None or byte == b"":
+                return "ignore"
+            sequence_length += 1
+            value = byte[0]
+            # The final byte of a CSI/SS3 sequence is in this range. This also
+            # consumes modified arrows such as ESC [ 1 ; 5 A safely.
+            if 0x40 <= value <= 0x7E:
+                if value == ord("A"):
+                    return "up"
+                if value == ord("B"):
+                    return "down"
+                return "ignore"
+        return "ignore"
+
+    fd = sys.stdin.fileno()
+    original_mode = termios.tcgetattr(fd)
+    cursor_hidden = False
+    menu_started = False
+    try:
         try:
-            choice = input("Enter a number or account name: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if not choice or choice.casefold() in {"0", "q", "quit"}:
-            return None
-        if choice.startswith("@"):
-            for profile in profiles:
-                if choice[1:] == profile.name:
-                    return profile.name
-        if choice.isdecimal():
-            index = int(choice)
-            if 1 <= index <= len(profiles):
-                return profiles[index - 1].name
-        else:
-            for profile in profiles:
-                if choice == profile.name:
-                    return profile.name
-        print(f"Invalid choice. Enter a number from 1 to {len(profiles)}, or 0 to cancel.")
+            menu_mode = list(original_mode)
+            menu_mode[6] = list(original_mode[6])
+            menu_mode[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+            menu_mode[6][termios.VMIN] = 1
+            menu_mode[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSADRAIN, menu_mode)
+            cursor_hidden = True
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.write(
+                "Choose an account:\n"
+                "Use ↑/↓ to move, Enter to select, Esc/Ctrl-C/Ctrl-Z to cancel.\n\n"
+            )
+            sys.stdout.write("\x1b[s")
+            menu_started = True
+            cursor = next(
+                (index for index, profile in enumerate(profiles) if profile.name == selected),
+                0,
+            )
+            render(cursor)
+            while True:
+                key = read_key(fd)
+                if key == "enter":
+                    return profiles[cursor].name
+                if key == "cancel":
+                    return None
+                if key == "up":
+                    cursor = (cursor - 1) % len(profiles)
+                    render(cursor)
+                elif key == "down":
+                    cursor = (cursor + 1) % len(profiles)
+                    render(cursor)
+        finally:
+            try:
+                if menu_started:
+                    sys.stdout.write("\x1b[u")
+                    if len(profiles) > 1:
+                        sys.stdout.write(f"\x1b[{len(profiles) - 1}B")
+                    sys.stdout.write("\r\n")
+                if cursor_hidden:
+                    sys.stdout.write("\x1b[?25h")
+                sys.stdout.flush()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, original_mode)
+    except KeyboardInterrupt:
+        # Also restore cleanly for an externally delivered SIGINT.
+        return None
 
 
 def _native(store: ProfileStore, args: list[str]) -> int:

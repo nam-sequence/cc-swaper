@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-import io
+import fcntl
 import json
 import os
+import pty
+import re
+import select
+import signal
+import struct
 import subprocess
 import sys
+import termios
+import time
 import uuid
 from pathlib import Path
 
@@ -48,27 +55,272 @@ def test_switch_persists_account_without_starting_a_session(
     assert ProfileStore(store.home).background_sessions() == {}
 
 
-class _TTY(io.StringIO):
-    def isatty(self) -> bool:
-        return True
+def _switch_in_pty(
+    store: ProfileStore,
+    keys: bytes,
+    auth_marker: Path,
+    *,
+    interrupt: bool = False,
+    terminal_width: int = 80,
+) -> tuple[int, str, list[object], list[object]]:
+    """Run the real interactive command on a PTY and return its terminal state."""
+
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(
+        slave_fd,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", 24, terminal_width, 0, 0),
+    )
+    original_terminal = termios.tcgetattr(slave_fd)
+    source_dir = str(Path(__file__).resolve().parents[1] / "src")
+    env = {
+        "HOME": str(store.home.parent),
+        "CC_SWAPER_HOME": str(store.home),
+        "CC_SWAPER_TEST_AUTH_MARKER": str(auth_marker),
+        "PYTHONPATH": source_dir,
+        "TERM": "xterm-256color",
+    }
+    code = """
+import os
+from pathlib import Path
+from cc_swaper import cli
+
+cli.claude_binary = lambda: '/fake/claude'
+
+def fake_auth_status(*_args):
+    Path(os.environ['CC_SWAPER_TEST_AUTH_MARKER']).write_text('checked')
+    return True, 'claude.ai'
+
+cli.auth_status = fake_auth_status
+raise SystemExit(cli.main(['switch']))
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+    )
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + 5
+        # Wait for the picker to enter character mode before sending keys, so
+        # the PTY's canonical line discipline cannot consume or rewrite them.
+        while termios.tcgetattr(slave_fd)[3] & termios.ICANON:
+            if process.poll() is not None:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail("switch picker did not enter character mode")
+            readable, _, _ = select.select([master_fd], [], [], 0.05)
+            if readable:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+
+        if process.poll() is None:
+            menu_mode = termios.tcgetattr(slave_fd)
+            assert not (menu_mode[3] & termios.ICANON), (
+                "switch picker exited or remained in canonical terminal mode; "
+                f"output so far: {output.decode(errors='replace')}"
+            )
+            assert not (menu_mode[3] & termios.ISIG), (
+                "switch picker left terminal-generated signals enabled"
+            )
+            if interrupt:
+                process.send_signal(signal.SIGINT)
+            else:
+                os.write(master_fd, keys)
+
+        deadline = time.monotonic() + 5
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "switch picker did not finish after key input; "
+                    f"output so far: {output.decode(errors='replace')}"
+                )
+            readable, _, _ = select.select([master_fd], [], [], 0.05)
+            if readable:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        return_code = process.wait(timeout=1)
+        # Capture the final status message after the process has restored its
+        # terminal and exited.
+        readable, _, _ = select.select([master_fd], [], [], 0.05)
+        if readable:
+            try:
+                output.extend(os.read(master_fd, 4096))
+            except OSError:
+                pass
+        restored_terminal = termios.tcgetattr(slave_fd)
+        return (
+            return_code,
+            output.decode(errors="replace"),
+            original_terminal,
+            restored_terminal,
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master_fd)
+        os.close(slave_fd)
 
 
-def test_switch_picker_cancellation_keeps_the_current_profile(
+def _assert_terminal_restored(
+    original_terminal: list[object], restored_terminal: list[object]
+) -> None:
+    assert restored_terminal[:3] == original_terminal[:3]
+    # The PTY kernel sets PENDIN after character-mode input returns to canonical
+    # mode, even when the program restores the original termios attributes.
+    pending_input_flag = getattr(termios, "PENDIN", 0)
+    assert restored_terminal[3] & ~pending_input_flag == (
+        original_terminal[3] & ~pending_input_flag
+    )
+    assert restored_terminal[4:] == original_terminal[4:]
+
+
+def test_switch_picker_down_selects_profile_and_restores_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path, monkeypatch)
-    terminal_in = _TTY("0\n")
-    terminal_out = _TTY()
-    monkeypatch.setattr(cli.sys, "stdin", terminal_in)
-    monkeypatch.setattr(cli.sys, "stdout", terminal_out)
-    monkeypatch.setattr(
-        cli, "auth_status", lambda *_args: pytest.fail("checked login after cancellation")
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, b"\x1b[B\r", auth_marker
     )
 
-    assert cli.main(["switch"]) == 0
+    assert return_code == 0
+    assert "Selected 'work'." in output
+    assert ProfileStore(store.home).selected().name == "work"
+    assert auth_marker.read_text() == "checked"
+    _assert_terminal_restored(original_terminal, restored_terminal)
 
-    assert "Account selection canceled." in terminal_out.getvalue()
+
+@pytest.mark.parametrize(
+    "up_sequence",
+    [b"\x1b[A", b"\x1bOA"],
+    ids=["csi", "ss3"],
+)
+def test_switch_picker_up_selects_profile_and_restores_terminal(
+    up_sequence: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.select("work")
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, up_sequence + b"\r", auth_marker
+    )
+
+    assert return_code == 0
+    assert "Selected 'main'." in output
     assert ProfileStore(store.home).selected().name == "main"
+    assert auth_marker.read_text() == "checked"
+    _assert_terminal_restored(original_terminal, restored_terminal)
+
+
+def test_switch_picker_enter_keeps_the_initially_selected_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.select("work")
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, b"\r", auth_marker
+    )
+
+    assert return_code == 0
+    assert "Selected 'work'." in output
+    assert ProfileStore(store.home).selected().name == "work"
+    assert auth_marker.read_text() == "checked"
+    _assert_terminal_restored(original_terminal, restored_terminal)
+
+
+def test_switch_picker_escape_cancels_without_auth_or_selection_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, b"\x1b", auth_marker
+    )
+
+    assert return_code == 0
+    assert "Account selection canceled." in output
+    assert ProfileStore(store.home).selected().name == "main"
+    assert not auth_marker.exists()
+    _assert_terminal_restored(original_terminal, restored_terminal)
+
+
+def test_switch_picker_sigint_cancels_and_restores_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, b"", auth_marker, interrupt=True
+    )
+
+    assert return_code == 0
+    assert "Account selection canceled." in output
+    assert ProfileStore(store.home).selected().name == "main"
+    assert not auth_marker.exists()
+    _assert_terminal_restored(original_terminal, restored_terminal)
+
+
+def test_switch_picker_ctrl_z_cancels_and_restores_terminal_and_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    auth_marker = tmp_path / "auth-checked"
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store, b"\x1a", auth_marker
+    )
+
+    assert return_code == 0
+    assert "Account selection canceled." in output
+    assert "\x1b[?25l" in output
+    assert "\x1b[?25h" in output
+    assert ProfileStore(store.home).selected().name == "main"
+    assert not auth_marker.exists()
+    _assert_terminal_restored(original_terminal, restored_terminal)
+
+
+def test_switch_picker_clips_long_rows_on_narrow_terminal_and_selects_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    long_name = "long_" + "x" * 100
+    store.add_managed(long_name)
+    auth_marker = tmp_path / "auth-checked"
+    terminal_width = 40
+
+    return_code, output, original_terminal, restored_terminal = _switch_in_pty(
+        store,
+        b"\x1b[B\x1b[B\r",
+        auth_marker,
+        terminal_width=terminal_width,
+    )
+
+    raw_rows = re.findall(r"\r\x1b\[2K([^\r\n]*)", output)
+    visible_rows = [
+        re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", row) for row in raw_rows
+    ]
+    assert return_code == 0
+    assert "Selected '" + long_name + "'." in output
+    assert ProfileStore(store.home).selected().name == long_name
+    assert auth_marker.read_text() == "checked"
+    assert len(visible_rows) >= 9  # initial render plus two arrow redraws
+    assert any(long_name[:12] in row for row in visible_rows)
+    assert all(len(row) <= terminal_width for row in visible_rows)
+    _assert_terminal_restored(original_terminal, restored_terminal)
 
 
 def test_switch_refuses_a_logged_out_profile_without_changing_selection(
