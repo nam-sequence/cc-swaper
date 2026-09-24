@@ -70,6 +70,7 @@ def claude_binary() -> str:
 def profile_environment(profile: Profile) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not _overrides_subscription(key)}
     env.pop("CLAUDE_CONFIG_DIR", None)
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     env.pop("CC_SWAPER_RUN_ID", None)
     if profile.config_dir is not None:
         for key in (

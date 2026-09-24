@@ -204,20 +204,55 @@ def _choose_profile_name(store: ProfileStore) -> str | None:
         return None
 
 
+def _prepare_onboarding(store: ProfileStore, profile_name: str, binary: str) -> None:
+    """Complete missing per-profile TUI state before a signed-in launch."""
+
+    from .onboarding import needs_repair, repair_if_authenticated
+
+    profile = store.get_fresh(profile_name)
+    if not needs_repair(profile):
+        return
+    # auth status can take up to ten seconds while the first launcher holds
+    # this lock. Give that repair time to finish before reporting contention.
+    deadline = time.monotonic() + 12.0
+    while True:
+        try:
+            with _profile_lock(store, profile_name, exclusive=True):
+                profile = store.get_fresh(profile_name)
+                repair_if_authenticated(profile, binary)
+                return
+        except RuntimeError as exc:
+            if "currently in use" not in str(exc):
+                raise
+            if not needs_repair(store.get_fresh(profile_name)):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"profile '{profile_name}' needs one-time Claude setup repair; "
+                    "exit its other Claude sessions and retry"
+                ) from exc
+            time.sleep(0.05)
+
+
 def _native(store: ProfileStore, args: list[str]) -> int:
     """Run real Claude in this terminal with the currently selected login."""
 
     profile_name = store.selected().name
+    profile = store.get_fresh(profile_name)
+    if profile.config_dir is not None and any(
+        argument.split("=", 1)[0] in {"--bg", "--background"}
+        for argument in args
+    ):
+        raise RuntimeError(
+            "background Claude sessions are unavailable for managed profiles; "
+            "run Claude in this terminal"
+        )
+    binary = claude_binary()
+    if profile.config_dir is not None and _starts_native_session(args):
+        _prepare_onboarding(store, profile_name, binary)
+
     with _profile_lock(store, profile_name, exclusive=False):
         profile = store.get_fresh(profile_name)
-        if profile.config_dir is not None and any(
-            argument.split("=", 1)[0] in {"--bg", "--background"}
-            for argument in args
-        ):
-            raise RuntimeError(
-                "background Claude sessions are unavailable for managed profiles; "
-                "run Claude in this terminal"
-            )
         environment = profile_environment(profile)
         forwarded = args
         if profile.config_dir is not None and _uses_interactive_customizations(args):
@@ -229,7 +264,7 @@ def _native(store: ProfileStore, args: list[str]) -> int:
             environment.update(settings_env)
             environment.update(mcp_env)
             forwarded = [*settings_args, *mcp_args, *args]
-        return run_passthrough(claude_binary(), forwarded, environment)
+        return run_passthrough(binary, forwarded, environment)
 
 
 _NATIVE_ADMIN_COMMANDS = frozenset({
@@ -240,7 +275,7 @@ _NATIVE_ADMIN_COMMANDS = frozenset({
 })
 
 
-def _uses_interactive_customizations(args: list[str]) -> bool:
+def _starts_native_session(args: list[str]) -> bool:
     if args and args[0] in _NATIVE_ADMIN_COMMANDS:
         return False
     if (
@@ -250,7 +285,14 @@ def _uses_interactive_customizations(args: list[str]) -> bool:
     ):
         return False
     return not any(
-        argument.split("=", 1)[0] in {"--bare", "--safe-mode", "--help", "--version", "-h", "-v"}
+        argument.split("=", 1)[0] in {"--help", "--version", "-h", "-v"}
+        for argument in args
+    )
+
+
+def _uses_interactive_customizations(args: list[str]) -> bool:
+    return _starts_native_session(args) and not any(
+        argument.split("=", 1)[0] in {"--bare", "--safe-mode"}
         for argument in args
     )
 

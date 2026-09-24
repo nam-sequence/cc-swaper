@@ -6,10 +6,10 @@ A small CLI for Claude Code accounts. Add profiles, choose which account new Cla
 
 Requires Claude Code, Python 3.10+, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). The `claude` shell wrapper supports interactive Zsh; `ccs` works from any shell. `tmux` is no longer required.
 
-Install from the v0.8.0 release:
+Install from the v0.8.1 release:
 
 ```bash
-curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.0/install.sh
+curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.1/install.sh
 bash install.sh
 ```
 
@@ -51,18 +51,20 @@ From v0.7.2, `ccs` accepts only an exact managed `projects` link to the user's `
 
 From v0.8.0, normal Claude launches under an added profile also load a private snapshot of the default account's selected user preferences, authored skills, agents, rules, and commands. The profile's own settings file and account-synced skills remain untouched; values already set in that profile take precedence over the shared snapshot. Account authentication, permissions, trust, and remote-control settings are excluded. Unknown or unsupported settings keys stay profile-local. The default account is the source of truth for shared customizations. The snapshot uses `--settings`, which Claude applies above project and local settings for that session; shared plugin enablement can therefore override a project-level plugin choice. Authentication commands and `ccs usage` do not load this snapshot. Managed profiles reject native `claude --bg` because ccs cannot safely retain their profile lock after Claude detaches.
 
+From v0.8.1, ccs repairs a managed profile's missing Claude TUI onboarding marker before launching a session if Claude reports that profile as already signed in. Claude can otherwise show its login wizard despite valid credentials, particularly after `claude auth login` or an IDE sign-in. The one-time repair changes only `hasCompletedOnboarding` in that profile's private `.claude.json`; it leaves the account and project values intact and does not read or copy credential tokens. ccs waits for another ccs launch to finish the same repair. If a different session keeps that profile in use, exit it and retry. Open a new terminal after upgrading so the Zsh wrapper uses the current Claude binary.
+
 Marketplace plugins are offered from the default account's read-only plugin seed while each profile keeps its own synced plugins and mutable plugin state; marketplace entries with credential-bearing URLs are omitted. Credential-free user MCP definitions from the default account are passed to normal sessions through a private `--mcp-config` snapshot. By default, ccs skips definitions with headers, helpers, inline credential patterns, or a nonempty `env` map; the reviewed `FIRECRAWL_API_URL` with a credential-free URL is the only allowed environment entry. Other MCP definitions must be configured separately for that account. MCP OAuth sign-ins remain per account. To authenticate a shared MCP server, open a normal Claude session under the selected profile and use `/mcp`; the native `claude mcp` command does not load the temporary shared server list. Generated snapshots live inside each private managed profile and can contain MCP connection details; `ccs` never prints their values. Main-account plugin code, command-valued settings such as `statusLine`, and shared MCP commands run as your OS user inside the selected profile's Claude process. `CLAUDE_CONFIG_DIR` separates Claude's stored account data; it does not restrict those commands from reading other files or inherited environment variables available to your OS user. Restart a running Claude process to pick up changes to the default account's settings or resources.
 
 To uninstall later, run `ccs shell uninstall`, then `uv tool uninstall cc-swaper`. This leaves the profile registry and Claude's own data intact.
 
 ## Build a release
 
-Run `bash scripts/build-release.sh` to build `dist/release-v0.8.0/`:
+Run `bash scripts/build-release.sh` to build `dist/release-v0.8.1/`:
 
 | Asset | Purpose |
 | --- | --- |
-| `cc_swaper-0.8.0-py3-none-any.whl` | Installable wheel |
-| `cc_swaper-0.8.0.tar.gz` | Source distribution |
+| `cc_swaper-0.8.1-py3-none-any.whl` | Installable wheel |
+| `cc_swaper-0.8.1.tar.gz` | Source distribution |
 | `install.sh` | Version-pinned standalone installer |
 | `SHA256SUMS` | SHA-256 hashes for the other three assets |
 

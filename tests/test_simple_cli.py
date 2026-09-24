@@ -13,11 +13,12 @@ import sys
 import termios
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from cc_swaper import cli, service, shared_mcp_plugins, shared_settings, tmux_sessions
+from cc_swaper import cli, onboarding, service, shared_mcp_plugins, shared_settings, tmux_sessions
 from cc_swaper.profiles import ProfileStore
 
 
@@ -432,6 +433,9 @@ def test_native_applies_shared_overlays_only_to_normal_managed_launches(
     assert env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] == "1"
     assert env["CLAUDE_CODE_PLUGIN_SEED_DIR"] == "/private/plugins"
 
+    assert cli.main(["native", "--", "--dangerously-skip-permissions"]) == 0
+    assert launches[-1][0][-1] == "--dangerously-skip-permissions"
+
     calls.clear()
     for admin_command in (
         "auth", "auto-mode", "daemon", "mcp", "plugin", "remote-control",
@@ -462,6 +466,70 @@ def test_native_applies_shared_overlays_only_to_normal_managed_launches(
     assert "CLAUDE_CONFIG_DIR" not in launches[-1][1]
     assert cli.main(["native", "--", "--bg"]) == 0
     assert launches[-1][0] == ["--bg"]
+
+
+def test_native_repairs_signed_in_profile_before_opening_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.select("work")
+    profile = store.get("work")
+    assert profile.config_dir is not None
+    state_path = profile.config_dir / ".claude.json"
+    state_path.write_text('{"oauthAccount":{"id":"private"}}', encoding="utf-8")
+    state_path.chmod(0o600)
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(onboarding, "auth_details", lambda *_args: {
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "configDirectory": str(profile.config_dir),
+    })
+    monkeypatch.setattr(shared_settings, "prepare_shared_settings", lambda *_args: ([], {}))
+    monkeypatch.setattr(shared_mcp_plugins, "prepare_shared_mcp_plugins", lambda *_args: ([], {}))
+    seen: list[dict[str, object]] = []
+
+    def fake_claude(_binary: str, _args: list[str], _env: dict[str, str]) -> int:
+        seen.append(json.loads(state_path.read_text(encoding="utf-8")))
+        return 0
+
+    monkeypatch.setattr(cli, "run_passthrough", fake_claude)
+    assert cli.main(["native", "--", "auth", "status"]) == 0
+    assert "hasCompletedOnboarding" not in seen[-1]
+    assert cli.main(["native", "--", "--dangerously-skip-permissions"]) == 0
+    assert seen[-1] == {
+        "oauthAccount": {"id": "private"},
+        "hasCompletedOnboarding": True,
+    }
+
+
+def test_onboarding_launch_rechecks_marker_after_another_launcher_repairs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    profile = store.get("work")
+    assert profile.config_dir is not None
+    state_path = profile.config_dir / ".claude.json"
+    state_path.write_text("{}", encoding="utf-8")
+    state_path.chmod(0o600)
+    calls = 0
+
+    @contextmanager
+    def contended_lock(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            state_path.write_text('{"hasCompletedOnboarding":true}', encoding="utf-8")
+        raise RuntimeError("profile 'work' is currently in use")
+        yield
+
+    monkeypatch.setattr(cli, "_profile_lock", contended_lock)
+    clock = iter((100.0, 105.0))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    cli._prepare_onboarding(store, "work", "/fake/claude")
+    assert calls == 2
+    assert not onboarding.needs_repair(profile)
 
 
 @pytest.mark.parametrize("action", ["attach", "stop"])
