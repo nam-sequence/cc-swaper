@@ -305,12 +305,12 @@ def test_standalone_installer_rejects_bad_wheel_checksum(tmp_path: Path) -> None
     assert not uv_log.exists()
 
 
-def _copy_minimal_builder_repo(tmp_path: Path, *, init_version: str = "0.8.1") -> Path:
+def _copy_minimal_builder_repo(tmp_path: Path, *, init_version: str = "0.8.2") -> Path:
     project_dir = tmp_path / "repo"
     (project_dir / "scripts").mkdir(parents=True)
     (project_dir / "src" / "cc_swaper").mkdir(parents=True)
     (project_dir / "pyproject.toml").write_text(
-        '[project]\nname = "cc-swaper"\nversion = "0.8.1"\n',
+        '[project]\nname = "cc-swaper"\nversion = "0.8.2"\n',
         encoding="utf-8",
     )
     (project_dir / "src" / "cc_swaper" / "__init__.py").write_text(
@@ -331,8 +331,8 @@ def _fake_builder_bin(tmp_path: Path, *, build_fails: bool = False) -> Path:
         'while [ "$#" -gt 0 ]; do\n'
         '  if [ "$1" = --out-dir ]; then outdir=$2; shift 2; else shift; fi\n'
         'done\n'
-        'printf "fake wheel\\n" > "$outdir/cc_swaper-0.8.1-py3-none-any.whl"\n'
-        'printf "fake source\\n" > "$outdir/cc_swaper-0.8.1.tar.gz"\n'
+        'printf "fake wheel\\n" > "$outdir/cc_swaper-0.8.2-py3-none-any.whl"\n'
+        'printf "fake source\\n" > "$outdir/cc_swaper-0.8.2.tar.gz"\n'
     )
     _write_executable(
         fake_bin / "python3",
@@ -366,33 +366,33 @@ def test_release_builder_stages_only_fresh_versioned_assets(tmp_path: Path) -> N
     result = _run_bash(project_dir / "scripts" / "build-release.sh", env=env)
 
     assert result.returncode == 0, result.stderr
-    output_dir = project_dir / "dist" / "release-v0.8.1"
+    output_dir = project_dir / "dist" / "release-v0.8.2"
     assert {path.name for path in output_dir.iterdir()} == {
-        "cc_swaper-0.8.1-py3-none-any.whl",
-        "cc_swaper-0.8.1.tar.gz",
+        "cc_swaper-0.8.2-py3-none-any.whl",
+        "cc_swaper-0.8.2.tar.gz",
         "install.sh",
         "SHA256SUMS",
     }
     generated_installer = (output_dir / "install.sh").read_text(encoding="utf-8")
-    assert "release_version='0.8.1'" in generated_installer
+    assert "release_version='0.8.2'" in generated_installer
     assert VERSION_MARKER not in generated_installer
     assert stale_root_asset.read_text(encoding="utf-8") == "stale"
     sums = (output_dir / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     assert {line.split(maxsplit=1)[1].lstrip("*") for line in sums} == {
-        "cc_swaper-0.8.1-py3-none-any.whl",
-        "cc_swaper-0.8.1.tar.gz",
+        "cc_swaper-0.8.2-py3-none-any.whl",
+        "cc_swaper-0.8.2.tar.gz",
         "install.sh",
     }
     for line in sums:
         digest, asset = line.split(maxsplit=1)
         asset = asset.lstrip("*")
         assert hashlib.sha256((output_dir / asset).read_bytes()).hexdigest() == digest
-    assert "Release assets (v0.8.1)" in result.stdout
+    assert "Release assets (v0.8.2)" in result.stdout
     assert "stale" not in result.stdout
 
 
 def test_release_builder_rejects_version_mismatch_without_output(tmp_path: Path) -> None:
-    project_dir = _copy_minimal_builder_repo(tmp_path, init_version="0.8.2")
+    project_dir = _copy_minimal_builder_repo(tmp_path, init_version="0.8.3")
     fake_bin = _fake_builder_bin(tmp_path)
     env = os.environ.copy()
     env.update(
@@ -429,7 +429,7 @@ def test_release_builder_surfaces_uv_build_failure(tmp_path: Path) -> None:
 
 def test_release_builder_preserves_an_existing_release_directory(tmp_path: Path) -> None:
     project_dir = _copy_minimal_builder_repo(tmp_path)
-    output_dir = project_dir / "dist" / "release-v0.8.1"
+    output_dir = project_dir / "dist" / "release-v0.8.2"
     output_dir.mkdir(parents=True)
     user_file = output_dir / "notes.txt"
     user_file.write_text("keep this file", encoding="utf-8")
@@ -447,4 +447,4 @@ def test_release_builder_preserves_an_existing_release_directory(tmp_path: Path)
     assert result.returncode == 1
     assert "Release output already exists" in result.stderr
     assert user_file.read_text(encoding="utf-8") == "keep this file"
-    assert {path.name for path in (project_dir / "dist").iterdir()} == {"release-v0.8.1"}
+    assert {path.name for path in (project_dir / "dist").iterdir()} == {"release-v0.8.2"}

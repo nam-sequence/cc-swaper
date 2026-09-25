@@ -56,6 +56,196 @@ def test_switch_persists_account_without_starting_a_session(
     assert ProfileStore(store.home).background_sessions() == {}
 
 
+@pytest.mark.parametrize("selected_before", ["main", "work"])
+def test_remove_default_logs_out_and_keeps_shared_claude_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], selected_before: str,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.select(selected_before)
+    settings = Path.home() / ".claude" / "settings.json"
+    settings.write_text('{"theme":"keep"}', encoding="utf-8")
+    transcript = store.shared_projects / "keep.jsonl"
+    transcript.write_text("shared", encoding="utf-8")
+    (store.profiles_dir / "main" / "projects").symlink_to(
+        store.shared_projects, target_is_directory=True
+    )
+    signed_in = True
+    logout_envs: list[dict[str, str]] = []
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+
+    def fake_status(profile, _binary):
+        assert profile.name == "main"
+        return (signed_in, "claude.ai" if signed_in else "none")
+
+    def fake_claude(_binary, args, env):
+        nonlocal signed_in
+        assert args == ["auth", "logout"]
+        logout_envs.append(env)
+        signed_in = False
+        return 0
+
+    monkeypatch.setattr(cli, "auth_status", fake_status)
+    monkeypatch.setattr(cli, "run_passthrough", fake_claude)
+
+    assert cli.main(["remove", "main"]) == 0
+    assert len(logout_envs) == 1
+    assert "CLAUDE_CONFIG_DIR" not in logout_envs[0]
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in logout_envs[0]
+    assert [profile.name for profile in ProfileStore(store.home).all()] == ["work"]
+    assert ProfileStore(store.home).selected().name == "work"
+    archives = list((store.home / "removed").glob("main-*"))
+    assert len(archives) == 1
+    assert (archives[0] / "projects").is_symlink()
+    assert settings.read_text(encoding="utf-8") == '{"theme":"keep"}'
+    assert transcript.read_text(encoding="utf-8") == "shared"
+    output = capsys.readouterr().out
+    assert "Shared Claude configuration and sessions were kept" in output
+    assert ("Selected 'work' for new Claude sessions." in output) == (
+        selected_before == "main"
+    )
+
+
+def test_remove_default_purge_is_rejected_before_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: pytest.fail("checked auth"))
+    monkeypatch.setattr(cli, "run_passthrough", lambda *_args: pytest.fail("logged out"))
+
+    assert cli.main(["remove", "main", "--purge-data"]) == 2
+    assert "cannot purge the default profile" in capsys.readouterr().err
+    assert ProfileStore(store.home).get("main").config_dir is None
+
+
+def test_remove_default_logout_failure_keeps_registered_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: (True, "claude.ai"))
+    monkeypatch.setattr(cli, "run_passthrough", lambda *_args: 1)
+
+    assert cli.main(["remove", "main"]) == 2
+    assert "logout failed" in capsys.readouterr().err
+    assert ProfileStore(store.home).get("main").config_dir is None
+    assert list((store.home / "removed").iterdir()) == []
+
+
+def test_remove_default_in_use_does_not_check_auth_or_unregister(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: pytest.fail("checked auth"))
+    with cli._profile_lock(store, "main", exclusive=False):
+        assert cli.main(["remove", "main"]) == 2
+    assert ProfileStore(store.home).get("main").config_dir is None
+
+
+def test_remove_default_rechecks_kind_before_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    original_lock = cli._profile_lock
+    replaced = False
+
+    @contextmanager
+    def replace_before_lock(current_store: ProfileStore, name: str, *, exclusive: bool):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            archive = current_store.home / "removed"
+            archive.mkdir(mode=0o700)
+            current_store.remove_default(
+                "main", archive_to=archive / "main-20260925T000000Z-a1b2c3d4"
+            )
+            current_store.add_managed("main")
+        with original_lock(current_store, name, exclusive=exclusive):
+            yield
+
+    monkeypatch.setattr(cli, "_profile_lock", replace_before_lock)
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: pytest.fail("checked auth"))
+    monkeypatch.setattr(cli, "run_passthrough", lambda *_args: pytest.fail("logged out"))
+
+    assert cli.main(["remove", "main"]) == 2
+    assert "profile changed" in capsys.readouterr().err
+    assert ProfileStore(store.home).get("main").config_dir is not None
+
+
+def test_remove_default_rejects_unsafe_registration_before_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    registration = store.profiles_dir / "main"
+    registration.chmod(0o755)
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: pytest.fail("checked auth"))
+    monkeypatch.setattr(cli, "run_passthrough", lambda *_args: pytest.fail("logged out"))
+
+    assert cli.main(["remove", "main"]) == 2
+    assert "registration directory is missing or unsafe" in capsys.readouterr().err
+    assert ProfileStore(store.home).get("main").config_dir is None
+
+
+def test_list_distinguishes_fresh_and_intentionally_empty_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    store.remove_managed("work")
+    store.remove_default("main")
+    assert cli.main(["list"]) == 0
+    assert "No account profiles configured" in capsys.readouterr().out
+    assert cli.main(["add", "new", "--no-login"]) == 0
+    assert ProfileStore(store.home).selected().name == "new"
+
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "fresh-store"))
+    assert cli.main(["list"]) == 2
+    assert "run 'ccs init'" in capsys.readouterr().err
+
+
+def test_remove_only_default_reports_no_account_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_SWAPER_HOME", str(tmp_path / "store"))
+    store = ProfileStore()
+    store.add_default("main")
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: (False, "none"))
+    monkeypatch.setattr(cli, "run_passthrough", lambda *_args: pytest.fail("logged out"))
+
+    assert cli.main(["remove", "main"]) == 0
+    assert "No account profiles remain" in capsys.readouterr().out
+    assert ProfileStore(store.home).all() == []
+    assert cli.main(["list"]) == 0
+
+
+def test_native_after_default_removal_uses_remaining_managed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    archive = store.home / "removed"
+    archive.mkdir(mode=0o700)
+    store.remove_default(
+        "main", archive_to=archive / "main-20260925T000000Z-a1b2c3d4"
+    )
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    launches: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(
+        cli, "run_passthrough",
+        lambda _binary, args, env: launches.append((args, env)) or 0,
+    )
+
+    assert cli.main(["native", "--", "auth", "status"]) == 0
+    assert launches[-1][0] == ["auth", "status"]
+    assert launches[-1][1]["CLAUDE_CONFIG_DIR"] == str(store.get("work").config_dir)
+
+
 def _switch_in_pty(
     store: ProfileStore,
     keys: bytes,
@@ -464,8 +654,9 @@ def test_native_applies_shared_overlays_only_to_normal_managed_launches(
     assert calls == []
     assert launches[-1][0] == ["--model", "sonnet"]
     assert "CLAUDE_CONFIG_DIR" not in launches[-1][1]
-    assert cli.main(["native", "--", "--bg"]) == 0
-    assert launches[-1][0] == ["--bg"]
+    assert cli.main(["native", "--", "--bg"]) == 2
+    assert "background Claude sessions are unavailable" in capsys.readouterr().err
+    assert launches[-1][0] == ["--model", "sonnet"]
 
 
 def test_native_repairs_signed_in_profile_before_opening_tui(

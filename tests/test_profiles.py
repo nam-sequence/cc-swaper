@@ -46,14 +46,11 @@ def test_default_and_managed_profiles_are_private_and_record_projects_anchor(
     assert not (tmp_path / "store" / "profiles" / "work" / "credentials.json").exists()
 
 
-def test_default_must_be_added_first_and_selection_persists(tmp_path: Path) -> None:
+def test_managed_can_precede_default_and_selection_persists(tmp_path: Path) -> None:
     store = ProfileStore(tmp_path / "store")
-
-    with pytest.raises(ValueError, match="add_default"):
-        store.add_managed("work")
-
-    store.add_default("personal")
     store.add_managed("work")
+    assert store.selected().name == "work"
+    store.add_default("personal")
     selected = store.select("work")
     assert selected.name == "work"
     assert store.selected() == selected
@@ -61,6 +58,183 @@ def test_default_must_be_added_first_and_selection_persists(tmp_path: Path) -> N
     reopened = ProfileStore(tmp_path / "store")
     assert [profile.name for profile in reopened.all()] == ["personal", "work"]
     assert reopened.selected().name == "work"
+
+
+@pytest.mark.parametrize("selected_name", ["personal", "work"])
+def test_remove_default_archives_only_ccs_registration_data(
+    tmp_path: Path, selected_name: str,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("personal")
+    store.add_managed("work")
+    store.select(selected_name)
+    shared_settings = Path.home() / ".claude" / "settings.json"
+    shared_settings.write_text('{"theme":"keep"}', encoding="utf-8")
+    shared_marker = store.shared_projects / "keep.jsonl"
+    shared_marker.write_text("shared history", encoding="utf-8")
+    default_dir = home / "profiles" / "personal"
+    (default_dir / "projects").symlink_to(store.shared_projects, target_is_directory=True)
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    destination = archive / "personal-20260925T000000Z-a1b2c3d4"
+
+    assert store.remove_default("personal", archive_to=destination) == destination
+
+    assert not default_dir.exists()
+    assert (destination / "projects").is_symlink()
+    assert shared_settings.read_text(encoding="utf-8") == '{"theme":"keep"}'
+    assert shared_marker.read_text(encoding="utf-8") == "shared history"
+    reopened = ProfileStore(home)
+    assert [profile.name for profile in reopened.all()] == ["work"]
+    assert reopened.selected().name == "work"
+
+
+def test_remove_only_default_allows_empty_store_and_readding_accounts(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    destination = archive / "main-20260925T000000Z-a1b2c3d4"
+
+    store.remove_default("main", archive_to=destination)
+
+    reopened = ProfileStore(home)
+    assert reopened.has_registry()
+    assert reopened.all() == []
+    with pytest.raises(RuntimeError, match="no profile"):
+        reopened.selected()
+    reopened.add_managed("work")
+    assert reopened.selected().name == "work"
+    reopened.add_default("personal")
+    assert [profile.name for profile in ProfileStore(home).all()] == ["personal", "work"]
+    assert ProfileStore(home).selected().name == "work"
+    with pytest.raises(ValueError, match="default profile"):
+        reopened.add_default("another")
+
+
+def test_remove_default_rejects_purge_and_keeps_shared_data(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.shared_projects.mkdir(parents=True, exist_ok=True)
+    shared_marker = store.shared_projects / "keep.jsonl"
+    shared_marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be purged"):
+        store.remove_default("main", purge_data=True)
+
+    assert store.selected().name == "main"
+    assert shared_marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_default_cleans_only_its_session_metadata(tmp_path: Path) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("work")
+    main_project = tmp_path / "main-project"
+    work_project = tmp_path / "work-project"
+    main_project.mkdir()
+    work_project.mkdir()
+    main_transcript = store.shared_projects / "main.jsonl"
+    main_transcript.write_text("main history", encoding="utf-8")
+    work_transcript = store.shared_projects / "work.jsonl"
+    work_transcript.write_text("work history", encoding="utf-8")
+    main_id = "550e8400-e29b-41d4-a716-446655440000"
+    work_id = "550e8400-e29b-41d4-a716-446655440001"
+    store.set_last_session(main_project, main_id, profile_name="main", transcript_path=main_transcript)
+    store.set_last_session(work_project, work_id, profile_name="work", transcript_path=work_transcript)
+    store.set_background_session("a1b2c3d4e5f6", main_project, main_id, "main", main_transcript)
+    store.set_background_session("a1b2c3d4e5f7", work_project, work_id, "work", work_transcript)
+
+    store.remove_default("main")
+
+    reopened = ProfileStore(home)
+    assert reopened.last_session(main_project) is None
+    assert reopened.last_session(work_project) == work_id
+    assert reopened.background_session("a1b2c3d4e5f6") is None
+    assert reopened.background_session("a1b2c3d4e5f7") is not None
+    assert main_transcript.read_text(encoding="utf-8") == "main history"
+
+
+def test_remove_default_recovers_after_committed_registry_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("work")
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    destination = archive / "main-20260925T000000Z-a1b2c3d4"
+    original_write = store._write_state
+
+    def fail_after_commit(next_state):
+        original_write(next_state)
+        raise OSError("post-commit fsync failed")
+
+    monkeypatch.setattr(store, "_write_state", fail_after_commit)
+    with pytest.raises(OSError, match="post-commit fsync failed"):
+        store.remove_default("main", archive_to=destination)
+
+    reopened = ProfileStore(home)
+    assert [profile.name for profile in reopened.all()] == ["work"]
+    assert reopened.selected().name == "work"
+    assert destination.is_dir()
+    assert not (home / "profiles" / "main").exists()
+    assert not (home / "pending-removal.json").exists()
+
+
+def test_remove_default_rolls_back_before_registry_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "store"
+    store = ProfileStore(home)
+    store.add_default("main")
+    store.add_managed("work")
+    project = tmp_path / "project"
+    project.mkdir()
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    transcript = store.shared_projects / "keep.jsonl"
+    transcript.write_text("keep", encoding="utf-8")
+    store.set_last_session(project, session_id, profile_name="main", transcript_path=transcript)
+    store.set_background_session("a1b2c3d4e5f6", project, session_id, "main", transcript)
+    archive = home / "removed"
+    archive.mkdir(mode=0o700)
+    destination = archive / "main-20260925T000000Z-a1b2c3d4"
+
+    def fail_before_commit(_next_state):
+        raise OSError("registry write failed")
+
+    monkeypatch.setattr(store, "_write_state", fail_before_commit)
+    with pytest.raises(OSError, match="registry write failed"):
+        store.remove_default("main", archive_to=destination)
+
+    reopened = ProfileStore(home)
+    assert [profile.name for profile in reopened.all()] == ["main", "work"]
+    assert reopened.selected().name == "main"
+    assert (home / "profiles" / "main").is_dir()
+    assert not destination.exists()
+    assert reopened.last_session(project) == session_id
+    assert reopened.background_session("a1b2c3d4e5f6") is not None
+    assert transcript.read_text(encoding="utf-8") == "keep"
+    assert not (home / "pending-removal.json").exists()
+
+
+def test_delayed_selection_returns_false_when_target_was_removed(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "store")
+    store.add_default("main")
+    store.add_managed("work")
+    snapshot = store.selection_snapshot()
+
+    store.remove_managed("work")
+
+    assert not store.select_if_unchanged(snapshot, "work")
+    assert ProfileStore(store.home).selected().name == "main"
 
 
 def test_remove_managed_profile_selects_first_remaining_and_preserves_directory(

@@ -239,12 +239,12 @@ def _native(store: ProfileStore, args: list[str]) -> int:
 
     profile_name = store.selected().name
     profile = store.get_fresh(profile_name)
-    if profile.config_dir is not None and any(
+    if any(
         argument.split("=", 1)[0] in {"--bg", "--background"}
         for argument in args
     ):
         raise RuntimeError(
-            "background Claude sessions are unavailable for managed profiles; "
+            "background Claude sessions are unavailable through ccs; "
             "run Claude in this terminal"
         )
     binary = claude_binary()
@@ -481,7 +481,7 @@ def _parser() -> argparse.ArgumentParser:
     usage.add_argument("profiles", nargs="*", help="profile names (default: all)")
     usage.add_argument("--json", action="store_true")
     usage.add_argument("--timeout", type=float, default=45)
-    remove = commands.add_parser("remove", help="remove an added profile")
+    remove = commands.add_parser("remove", help="remove an account profile")
     remove.add_argument("name")
     remove.add_argument("--purge-data", action="store_true")
     commands.add_parser("setup", help="install the simple Zsh wrapper and remove the old monitor")
@@ -547,9 +547,15 @@ def main(argv: list[str] | None = None) -> int:
                 store.get_fresh(profile.name)
                 return subprocess.call(login_args, env=profile_environment(profile))
         if args.command == "list":
+            profiles = store.all()
+            if not profiles:
+                if not store.has_registry():
+                    raise RuntimeError("no account profiles are configured; run 'ccs init'")
+                print("No account profiles configured. Use 'ccs add <name>' or 'ccs init'.")
+                return 0
             binary = claude_binary()
             selected = store.selected().name
-            for profile in store.all():
+            for profile in profiles:
                 logged_in, method = auth_status(profile, binary)
                 marker = "*" if profile.name == selected else " "
                 state = "signed in" if logged_in else f"not ready ({method})"
@@ -580,10 +586,27 @@ def main(argv: list[str] | None = None) -> int:
             return _usage(store, args)
         if args.command == "remove":
             profile = store.get(args.name)
-            if profile.config_dir is None:
-                raise ValueError("the default Claude profile cannot be removed")
             with _profile_lock(store, profile.name, exclusive=True):
-                store.get_fresh(profile.name)
+                fresh = store.get_fresh(profile.name)
+                if fresh.config_dir != profile.config_dir:
+                    raise RuntimeError("profile changed while preparing removal; retry")
+                profile = fresh
+                if profile.config_dir is None and args.purge_data:
+                    raise ValueError(
+                        "cannot purge the default profile because ~/.claude is shared; "
+                        "use 'ccs remove <name>' to unregister and log out"
+                    )
+                registration_dir = store.profiles_dir / profile.name
+                try:
+                    registration_info = registration_dir.lstat()
+                except OSError as exc:
+                    raise ValueError("profile registration directory is missing or unsafe") from exc
+                if (
+                    not stat.S_ISDIR(registration_info.st_mode)
+                    or registration_info.st_uid != os.getuid()
+                    or stat.S_IMODE(registration_info.st_mode) != 0o700
+                ):
+                    raise ValueError("profile registration directory is missing or unsafe")
                 archive = store.home / "removed"
                 if archive.is_symlink():
                     raise RuntimeError(f"unsafe archive directory: {archive}")
@@ -603,17 +626,41 @@ def main(argv: list[str] | None = None) -> int:
                     still_logged_in, after_method = auth_status(profile, claude_binary())
                     if still_logged_in or after_method == "status unavailable":
                         raise RuntimeError("could not verify Claude logout; profile was kept")
+                was_selected = store.selected().name == profile.name
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 destination = archive / f"{profile.name}-{stamp}-{uuid.uuid4().hex[:8]}"
-                destination = store.remove_managed(
-                    profile.name, archive_to=destination, purge_data=args.purge_data
-                )
+                if profile.config_dir is None:
+                    destination = store.remove_default(
+                        profile.name, archive_to=destination, purge_data=args.purge_data
+                    )
+                else:
+                    destination = store.remove_managed(
+                        profile.name, archive_to=destination, purge_data=args.purge_data
+                    )
                 if args.purge_data:
                     shutil.rmtree(destination)
                     store.finish_purge(destination)
-                    print(f"Removed '{profile.name}' and deleted its local data.")
+                    if profile.config_dir is None:
+                        print(
+                            f"Removed '{profile.name}' and deleted its ccs registration data. "
+                            "Shared Claude configuration and sessions were kept."
+                        )
+                    else:
+                        print(f"Removed '{profile.name}' and deleted its local data.")
                 else:
-                    print(f"Removed '{profile.name}'. Local history was archived at {destination}.")
+                    if profile.config_dir is None:
+                        print(
+                            f"Removed '{profile.name}'. Its ccs registration data was archived at "
+                            f"{destination}. Shared Claude configuration and sessions were kept."
+                        )
+                    else:
+                        print(f"Removed '{profile.name}'. Local history was archived at {destination}.")
+                if was_selected:
+                    remaining = store.all()
+                    if remaining:
+                        print(f"Selected '{store.selected().name}' for new Claude sessions.")
+                    else:
+                        print("No account profiles remain. Use 'ccs add <name>' or 'ccs init'.")
             return 0
         if args.command == "setup":
             if sys.platform == "darwin":

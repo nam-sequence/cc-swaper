@@ -6,10 +6,10 @@ A small CLI for Claude Code accounts. Add profiles, choose which account new Cla
 
 Requires Claude Code, Python 3.10+, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). The `claude` shell wrapper supports interactive Zsh; `ccs` works from any shell. `tmux` is no longer required.
 
-Install from the v0.8.1 release:
+Install from the v0.8.2 release:
 
 ```bash
-curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.1/install.sh
+curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.2/install.sh
 bash install.sh
 ```
 
@@ -37,7 +37,9 @@ To create a profile without opening the browser, use `ccs add work --no-login` a
 
 `ccs usage` invokes Claude Code's local `/usage` command for each profile, checking up to eight in parallel. The table shows loading states, percentage bars, 5-hour and 7-day windows, model-specific weekly limits when available, and Claude's reset times. Missing reset times display as **Reset time unavailable**. It does not show a subscription end date. Redirected output and `--json` omit the animation.
 
-To remove an added profile, run `ccs remove work` to log out and archive its profile data, or `ccs remove work --purge-data` to delete that profile's local data. Shared project transcripts are kept by both options. The default profile cannot be removed this way; neither option deletes `~/.claude`. Exit any Claude process using a profile, including agents or background processes it started, before removing it.
+To remove an added profile, run `ccs remove work` to log out and archive its profile data, or `ccs remove work --purge-data` to delete that profile's local data. Shared project transcripts are kept by both options. You can also run `ccs remove main` to log out and unregister the default account. This archives only its ccs registration directory; `~/.claude`, including shared settings, skills, plugins, and project history, stays in place. `--purge-data` is unavailable for the default account. Exit any Claude process using a profile, including agents or background processes it started, before removing it; ccs refuses removal while that profile is locked. If you remove the last profile, `ccs add <name>` or `ccs init` can register a new one. An upgrade will not silently recreate a deliberately removed default account.
+
+A registry without a default profile requires ccs v0.8.2 or later. Older versions expect the default profile to be present, so reinstall this version before using ccs again if you downgrade by accident.
 
 ## Migrating from v0.6
 
@@ -49,7 +51,7 @@ The profile registry and sign-ins in `~/.config/cc-swaper` (or `$CC_SWAPER_HOME`
 
 From v0.7.2, `ccs` accepts only an exact managed `projects` link to the user's `~/.claude/projects` directory and creates that link for new managed profiles. Existing physical `projects` directories are preserved; `ccs` does not merge or replace them automatically. Do not delete those directories to enable sharing. Shared transcripts and project auto memory are readable from every profile and may be sent to a different account when you resume them. Claude's `project purge` and transcript retention can affect this shared history for every profile.
 
-From v0.8.0, normal Claude launches under an added profile also load a private snapshot of the default account's selected user preferences, authored skills, agents, rules, and commands. The profile's own settings file and account-synced skills remain untouched; values already set in that profile take precedence over the shared snapshot. Account authentication, permissions, trust, and remote-control settings are excluded. Unknown or unsupported settings keys stay profile-local. The default account is the source of truth for shared customizations. The snapshot uses `--settings`, which Claude applies above project and local settings for that session; shared plugin enablement can therefore override a project-level plugin choice. Authentication commands and `ccs usage` do not load this snapshot. Managed profiles reject native `claude --bg` because ccs cannot safely retain their profile lock after Claude detaches.
+From v0.8.0, normal Claude launches under an added profile also load a private snapshot of the default account's selected user preferences, authored skills, agents, rules, and commands. The profile's own settings file and account-synced skills remain untouched; values already set in that profile take precedence over the shared snapshot. Account authentication, permissions, trust, and remote-control settings are excluded. Unknown or unsupported settings keys stay profile-local. The default account is the source of truth for shared customizations. The snapshot uses `--settings`, which Claude applies above project and local settings for that session; shared plugin enablement can therefore override a project-level plugin choice. Authentication commands and `ccs usage` do not load this snapshot. ccs rejects native `claude --bg` for every profile because it cannot safely retain the profile lock after Claude detaches.
 
 From v0.8.1, ccs repairs a managed profile's missing Claude TUI onboarding marker before launching a session if Claude reports that profile as already signed in. Claude can otherwise show its login wizard despite valid credentials, particularly after `claude auth login` or an IDE sign-in. The one-time repair changes only `hasCompletedOnboarding` in that profile's private `.claude.json`; it leaves the account and project values intact and does not read or copy credential tokens. ccs waits for another ccs launch to finish the same repair. If a different session keeps that profile in use, exit it and retry. Open a new terminal after upgrading so the Zsh wrapper uses the current Claude binary.
 
@@ -59,12 +61,12 @@ To uninstall later, run `ccs shell uninstall`, then `uv tool uninstall cc-swaper
 
 ## Build a release
 
-Run `bash scripts/build-release.sh` to build `dist/release-v0.8.1/`:
+Run `bash scripts/build-release.sh` to build `dist/release-v0.8.2/`:
 
 | Asset | Purpose |
 | --- | --- |
-| `cc_swaper-0.8.1-py3-none-any.whl` | Installable wheel |
-| `cc_swaper-0.8.1.tar.gz` | Source distribution |
+| `cc_swaper-0.8.2-py3-none-any.whl` | Installable wheel |
+| `cc_swaper-0.8.2.tar.gz` | Source distribution |
 | `install.sh` | Version-pinned standalone installer |
 | `SHA256SUMS` | SHA-256 hashes for the other three assets |
 

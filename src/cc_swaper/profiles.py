@@ -320,14 +320,16 @@ class ProfileStore:
             self._state = self._load_state()
 
     def add_default(self, name: str) -> Profile:
-        """Create the first profile using Claude's existing default login."""
+        """Register Claude's existing default login, even after managed accounts."""
 
         name = _validate_profile_name(name)
         with _metadata_lock(self.home):
             self._state = self._load_state()
             profiles = self._state["profiles"]
-            if profiles:
-                raise ValueError("the default profile must be added first")
+            if any(record["kind"] == "default" for record in profiles):
+                raise ValueError("a default profile is already registered")
+            if any(record["name"] == name for record in profiles):
+                raise ValueError(f"profile already exists: {name}")
             return self._add_profile(name, kind="default")
 
     def add_managed(self, name: str) -> Profile:
@@ -337,8 +339,6 @@ class ProfileStore:
         with _metadata_lock(self.home):
             self._state = self._load_state()
             profiles = self._state["profiles"]
-            if not profiles:
-                raise ValueError("add_default must be called before add_managed")
             if any(record["name"] == name for record in profiles):
                 raise ValueError(f"profile already exists: {name}")
             return self._add_profile(name, kind="managed")
@@ -346,7 +346,28 @@ class ProfileStore:
     def remove_managed(
         self, name: str, *, archive_to: Path | None = None, purge_data: bool = False
     ) -> Path:
-        """Unregister a managed profile, optionally moving its data first.
+        """Unregister a managed profile, optionally moving its data first."""
+
+        return self._remove_profile(
+            name, required_kind="managed", archive_to=archive_to, purge_data=purge_data
+        )
+
+    def remove_default(
+        self, name: str, *, archive_to: Path | None = None, purge_data: bool = False
+    ) -> Path:
+        """Unregister the default account without touching shared ~/.claude."""
+
+        if purge_data:
+            raise ValueError("the default profile's shared Claude data cannot be purged")
+        return self._remove_profile(
+            name, required_kind="default", archive_to=archive_to
+        )
+
+    def _remove_profile(
+        self, name: str, *, required_kind: str,
+        archive_to: Path | None = None, purge_data: bool = False,
+    ) -> Path:
+        """Unregister one profile, optionally moving its ccs directory first.
 
         `archive_to` must be a new path in this store's private `removed/`
         directory. A journal lets the next process restore the source path if
@@ -367,10 +388,12 @@ class ProfileStore:
             )
             if record is None:
                 raise KeyError(name)
-            if record["kind"] != "managed":
-                raise ValueError("the default profile cannot be removed")
+            if record["kind"] != required_kind:
+                if required_kind == "managed":
+                    raise ValueError("the default profile cannot be removed as managed")
+                raise ValueError("profile is not the default account")
 
-            config_dir = Path(record["config_dir"])
+            config_dir = self.profiles_dir / name
             # _load_state validates this path, including ownership, mode,
             # containment, and symlink checks.  Re-check the object we return
             # so a stale or tampered state cannot turn removal into a path
@@ -684,6 +707,11 @@ class ProfileStore:
 
         return [self._profile_from_record(record) for record in self._state["profiles"]]
 
+    def has_registry(self) -> bool:
+        """Distinguish a fresh install from an intentionally emptied store."""
+
+        return self._state_path.exists()
+
     def selected(self) -> Profile:
         selected_name = self._state.get("selected")
         if selected_name is None:
@@ -732,7 +760,10 @@ class ProfileStore:
                 or self._state["selection_revision"] != snapshot.revision
             ):
                 return False
-            self.get(name)
+            try:
+                self.get(name)
+            except KeyError:
+                return False
             next_state = self._copy_state()
             next_state["selected"] = name
             next_state["selection_revision"] += 1
@@ -947,7 +978,10 @@ class ProfileStore:
                 "projects_path": str(self.shared_projects),
             }
             next_state = self._copy_state()
-            next_state["profiles"].append(record)
+            if kind == "default":
+                next_state["profiles"].insert(0, record)
+            else:
+                next_state["profiles"].append(record)
             if next_state.get("selected") is None:
                 next_state["selected"] = name
                 next_state["selection_revision"] += 1
@@ -1087,11 +1121,11 @@ class ProfileStore:
             raise ValueError("selected profile is not present in metadata")
         if profiles and selected is None:
             raise ValueError("profile metadata has profiles but no selected profile")
-        if profiles and profiles[0]["kind"] != "default":
-            raise ValueError("the default profile must be first in metadata")
         default_count = sum(record["kind"] == "default" for record in profiles)
-        if default_count != (1 if profiles else 0):
-            raise ValueError("profile metadata must contain exactly one default profile")
+        if default_count and profiles[0]["kind"] != "default":
+            raise ValueError("the default profile must be first in metadata")
+        if default_count > 1:
+            raise ValueError("profile metadata contains multiple default profiles")
         return {
             "version": _STATE_VERSION,
             "shared_projects": str(self.shared_projects),
