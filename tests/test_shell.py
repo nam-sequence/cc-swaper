@@ -6,11 +6,13 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from cc_swaper.profiles import ProfileStore
+from cc_swaper.runner import claude_binary
 from cc_swaper.shell import _managed_block, _source_script, install, installed, uninstall
 
 
@@ -145,6 +147,89 @@ def test_shell_wrapper_forwards_all_arguments_and_pins_claude_binary(
     assert " native -- \"$@\"" in script
     assert " run -- " not in script
     assert " resume" not in script
+
+
+def test_shell_wrapper_tracks_claude_update_without_reloading_zsh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_bin = tmp_path / "trusted-bin"
+    versions = fake_bin / "versions"
+    versions.mkdir(parents=True)
+    ccs = fake_bin / "ccs"
+    ccs.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m cc_swaper "$@"\n',
+        encoding="utf-8",
+    )
+    ccs.chmod(0o755)
+    old_binary = versions / "2.1.282"
+    old_binary.write_text('#!/bin/sh\nprintf "2.1.282\\n"\n', encoding="utf-8")
+    old_binary.chmod(0o755)
+    new_binary = versions / "2.1.283"
+    new_binary.write_text('#!/bin/sh\nprintf "2.1.283\\n"\n', encoding="utf-8")
+    new_binary.chmod(0o755)
+    launcher = fake_bin / "claude"
+    launcher.symlink_to(old_binary)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    zdotdir = tmp_path / "zsh"
+    zdotdir.mkdir()
+    monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+    store = ProfileStore(tmp_path / "store")
+    store.add_default("main")
+    monkeypatch.setenv("CC_SWAPER_HOME", str(store.home))
+
+    install(store)
+    script = (store.home / "claude.zsh").read_text(encoding="utf-8")
+    assert f"CC_SWAPER_CLAUDE_BIN={shlex.quote(str(launcher))}" in script
+    result = subprocess.run(
+        [
+            "zsh", "-ic",
+            f"claude --version; ln -sfn {shlex.quote(str(new_binary))} "
+            f"{shlex.quote(str(launcher))}; claude --version",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["2.1.282", "2.1.283"]
+    monkeypatch.setenv("CC_SWAPER_CLAUDE_BIN", str(launcher))
+    assert claude_binary() == str(new_binary)
+    unsafe_binary = versions / "untrusted"
+    unsafe_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    unsafe_binary.chmod(0o777)
+    launcher.unlink()
+    launcher.symlink_to(unsafe_binary)
+    with pytest.raises(RuntimeError, match="not trusted"):
+        claude_binary()
+
+
+def test_shell_setup_replaces_old_version_pin_with_stable_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ccs, launcher = _trusted_binaries(tmp_path, monkeypatch)
+    version = launcher.parent / "2.1.282"
+    version.write_text('#!/bin/sh\nprintf "2.1.282\\n"\n', encoding="utf-8")
+    version.chmod(0o755)
+    launcher.unlink()
+    launcher.symlink_to(version)
+    zdotdir = tmp_path / "zsh"
+    zdotdir.mkdir()
+    monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+    store = ProfileStore(tmp_path / "store")
+    script = store.home / "claude.zsh"
+    old_script = _source_script(ccs, version)
+    script.write_text(old_script, encoding="utf-8")
+    script.chmod(0o600)
+    digest = hashlib.sha256(old_script.encode()).hexdigest()
+    rc = zdotdir / ".zshrc"
+    rc.write_text(_managed_block(script, "yes", digest) + "\n", encoding="utf-8")
+    rc.chmod(0o600)
+
+    install(store)
+
+    assert installed(store)
+    assert script.read_text(encoding="utf-8") == _source_script(ccs, launcher)
+    assert str(version) not in script.read_text(encoding="utf-8")
 
 
 def test_shell_install_refuses_existing_claude_alias(

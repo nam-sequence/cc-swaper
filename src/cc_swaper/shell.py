@@ -73,7 +73,9 @@ def _trusted_claude_path() -> Path:
         raise RuntimeError(f"untrusted Claude Code executable: {target}")
     if stat.S_IMODE(info.st_mode) & 0o022 or not os.access(target, os.X_OK):
         raise RuntimeError(f"Claude Code executable is not private/executable: {target}")
-    return target
+    # Keep the stable launcher path. Claude's updater can repoint its symlink
+    # to a new version; runner.claude_binary validates the target each time.
+    return path
 
 
 def _source_script(ccs_path: Path, claude_path: Path) -> str:
