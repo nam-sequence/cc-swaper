@@ -26,6 +26,7 @@ from typing import Any
 
 
 _STATE_VERSION = 1
+_PROFILE_STATE_VERSION = 2
 _PROFILES_FILENAME = "profiles.json"
 _SESSIONS_FILENAME = "sessions.json"
 _BACKGROUND_SESSIONS_FILENAME = "background-sessions.json"
@@ -49,10 +50,15 @@ class Profile:
 
 @dataclass(frozen=True)
 class SelectionSnapshot:
-    """The exact profile-selection revision observed before a session starts."""
+    """The exact launch selection observed before a delayed operation starts."""
 
     name: str | None
     revision: int
+    launch_backend: str
+
+
+class LaunchRouteChanged(RuntimeError):
+    """A newer route selection made an automatic activation unsafe."""
 
 
 def _default_store_home() -> Path:
@@ -451,6 +457,8 @@ class ProfileStore:
                     next_state["profiles"][0]["name"] if next_state["profiles"] else None
                 )
                 next_state["selection_revision"] += 1
+                if next_state["selected"] is None:
+                    next_state["launch_backend"] = "accounts"
 
             _write_json_atomic(
                 self._pending_removal_path,
@@ -725,10 +733,98 @@ class ProfileStore:
             profile = self.get(name)
             next_state = self._copy_state()
             next_state["selected"] = name
+            next_state["launch_backend"] = "legacy"
             next_state["selection_revision"] += 1
             self._write_state(next_state)
             self._state = next_state
             return profile
+
+    def launch_backend(self) -> str:
+        """Return the backend used by new `claude` wrapper launches."""
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            return self._state["launch_backend"]
+
+    def use_accounts_if_unchanged(self, snapshot: SelectionSnapshot) -> bool:
+        """Route new launches to Claude's default login after an engine switch.
+
+        An engine switch can take several seconds. A more recent legacy choice
+        wins instead of being overwritten when that switch returns.
+        """
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            if (
+                not self._state["_selection_revision_present"]
+                or self._state.get("selected") != snapshot.name
+                or self._state["selection_revision"] != snapshot.revision
+                or self._state["launch_backend"] != snapshot.launch_backend
+            ):
+                return False
+            next_state = self._copy_state()
+            next_state["launch_backend"] = "accounts"
+            next_state["selection_revision"] += 1
+            self._write_state(next_state)
+            self._state = next_state
+            return True
+
+    def use_accounts(self) -> None:
+        """Explicitly route new launches to Claude's current default login."""
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            next_state = self._copy_state()
+            next_state["launch_backend"] = "accounts"
+            next_state["selection_revision"] += 1
+            self._write_state(next_state)
+            self._state = next_state
+
+    @contextmanager
+    def accounts_activation_guard(self, snapshot: SelectionSnapshot):
+        """Serialize a prepared auto-switch with legacy route changes.
+
+        The caller fetches usage and prepares credentials before entering.
+        Hold this guard only while writing Claude's active default credential;
+        an ABA route change since the tick began also invalidates the choice.
+        """
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            if (
+                not self._state["_selection_revision_present"]
+                or self._state["launch_backend"] != "accounts"
+                or self._state.get("selected") != snapshot.name
+                or self._state["selection_revision"] != snapshot.revision
+                or snapshot.launch_backend != "accounts"
+            ):
+                raise LaunchRouteChanged(
+                    "account auto-switch paused because the Claude launch route changed"
+                )
+            yield
+
+    @contextmanager
+    def manual_accounts_activation_guard(self, snapshot: SelectionSnapshot):
+        """Stop a manual account switch if a newer route choice won the race.
+
+        A manual engine switch may begin while a legacy profile is selected;
+        only the exact selection revision matters. The engine holds this lock
+        through its final active-credential write, so a concurrent `ccs
+        switch` cannot complete immediately before that write.
+        """
+
+        with _metadata_lock(self.home):
+            self._state = self._load_state()
+            if (
+                not self._state["_selection_revision_present"]
+                or self._state.get("selected") != snapshot.name
+                or self._state["selection_revision"] != snapshot.revision
+                or self._state["launch_backend"] != snapshot.launch_backend
+            ):
+                raise LaunchRouteChanged(
+                    "account switch stopped because the Claude launch route changed"
+                )
+            yield
 
     def selection_snapshot(self) -> SelectionSnapshot:
         """Read a selection token while holding the metadata lock."""
@@ -746,6 +842,7 @@ class ProfileStore:
             return SelectionSnapshot(
                 self._state.get("selected"),
                 self._state["selection_revision"],
+                self._state["launch_backend"],
             )
 
     def select_if_unchanged(self, snapshot: SelectionSnapshot, name: str) -> bool:
@@ -758,6 +855,7 @@ class ProfileStore:
                 not self._state["_selection_revision_present"]
                 or self._state.get("selected") != snapshot.name
                 or self._state["selection_revision"] != snapshot.revision
+                or self._state["launch_backend"] != snapshot.launch_backend
             ):
                 return False
             try:
@@ -766,6 +864,7 @@ class ProfileStore:
                 return False
             next_state = self._copy_state()
             next_state["selected"] = name
+            next_state["launch_backend"] = "legacy"
             next_state["selection_revision"] += 1
             self._write_state(next_state)
             self._state = next_state
@@ -984,6 +1083,7 @@ class ProfileStore:
                 next_state["profiles"].append(record)
             if next_state.get("selected") is None:
                 next_state["selected"] = name
+                next_state["launch_backend"] = "legacy"
                 next_state["selection_revision"] += 1
             self._write_state(next_state)
         except BaseException:
@@ -1033,10 +1133,11 @@ class ProfileStore:
 
     def _copy_state(self) -> dict[str, Any]:
         return {
-            "version": self._state["version"],
+            "version": _PROFILE_STATE_VERSION,
             "shared_projects": self._state["shared_projects"],
             "profiles": [dict(record) for record in self._state["profiles"]],
             "selected": self._state.get("selected"),
+            "launch_backend": self._state["launch_backend"],
             "selection_revision": self._state["selection_revision"],
         }
 
@@ -1044,17 +1145,20 @@ class ProfileStore:
         if self._state_path.is_symlink():
             raise ValueError(f"refusing symlink metadata file: {self._state_path}")
         if not self._state_path.exists():
+            if any(self.profiles_dir.iterdir()):
+                raise ValueError("profile metadata is missing while profile data exists")
             return {
-                "version": _STATE_VERSION,
+                "version": _PROFILE_STATE_VERSION,
                 "shared_projects": str(self.shared_projects),
                 "profiles": [],
                 "selected": None,
+                "launch_backend": "accounts",
                 "selection_revision": 0,
                 "_selection_revision_present": True,
             }
 
         payload = _read_json(self._state_path)
-        if not isinstance(payload, dict) or payload.get("version") != _STATE_VERSION:
+        if not isinstance(payload, dict) or payload.get("version") not in {1, _PROFILE_STATE_VERSION}:
             raise ValueError(f"unsupported profile metadata in {self._state_path}")
         if payload.get("shared_projects") != str(self.shared_projects):
             raise ValueError("profile metadata points at a different shared projects directory")
@@ -1121,16 +1225,22 @@ class ProfileStore:
             raise ValueError("selected profile is not present in metadata")
         if profiles and selected is None:
             raise ValueError("profile metadata has profiles but no selected profile")
+        launch_backend = payload.get("launch_backend", "legacy" if profiles else "accounts")
+        if launch_backend not in {"legacy", "accounts"}:
+            raise ValueError("profile metadata has an invalid launch backend")
+        if launch_backend == "legacy" and selected is None:
+            raise ValueError("legacy launch backend has no selected profile")
         default_count = sum(record["kind"] == "default" for record in profiles)
         if default_count and profiles[0]["kind"] != "default":
             raise ValueError("the default profile must be first in metadata")
         if default_count > 1:
             raise ValueError("profile metadata contains multiple default profiles")
         return {
-            "version": _STATE_VERSION,
+            "version": _PROFILE_STATE_VERSION,
             "shared_projects": str(self.shared_projects),
             "profiles": profiles,
             "selected": selected,
+            "launch_backend": launch_backend,
             "selection_revision": selection_revision,
             "_selection_revision_present": "selection_revision" in payload,
         }
@@ -1172,4 +1282,4 @@ class ProfileStore:
         _write_json_atomic(self._state_path, state)
 
 
-__all__ = ["Profile", "ProfileStore"]
+__all__ = ["LaunchRouteChanged", "Profile", "ProfileStore"]

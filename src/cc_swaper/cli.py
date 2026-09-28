@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import json
 import os
+import pwd
 import re
 import select
 import shutil
@@ -237,8 +238,6 @@ def _prepare_onboarding(store: ProfileStore, profile_name: str, binary: str) -> 
 def _native(store: ProfileStore, args: list[str]) -> int:
     """Run real Claude in this terminal with the currently selected login."""
 
-    profile_name = store.selected().name
-    profile = store.get_fresh(profile_name)
     if any(
         argument.split("=", 1)[0] in {"--bg", "--background"}
         for argument in args
@@ -248,6 +247,14 @@ def _native(store: ProfileStore, args: list[str]) -> int:
             "run Claude in this terminal"
         )
     binary = claude_binary()
+    if store.launch_backend() == "accounts":
+        # The engine switches Claude's default login. Never inherit an IDE's
+        # profile-specific directory when the wrapper should use that login.
+        environment = profile_environment(Profile("accounts", None))
+        return run_passthrough(binary, args, environment)
+
+    profile_name = store.selected().name
+    profile = store.get_fresh(profile_name)
     if profile.config_dir is not None and _starts_native_session(args):
         _prepare_onboarding(store, profile_name, binary)
 
@@ -265,6 +272,180 @@ def _native(store: ProfileStore, args: list[str]) -> int:
             environment.update(mcp_env)
             forwarded = [*settings_args, *mcp_args, *args]
         return run_passthrough(binary, forwarded, environment)
+
+
+def _account_engine_environment() -> dict[str, str]:
+    """Keep engine operations on Claude's default login, even inside an IDE."""
+
+    inherited = os.environ
+    session_root = Path.home() / ".config" / "cc-swaper" / "account-engine" / "sessions"
+    for key in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        value = inherited.get(key)
+        if not value:
+            continue
+        try:
+            is_session = Path(value).expanduser().resolve().is_relative_to(
+                session_root.resolve()
+            )
+        except OSError:
+            is_session = False
+        if is_session:
+            raise RuntimeError(
+                "the global account engine cannot run from inside one of its "
+                "account sessions; open a normal terminal"
+            )
+    environment = profile_environment(Profile("accounts", None))
+    environment.pop("CC_SWAPER_ROUTE_SNAPSHOT", None)
+    account_name = pwd.getpwuid(os.getuid()).pw_name
+    environment["USER"] = account_name
+    environment["LOGNAME"] = account_name
+    # urllib/OpenSSL honor these shell variables during OAuth refresh and
+    # usage requests. Keep project/IDE environment from redirecting tokens
+    # to a proxy, replacing trusted CAs, or writing TLS session keys to disk.
+    blocked = {
+        "SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PYTHONHTTPSVERIFY",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    }
+    for key in list(environment):
+        if key in blocked or key.startswith(("DYLD_", "LD_", "OPENSSL_", "SSL_")):
+            environment.pop(key, None)
+    return environment
+
+
+def _accounts_command(argv: list[str]) -> int:
+    """Run the macOS account engine and coordinate `claude` launch routing."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("the account engine supports macOS only")
+    if argv and argv[0] == "use":
+        if argv[1:] not in ([], ["--json"]):
+            raise ValueError("usage: ccs accounts use [--json]")
+        store = ProfileStore()
+        store.use_accounts()
+        if argv[1:] == ["--json"]:
+            print(json.dumps({"schemaVersion": 1, "launchBackend": "accounts"}))
+        else:
+            print("New Claude sessions will use the current default Claude login.")
+        return 0
+
+    command = [sys.executable, "-I", "-m", "claude_swap", *argv]
+    engine_env = _account_engine_environment()
+    is_switch = bool(
+        argv and (
+            argv[0] == "switch"
+            or any(
+                argument in {"--switch", "--switch-to"}
+                or argument.startswith("--switch-to=")
+                for argument in argv
+            )
+        )
+    )
+    if not argv or (not is_switch and argv[0] != "auto") or any(
+        flag in argv for flag in ("-h", "--help")
+    ):
+        return subprocess.call(command, env=engine_env)
+
+    store = ProfileStore()
+    if argv[0] == "auto":
+        if store.launch_backend() == "legacy":
+            if "--json" in argv:
+                print(json.dumps({
+                    "schemaVersion": 1,
+                    "event": "no-switch",
+                    "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "reason": "legacy-backend",
+                    "detail": "New Claude sessions use an existing profile; select an engine account first.",
+                }))
+            else:
+                print("Auto-switch paused: new Claude sessions use an existing profile.")
+            return 2
+        return subprocess.call(command, env=engine_env)
+
+    snapshot = store.selection_snapshot()
+    engine_env["CC_SWAPER_ROUTE_SNAPSHOT"] = json.dumps({
+        "name": snapshot.name,
+        "revision": snapshot.revision,
+        "launch_backend": snapshot.launch_backend,
+    }, separators=(",", ":"))
+    if "--json" not in argv:
+        result = subprocess.call(command, env=engine_env)
+        if result != 0:
+            return result
+        try:
+            routed = store.use_accounts_if_unchanged(snapshot)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(
+                "ccs: account credentials switched, but the Claude launch route could not "
+                f"be updated: {exc}. Run 'ccs accounts use' to finish selecting it.",
+                file=sys.stderr,
+            )
+            return 1
+        if not routed:
+            print(
+                "ccs: account switched, but a newer profile selection controls new Claude sessions; "
+                "run 'ccs accounts use' to choose the default login",
+                file=sys.stderr,
+            )
+            return 1
+        print("New Claude sessions will use this account.")
+        return 0
+
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False, env=engine_env
+    )
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode != 0:
+        sys.stdout.write(result.stdout)
+        return result.returncode
+    try:
+        payload = json.loads(result.stdout)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schemaVersion") != 1
+            or "error" in payload
+        ):
+            raise ValueError("invalid account-engine switch response")
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "error": {
+                "code": "switch_response_invalid",
+                "message": (
+                    f"The account engine succeeded but returned an invalid response: {exc}. "
+                    "The default Claude login may have changed; inspect it with "
+                    "'ccs accounts status', then run 'ccs accounts use' only if "
+                    "you want new Claude sessions to use it."
+                ),
+            },
+        }))
+        return 1
+    try:
+        routed = store.use_accounts_if_unchanged(snapshot)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "error": {
+                "code": "routing_update_failed",
+                "message": (
+                    "Account credentials switched, but the Claude launch route could not "
+                    f"be updated: {exc}. Run 'ccs accounts use' to finish selecting it."
+                ),
+            },
+            "switchResult": payload,
+        }))
+        return 1
+    payload["launchBackend"] = store.launch_backend()
+    payload["routingChanged"] = routed
+    if not routed:
+        payload["routingWarning"] = (
+            "A newer profile selection controls new Claude sessions; "
+            "run 'ccs accounts use' to choose the default login."
+        )
+    print(json.dumps(payload))
+    return 0
 
 
 _NATIVE_ADMIN_COMMANDS = frozenset({
@@ -475,8 +656,10 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("--email")
     list_command = commands.add_parser("list", help="list profiles and login state")
     list_command.add_argument("--show-identity", action="store_true")
+    list_command.add_argument("--json", action="store_true", help="machine-readable legacy profiles")
     switch = commands.add_parser("switch", help="choose the account for new Claude sessions")
     switch.add_argument("name", nargs="?", help="omit to pick from a list")
+    switch.add_argument("--json", action="store_true", help="machine-readable selection result")
     usage = commands.add_parser("usage", help="show five-hour and weekly usage for all accounts")
     usage.add_argument("profiles", nargs="*", help="profile names (default: all)")
     usage.add_argument("--json", action="store_true")
@@ -484,6 +667,9 @@ def _parser() -> argparse.ArgumentParser:
     remove = commands.add_parser("remove", help="remove an account profile")
     remove.add_argument("name")
     remove.add_argument("--purge-data", action="store_true")
+    commands.add_parser("accounts", help="open the macOS account engine and dashboard")
+    routing = commands.add_parser("routing", help="show which login new Claude sessions use")
+    routing.add_argument("--json", action="store_true")
     commands.add_parser("setup", help="install the simple Zsh wrapper and remove the old monitor")
     shell = commands.add_parser("shell", help="manage the Zsh claude wrapper")
     shell.add_argument("action", choices=("install", "uninstall", "status"))
@@ -493,6 +679,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if argv and argv[0] == "accounts":
+            return _accounts_command(argv[1:])
         # Keep old sessions accessible while no new invocation can create one.
         if argv and argv[0] in {"attach", "stop"}:
             return _legacy_session(ProfileStore(), argv[0], argv[1:])
@@ -523,6 +711,19 @@ def main(argv: list[str] | None = None) -> int:
 
         args = _parser().parse_args(argv)
         store = ProfileStore()
+        if args.command == "routing":
+            backend = store.launch_backend()
+            selected = store.selected().name if store.all() else None
+            if args.json:
+                print(json.dumps({
+                    "schemaVersion": 1,
+                    "launchBackend": backend,
+                    "selectedLegacyProfile": selected,
+                }))
+            else:
+                label = f"existing profile '{selected}'" if backend == "legacy" else "default Claude login"
+                print(f"New Claude sessions use the {label}.")
+            return 0
         if args.command == "init":
             profile = store.add_default(args.name)
             print(f"Registered existing Claude Code login as '{profile.name}'.")
@@ -548,25 +749,58 @@ def main(argv: list[str] | None = None) -> int:
                 return subprocess.call(login_args, env=profile_environment(profile))
         if args.command == "list":
             profiles = store.all()
+            backend = store.launch_backend()
             if not profiles:
                 if not store.has_registry():
                     raise RuntimeError("no account profiles are configured; run 'ccs init'")
-                print("No account profiles configured. Use 'ccs add <name>' or 'ccs init'.")
+                if args.json:
+                    print(json.dumps({
+                        "schemaVersion": 1, "launchBackend": backend,
+                        "selected": None, "selectedLegacyProfile": None, "profiles": [],
+                    }))
+                else:
+                    print("No account profiles configured. Use 'ccs add <name>' or 'ccs init'.")
                 return 0
             binary = claude_binary()
             selected = store.selected().name
+            rows: list[dict[str, object]] = []
             for profile in profiles:
                 logged_in, method = auth_status(profile, binary)
-                marker = "*" if profile.name == selected else " "
+                active = backend == "legacy" and profile.name == selected
+                marker = "*" if active else " "
                 state = "signed in" if logged_in else f"not ready ({method})"
+                row: dict[str, object] = {
+                    "name": profile.name,
+                    "kind": "default" if profile.config_dir is None else "managed",
+                    "selected": active,
+                    "signedIn": logged_in,
+                    "authMethod": method,
+                }
                 if args.show_identity and logged_in:
                     details = auth_details(profile, binary) or {}
                     email = _identity_text(details.get("email"), "unknown email")
                     org = _identity_text(details.get("orgName"))
                     state += f"  {email}" + (f"  [{org}]" if org else "")
-                print(f"{marker} {profile.name:16} {state}")
+                    row["email"] = email
+                    if org:
+                        row["organization"] = org
+                rows.append(row)
+                if not args.json:
+                    print(f"{marker} {profile.name:16} {state}")
+            if args.json:
+                print(json.dumps({
+                    "schemaVersion": 1,
+                    "launchBackend": backend,
+                    "selected": selected if backend == "legacy" else None,
+                    "selectedLegacyProfile": selected,
+                    "profiles": rows,
+                }))
+            elif backend == "accounts":
+                print("New Claude sessions use the default Claude login.")
             return 0
         if args.command == "switch":
+            if args.json and args.name is None:
+                raise ValueError("'switch --json' requires a profile name")
             name = args.name or _choose_profile_name(store)
             if name is None:
                 print("Account selection canceled.")
@@ -580,7 +814,10 @@ def main(argv: list[str] | None = None) -> int:
                         f"(authentication: {method}); run 'ccs login {name}'"
                     )
                 store.select(name)
-            print(f"Selected '{name}'. New Claude sessions will use this account.")
+            if args.json:
+                print(json.dumps({"schemaVersion": 1, "launchBackend": "legacy", "selected": name}))
+            else:
+                print(f"Selected '{name}'. New Claude sessions will use this account.")
             return 0
         if args.command == "usage":
             return _usage(store, args)

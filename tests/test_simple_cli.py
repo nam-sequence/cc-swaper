@@ -56,6 +56,90 @@ def test_switch_persists_account_without_starting_a_session(
     assert ProfileStore(store.home).background_sessions() == {}
 
 
+def test_accounts_namespace_forwards_to_macos_engine_without_touching_legacy_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/fake/ide-profile")
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/fake/ide-storage")
+    monkeypatch.setenv("CC_SWAPER_ROUTE_SNAPSHOT", "stale")
+    monkeypatch.setenv("USER", "attacker\ndelete-generic-password")
+    monkeypatch.setenv("SSLKEYLOGFILE", "/fake/tls-keys.log")
+    monkeypatch.setenv("SSL_CERT_FILE", "/fake/attacker-ca.pem")
+    monkeypatch.setenv("OPENSSL_CONF", "/fake/openssl.cnf")
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.invalid:8080")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/fake/hook.dylib")
+    monkeypatch.setattr(
+        cli.subprocess, "call", lambda args, **kwargs: calls.append((args, kwargs["env"])) or 17
+    )
+    monkeypatch.setattr(cli, "ProfileStore", lambda *_args: pytest.fail("opened legacy store"))
+
+    assert cli.main(["accounts", "list", "--json"]) == 17
+    assert calls[0][0] == [sys.executable, "-I", "-m", "claude_swap", "list", "--json"]
+    assert "CLAUDE_CONFIG_DIR" not in calls[0][1]
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in calls[0][1]
+    assert "CC_SWAPER_ROUTE_SNAPSHOT" not in calls[0][1]
+    assert "\n" not in calls[0][1]["USER"]
+    assert calls[0][1]["LOGNAME"] == calls[0][1]["USER"]
+    for key in ("SSLKEYLOGFILE", "SSL_CERT_FILE", "OPENSSL_CONF", "HTTPS_PROXY", "DYLD_INSERT_LIBRARIES"):
+        assert key not in calls[0][1]
+
+
+def test_accounts_namespace_rejects_non_macos(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.subprocess, "call", lambda *_args: pytest.fail("launched engine"))
+
+    assert cli.main(["accounts", "list", "--json"]) == 2
+    assert "supports macOS only" in capsys.readouterr().err
+
+
+def test_accounts_namespace_refuses_an_engine_session_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session = tmp_path / ".config" / "cc-swaper" / "account-engine" / "sessions" / "slot-2"
+    session.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(session))
+    monkeypatch.setattr(cli.subprocess, "call", lambda *_args, **_kwargs: pytest.fail("ran engine"))
+
+    assert cli.main(["accounts", "list", "--json"]) == 2
+    assert "cannot run from inside" in capsys.readouterr().err
+
+
+def test_legacy_list_and_switch_have_versioned_json_for_menu_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(cli, "auth_status", lambda *_args: (True, "claude.ai"))
+
+    assert cli.main(["list", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed == {
+        "schemaVersion": 1,
+        "launchBackend": "legacy",
+        "selected": "main",
+        "selectedLegacyProfile": "main",
+        "profiles": [
+            {"name": "main", "kind": "default", "selected": True,
+             "signedIn": True, "authMethod": "claude.ai"},
+            {"name": "work", "kind": "managed", "selected": False,
+             "signedIn": True, "authMethod": "claude.ai"},
+        ],
+    }
+    assert cli.main(["switch", "work", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "schemaVersion": 1, "launchBackend": "legacy", "selected": "work"
+    }
+    assert ProfileStore(store.home).selected().name == "work"
+    assert cli.main(["switch", "--json"]) == 2
+    assert "requires a profile name" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("selected_before", ["main", "work"])
 def test_remove_default_logs_out_and_keeps_shared_claude_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
