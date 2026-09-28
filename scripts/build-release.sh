@@ -19,6 +19,14 @@ if ! command -v uv >/dev/null 2>&1; then
   printf '%s\n' 'Install uv first: https://docs.astral.sh/uv/getting-started/installation/' >&2
   exit 1
 fi
+if [[ "$(uname -s)" != Darwin ]]; then
+  printf '%s\n' 'Building the macOS menu bar release requires macOS.' >&2
+  exit 1
+fi
+if ! command -v ditto >/dev/null 2>&1; then
+  printf '%s\n' 'Building a release requires ditto for the menu bar app archive.' >&2
+  exit 1
+fi
 if ! command -v mktemp >/dev/null 2>&1 || \
   ! command -v mv >/dev/null 2>&1 || \
   ! command -v rm >/dev/null 2>&1; then
@@ -116,6 +124,40 @@ if [[ ! -f "$build_dir/$wheel_name" || ! -f "$build_dir/$sdist_name" ]]; then
   printf 'The build did not produce the expected assets: %s and %s.\n' "$wheel_name" "$sdist_name" >&2
   exit 1
 fi
+
+menubar_builder="$project_dir/apps/menubar/scripts/build-app.sh"
+if [[ ! -f "$menubar_builder" ]]; then
+  printf 'Menu bar build script is missing: %s\n' "$menubar_builder" >&2
+  exit 1
+fi
+menubar_app="$build_dir/CcsMenuBar.app"
+if ! CC_SWAPER_APP_VERSION="$version" CC_SWAPER_APP_OUTPUT="$menubar_app" \
+  bash "$menubar_builder"; then
+  printf '%s\n' 'Menu bar app build failed; no release was published.' >&2
+  exit 1
+fi
+if [[ ! -f "$menubar_app/Contents/Info.plist" || \
+      ! -x "$menubar_app/Contents/MacOS/CcsMenuBar" ]]; then
+  printf '%s\n' 'Menu bar build did not produce a complete app bundle.' >&2
+  exit 1
+fi
+app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+  "$menubar_app/Contents/Info.plist")
+app_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$menubar_app/Contents/Info.plist")
+if [[ "$app_version" != "$version" || \
+      "$app_id" != 'com.namsequence.ccswaper.menubar' ]]; then
+  printf 'Menu bar app metadata mismatch (version %s, id %s).\n' \
+    "$app_version" "$app_id" >&2
+  exit 1
+fi
+if ! codesign --verify --deep --strict "$menubar_app"; then
+  printf '%s\n' 'Menu bar app signature verification failed.' >&2
+  exit 1
+fi
+app_archive="CcsMenuBar-v${version}-macos-local.zip"
+ditto -c -k --sequesterRsrc --keepParent "$menubar_app" "$stage_dir/$app_archive"
+
 mv -- "$build_dir/$wheel_name" "$stage_dir/$wheel_name"
 mv -- "$build_dir/$sdist_name" "$stage_dir/$sdist_name"
 
@@ -142,9 +184,9 @@ PY
 
 cd -- "$stage_dir"
 if [[ "$checksum_command" == sha256sum ]]; then
-  sha256sum "$wheel_name" "$sdist_name" install.sh > SHA256SUMS
+  sha256sum "$wheel_name" "$sdist_name" "$app_archive" install.sh > SHA256SUMS
 else
-  shasum -a 256 "$wheel_name" "$sdist_name" install.sh > SHA256SUMS
+  shasum -a 256 "$wheel_name" "$sdist_name" "$app_archive" install.sh > SHA256SUMS
 fi
 
 if [[ -e "$release_dir" || -L "$release_dir" ]]; then
