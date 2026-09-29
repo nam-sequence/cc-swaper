@@ -17,7 +17,7 @@ struct CcsMenuBarApp: App {
             MenuBarView(model: model)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "shift")
+                Image(nsImage: MenuBarGlyph.image)
                 Text(model.menuTitle)
                     .lineLimit(1)
                     .truncationMode(.middle)
