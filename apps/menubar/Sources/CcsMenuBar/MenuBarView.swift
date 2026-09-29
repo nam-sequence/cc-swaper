@@ -155,7 +155,7 @@ struct MenuBarView: View {
                 emptyStateText(
                     symbol: "terminal",
                     title: "Connect ccshift",
-                    message: "Install ccshift (uv tool install git+https://github.com/nam-sequence/cc-swaper) or choose the installed ccshift command."
+                    message: "Install ccshift (uv tool install git+https://github.com/nam-sequence/ccshift) or choose the installed ccshift command."
                 )
                 Button("Choose ccshift executable…", action: model.chooseExecutable)
                     .buttonStyle(.bordered)

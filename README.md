@@ -14,14 +14,14 @@ store. This repository also contains a native macOS menu bar app in
 ccshift is not published on PyPI. Install it from this repository:
 
 ```bash
-uv tool install git+https://github.com/nam-sequence/cc-swaper
+uv tool install git+https://github.com/nam-sequence/ccshift
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/nam-sequence/cc-swaper.git
-cd cc-swaper
+git clone https://github.com/nam-sequence/ccshift.git
+cd ccshift
 uv sync
 uv run ccshift help
 ```
@@ -40,7 +40,7 @@ Earlier versions of this repository shipped `cc-swaper` (the `ccs` command,
 its profiles and a zsh `claude()` wrapper). ccshift does not read any of that
 data. To remove it, quit every Claude Code session started through `ccs`, open
 a new Terminal and run from a checkout of this repository
-(`git clone https://github.com/nam-sequence/cc-swaper.git && cd cc-swaper`):
+(`git clone https://github.com/nam-sequence/ccshift.git && cd ccshift`):
 
 ```bash
 bash scripts/remove-cc-swaper.sh           # dry run: lists what would be removed
@@ -283,7 +283,7 @@ Run only one automatic switcher at a time: the native app's auto-switch,
 Needs the `menubar` extra (macOS only):
 
 ```bash
-uv tool install --python 3.12 'ccshift[menubar] @ git+https://github.com/nam-sequence/cc-swaper'
+uv tool install --python 3.12 'ccshift[menubar] @ git+https://github.com/nam-sequence/ccshift'
 ccshift menubar
 ```
 

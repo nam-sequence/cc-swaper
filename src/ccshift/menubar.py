@@ -495,13 +495,13 @@ def framework_build_warning(
 
     if install_method == "uv":
         remedy = (
-            "  uv tool install --managed-python --force 'ccshift[menubar] @ git+https://github.com/nam-sequence/cc-swaper'"
+            "  uv tool install --managed-python --force 'ccshift[menubar] @ git+https://github.com/nam-sequence/ccshift'"
         )
     elif install_method == "pipx":
         remedy = (
             "  Reinstall against a non-framework interpreter, e.g. one from "
             "`uv python install 3.13`:\n"
-            "  pipx install --force --python <that python> 'ccshift[menubar] @ git+https://github.com/nam-sequence/cc-swaper'"
+            "  pipx install --force --python <that python> 'ccshift[menubar] @ git+https://github.com/nam-sequence/ccshift'"
         )
     else:
         remedy = (
@@ -536,7 +536,7 @@ def run(switcher) -> int:
         # error type the CLI already renders cleanly instead of a traceback.
         raise ClaudeSwitchError(
             "Menu bar mode requires 'rumps'. "
-            "Install with: pip install 'ccshift[menubar] @ git+https://github.com/nam-sequence/cc-swaper'"
+            "Install with: pip install 'ccshift[menubar] @ git+https://github.com/nam-sequence/ccshift'"
         ) from e
 
     # rumps never sets an activation policy, so under a framework Python the
