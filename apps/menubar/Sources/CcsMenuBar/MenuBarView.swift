@@ -122,6 +122,18 @@ struct MenuBarView: View {
                         usageLabelWidth: usageLabelWidth,
                         switchAction: { model.switchTo(row.account) }
                     )
+                    .contextMenu {
+                        Button("Switch to This Account") { model.switchTo(row.account) }
+                            .disabled(row.isActive || model.switchingAccountID != nil || model.isChangingAccounts)
+                        Divider()
+                        // One modal at a time: the Add Account sheet would
+                        // hold back the removal confirmation.
+                        Button("Remove Account…", role: .destructive) {
+                            model.requestRemoval(of: row.account)
+                            openSettingsWindow()
+                        }
+                        .disabled(model.isChangingAccounts || model.isAddAccountSheetPresented)
+                    }
                 }
             }
             .background {
@@ -171,8 +183,15 @@ struct MenuBarView: View {
                 emptyStateText(
                     symbol: "person.crop.circle.badge.plus",
                     title: "No accounts configured",
-                    message: "Run ccshift add to register an account, then refresh this menu."
+                    message: "Add the account Claude Code is signed in to."
                 )
+                Button("Add Account…") {
+                    model.beginAddingAccount()
+                    openSettingsWindow()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .padding(.top, 4)
             }
         }
         .frame(maxWidth: .infinity)
@@ -254,6 +273,17 @@ struct MenuBarView: View {
 
     private var menuItems: some View {
         VStack(spacing: 0) {
+            if let update = model.visibleUpdate {
+                CCMenuRow(title: "ccshift \(update.version) Is Available…") {
+                    model.settingsTab = .general
+                    openSettingsWindow()
+                }
+            }
+            CCMenuRow(title: "Add Account…") {
+                model.beginAddingAccount()
+                openSettingsWindow()
+            }
+            .disabled(model.executablePath == nil || model.isChangingAccounts)
             CCMenuRow(title: "ccshift Settings…", shortcut: KeyboardShortcut(",", modifiers: .command)) {
                 openSettingsWindow()
             }

@@ -288,6 +288,167 @@ final class CSwapClientTests: XCTestCase {
         }
     }
 
+    func testAccountCommandsSendExactArgumentsAndDecodeTheirReports() throws {
+        let folder = try tempFolder()
+        let argsPath = folder.appendingPathComponent("args")
+        let script = #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__ARGS__'
+        case "$1" in
+          status) printf '%s\n' '{"schemaVersion":1,"active":{"email":"new@example.test","managed":false}}' ;;
+          add) printf '%s\n' '{"schemaVersion":1,"action":"added","account":{"number":3,"email":"new@example.test","alias":"dev"}}' ;;
+          remove) printf '%s\n' '{"schemaVersion":1,"action":"removed","account":{"number":2,"email":"b@example.test"},"wasActive":true}' ;;
+        esac
+        """#
+        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+
+        let login = try XCTUnwrap(client.currentLogin())
+        XCTAssertEqual(login.email, "new@example.test")
+        XCTAssertFalse(login.managed)
+
+        let added = try client.addCurrentAccount(alias: "dev")
+        XCTAssertEqual(added.action, "added")
+        XCTAssertEqual(added.account?.number, 3)
+        XCTAssertEqual(added.account?.displayName, "dev")
+
+        let removed = try client.removeAccount(account(2, "b@example.test"), emailIsShared: false)
+        XCTAssertEqual(removed.action, "removed")
+        XCTAssertEqual(removed.wasActive, true)
+
+        _ = try client.addCurrentAccount(alias: "-dash")
+        let calls = try String(contentsOf: argsPath, encoding: .utf8).split(separator: "\n").map(String.init)
+        // Removal names the account by email, so a stale list cannot hit
+        // another account that now sits in the same slot.
+        XCTAssertEqual(calls, [
+            "status --json", "add --json --alias=dev", "remove b@example.test --yes --json", "add --json --alias=-dash",
+        ])
+    }
+
+    func testSharedEmailIsRemovedByNumberOnlyAfterTheSlotIsRechecked() throws {
+        let folder = try tempFolder()
+        let argsPath = folder.appendingPathComponent("args")
+        let script = #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__ARGS__'
+        case "$1" in
+          list) printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"same@example.test","organizationName":"A","active":true,"usageStatus":"ok"},{"number":2,"email":"same@example.test","organizationName":"B","active":false,"usageStatus":"ok"}]}' ;;
+          remove) printf '%s\n' '{"schemaVersion":1,"action":"removed","account":{"number":2,"email":"same@example.test"},"wasActive":false}' ;;
+        esac
+        """#
+        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+
+        _ = try client.removeAccount(account(2, "same@example.test", organization: "B"), emailIsShared: true)
+        // Slot 2 now holds a different organization's account: nothing is removed.
+        XCTAssertThrowsError(
+            try client.removeAccount(account(2, "same@example.test", organization: "A"), emailIsShared: true)
+        ) { error in
+            XCTAssertEqual(error as? CLIError, .accountListChanged)
+        }
+        let calls = try String(contentsOf: argsPath, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(calls, ["list --json", "remove 2 --yes --json", "list --json"])
+    }
+
+    func testOtherUsageErrorsAreNotMistakenForAnOldCcshift() throws {
+        let client = try CSwapClient(executableURL: fakeCLI("""
+        #!/bin/sh
+        echo "ccshift: error: argument --alias: expected one argument" >&2
+        exit 2
+        """))
+        XCTAssertThrowsError(try client.addCurrentAccount(alias: "dev")) { error in
+            XCTAssertEqual(error as? CLIError, .failed("ccshift: error: argument --alias: expected one argument"))
+        }
+    }
+
+    private func account(_ number: Int, _ email: String, organization: String? = nil) -> Account {
+        Account(
+            id: "account:\(number)", number: number, email: email, organizationName: organization,
+            alias: nil, active: false, disabled: false, usageStatus: "ok",
+            usage: nil, usageAgeSeconds: nil, lastGoodUsage: nil, lastGoodAgeSeconds: nil
+        )
+    }
+
+    func testBrowserSignInPassesItsOptionsAsSingleTokens() throws {
+        let folder = try tempFolder()
+        let argsPath = folder.appendingPathComponent("args")
+        let script = #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__ARGS__'
+        printf '%s\n' '{"schemaVersion":1,"action":"refreshed","account":{"number":1,"email":"a@example.test"}}'
+        """#
+        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+
+        let report = try client.signInAndAddAccount(
+            email: "a@example.test", sso: true, alias: "work", cancellation: ProcessCancellation()
+        )
+        XCTAssertEqual(report.action, "refreshed")
+        _ = try client.signInAndAddAccount(email: nil, sso: false, alias: nil, cancellation: ProcessCancellation())
+        _ = try client.signInAndAddAccount(
+            email: nil, sso: false, alias: nil, handoffFile: "/tmp/ccshift-signin/url", cancellation: ProcessCancellation()
+        )
+        _ = try client.signInAndAddAccount(
+            email: nil, sso: false, alias: nil, privateBrowser: "com.google.Chrome", cancellation: ProcessCancellation()
+        )
+        let calls = try String(contentsOf: argsPath, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(calls, [
+            "add --login --json --sso --email=a@example.test --alias=work",
+            "add --login --json",
+            "add --login --json --handoff-file=/tmp/ccshift-signin/url",
+            "add --login --json --private --browser=com.google.Chrome",
+        ])
+        XCTAssertGreaterThanOrEqual(CSwapClient.signInTimeout, 15 * 60)
+    }
+
+    func testOnlyClaudeSignInPagesAreOpenedFromAHandoff() {
+        XCTAssertTrue(SignInURLPolicy.isAllowed(URL(string: "https://claude.com/cai/oauth/authorize?x=1")!))
+        XCTAssertTrue(SignInURLPolicy.isAllowed(URL(string: "https://platform.claude.com/oauth/authorize")!))
+        XCTAssertFalse(SignInURLPolicy.isAllowed(URL(string: "http://claude.com/cai/oauth/authorize")!))
+        XCTAssertFalse(SignInURLPolicy.isAllowed(URL(string: "https://claude.com.evil.test/")!))
+        XCTAssertFalse(SignInURLPolicy.isAllowed(URL(string: "file:///etc/passwd")!))
+    }
+
+    func testSignInOpenerIsRememberedAsAString() {
+        for opener in [SignInOpener.privateWindow, .defaultBrowser, .privateBrowser("com.google.Chrome")] {
+            XCTAssertEqual(SignInOpener(storageValue: opener.storageValue), opener)
+        }
+        XCTAssertEqual(SignInOpener(storageValue: ""), .privateWindow)
+    }
+
+    func testSignedOutClaudeCodeIsReportedAsNoLogin() throws {
+        let client = try CSwapClient(executableURL: fakeCLI("""
+        #!/bin/sh
+        printf '%s\n' '{"schemaVersion":1,"active":null}'
+        """))
+        XCTAssertNil(try client.currentLogin())
+    }
+
+    func testOlderCcshiftWithoutAccountJSONAsksForAnUpgrade() throws {
+        let client = try CSwapClient(executableURL: fakeCLI("""
+        #!/bin/sh
+        echo "ccshift: error: --json can only be used with 'list', 'status', or 'switch'" >&2
+        exit 2
+        """))
+        XCTAssertThrowsError(try client.removeAccount(account(2, "b@example.test"), emailIsShared: false)) { error in
+            XCTAssertEqual(error as? CLIError, .accountCommandsUnsupported)
+        }
+        XCTAssertThrowsError(try client.addCurrentAccount(alias: nil)) { error in
+            XCTAssertEqual(error as? CLIError, .accountCommandsUnsupported)
+        }
+    }
+
+    func testAccountCommandErrorEnvelopeSurfacesTheReason() throws {
+        let client = try CSwapClient(executableURL: fakeCLI("""
+        #!/bin/sh
+        printf '%s\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"No active Claude account found. Please log in first."}}'
+        exit 1
+        """))
+        XCTAssertThrowsError(try client.addCurrentAccount(alias: nil)) { error in
+            XCTAssertEqual(error.localizedDescription, "No active Claude account found. Please log in first.")
+        }
+        XCTAssertThrowsError(try client.removeAccount(account(0, "a@example.test"), emailIsShared: false)) { error in
+            XCTAssertEqual(error as? CLIError, .invalidAccountNumber)
+        }
+    }
+
     private func fakeCLI(_ script: String, replacements: [String: String] = [:]) throws -> URL {
         let folder = try tempFolder()
         let executable = folder.appendingPathComponent("ccshift-fake")

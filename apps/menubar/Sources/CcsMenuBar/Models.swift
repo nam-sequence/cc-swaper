@@ -271,6 +271,55 @@ struct AccountReference: Decodable, Sendable {
     let email: String?
 }
 
+/// `ccshift status --json`: the login Claude Code is using right now, if any.
+struct EngineStatus: Decodable, Sendable {
+    let schemaVersion: Int
+    let active: CurrentLogin?
+}
+
+struct CurrentLogin: Decodable, Equatable, Sendable {
+    let email: String
+    let managed: Bool
+    let number: Int?
+    let alias: String?
+    let organizationName: String?
+
+    /// The name ccshift shows for the saved account, else the email.
+    var displayName: String {
+        if let alias, !alias.isEmpty { return alias }
+        return email
+    }
+}
+
+/// `ccshift add --json` / `ccshift remove N --yes --json`.
+struct AccountChangeReport: Decodable, Equatable, Sendable {
+    struct ChangedAccount: Decodable, Equatable, Sendable {
+        let number: Int
+        let email: String
+        let alias: String?
+
+        var displayName: String {
+            if let alias, !alias.isEmpty { return alias }
+            return email
+        }
+    }
+
+    let schemaVersion: Int
+    /// "added", "refreshed", "removed" or "cancelled".
+    let action: String
+    let account: ChangedAccount?
+    let wasActive: Bool?
+}
+
+/// What the Add Account sheet knows about the current Claude Code login.
+enum CurrentLoginState: Equatable, Sendable {
+    case unknown
+    case checking
+    case signedOut
+    case signedIn(CurrentLogin)
+    case failed(String)
+}
+
 struct CommandResult: Sendable {
     let output: Data
     let standardError: String
@@ -300,6 +349,8 @@ enum CLIError: LocalizedError, Equatable {
     case unsupportedSchema(Int)
     case unexpectedSelection(expected: Int, actual: Int?)
     case switchRejected(String)
+    case accountCommandsUnsupported
+    case accountListChanged
 
     var errorDescription: String? {
         switch self {
@@ -327,6 +378,10 @@ enum CLIError: LocalizedError, Equatable {
             "ccshift selected account \(actual.map(String.init) ?? "unknown") instead of account \(expected)."
         case let .switchRejected(message):
             message.isEmpty ? "ccshift could not switch accounts." : message
+        case .accountListChanged:
+            "The account list changed since it was shown. Check the refreshed list and try again."
+        case .accountCommandsUnsupported:
+            "This ccshift version cannot add or remove accounts for the menu bar app. Run ccshift upgrade, then try again."
         }
     }
 }
