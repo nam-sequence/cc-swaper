@@ -2,9 +2,17 @@
 
 ## Claude Swap
 
-The `src/claude_swap/` package and its upstream tests in `tests_upstream/` are
-adapted from [realiti4/claude-swap](https://github.com/realiti4/claude-swap),
-commit `3a4e5c14873eb5b32f182d55c68da98ac8c0db45`.
+The `src/ccshift/` package, its tests in `tests/`, `README.md` and
+`assets/tui-watch.png` are derived from
+[realiti4/claude-swap](https://github.com/realiti4/claude-swap), commit
+`3a4e5c14873eb5b32f182d55c68da98ac8c0db45` (v0.27.0b1). The fork renames the
+project to ccshift: the command, the Python package (`claude_swap` →
+`ccshift`), the data directory (`~/.claude-swap-backup` → `~/.ccshift`), the
+Keychain service (`claude-swap` → `ccshift`) and related names. `LICENSE` is
+the upstream license, reproduced unchanged.
+
+The menu bar app in `apps/menubar/` is original to this repository and is not
+covered by this notice.
 
 Copyright (c) 2026 Onur Cetinkol. Licensed under the MIT License.
 

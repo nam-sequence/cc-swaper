@@ -4,75 +4,41 @@ import XCTest
 @testable import CcsMenuBar
 
 final class CSwapClientTests: XCTestCase {
-    func testEngineDashboardAndSwitchSupportUnmanagedSourceAndAlreadyActiveNoOp() throws {
+    func testDashboardAndSwitchSupportUnmanagedSourceAndAlreadyActiveNoOp() throws {
         let executable = try fakeCLI(engineScript)
         let client = try CSwapClient(executableURL: executable)
 
         let dashboard = try client.dashboard()
         XCTAssertEqual(dashboard.activeAccountNumber, 1)
-        XCTAssertEqual(dashboard.accounts.filter { $0.mode == .engine }.count, 2)
-        XCTAssertEqual(dashboard.accounts.filter { $0.mode == .legacy }.count, 0)
+        XCTAssertEqual(dashboard.accounts.count, 2)
         XCTAssertEqual(dashboard.accounts[0].alias, "main")
         XCTAssertEqual(dashboard.accounts[0].visibleUsage?.fiveHour?.pct, 17)
         XCTAssertEqual(dashboard.accounts[1].lastGoodUsage?.sevenDay?.pct, 61)
+        XCTAssertEqual(dashboard.accounts[1].usageStatus, "unavailable")
         XCTAssertTrue(dashboard.accounts[1].isStale)
-        XCTAssertEqual(dashboard.launchBackend, "accounts")
 
         let switched = try client.switchEngineAccount(to: 2)
         XCTAssertTrue(switched.switched)
-        XCTAssertNil(switched.from?.number)
+        XCTAssertNil(switched.from)
         XCTAssertEqual(switched.to.number, 2)
 
         let alreadyActive = try client.switchEngineAccount(to: 1)
         XCTAssertFalse(alreadyActive.switched)
-        XCTAssertNil(alreadyActive.from?.number)
+        XCTAssertEqual(alreadyActive.from?.number, 1)
         XCTAssertEqual(alreadyActive.to.number, 1)
-    }
-
-    func testEmptyEngineListFallsBackToLegacyProfilesAndUsage() throws {
-        let executable = try fakeCLI(legacyScript)
-        let client = try CSwapClient(executableURL: executable)
-
-        let dashboard = try client.dashboard()
-        XCTAssertEqual(dashboard.launchBackend, "legacy")
-        XCTAssertEqual(dashboard.activeProfileName, "main")
-        XCTAssertEqual(dashboard.accounts.map(\.profileName), ["main", "team"])
-        XCTAssertTrue(dashboard.accounts.allSatisfy { $0.mode == .legacy })
-        XCTAssertEqual(dashboard.accounts[0].visibleUsage?.fiveHour?.pct, 17)
-        XCTAssertEqual(dashboard.accounts[0].visibleUsage?.scoped?.first?.model, "Sonnet")
-        XCTAssertEqual(dashboard.accounts[1].usageStatus, "Usage query failed")
-
-        XCTAssertEqual(try client.switchLegacyProfile(to: "team"), "team")
-    }
-
-    func testCombinedDashboardKeepsBothCollectionsAndTheirIndependentSelection() throws {
-        let client = try CSwapClient(executableURL: fakeCLI(combinedScript))
-
-        let dashboard = try client.dashboard()
-        XCTAssertEqual(dashboard.accounts.count, 2)
-        XCTAssertEqual(dashboard.accounts.map(\.mode), [.engine, .legacy])
-        XCTAssertEqual(dashboard.accounts.map(\.active), [true, true])
-        XCTAssertEqual(dashboard.launchBackend, "legacy")
-        XCTAssertEqual(try client.switchEngineAccount(to: 7).to.number, 7)
-        XCTAssertEqual(try client.switchLegacyProfile(to: "old-main"), "old-main")
-
-        let routeRace = try client.switchEngineAccount(to: 8)
-        XCTAssertFalse(routeRace.routingChanged ?? true)
-        XCTAssertEqual(routeRace.launchBackend, "legacy")
-        XCTAssertEqual(routeRace.routingWarning, "A newer Existing Profiles selection remained active.")
     }
 
     func testNonzeroJSONErrorEnvelopeSurfacesTheUpstreamReason() throws {
         let executable = try fakeCLI("""
         #!/bin/sh
-        printf '%s\\n' '{"schemaVersion":1,"error":{"code":"not-ready","message":"Engine is not ready"}}'
+        printf '%s\\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"No accounts are managed yet"}}'
         exit 1
         """)
         let client = try CSwapClient(executableURL: executable)
 
         XCTAssertThrowsError(try client.dashboard()) { error in
-            XCTAssertEqual(error as? CLIError, .commandRejected("Engine is not ready"))
-            XCTAssertEqual(error.localizedDescription, "Engine is not ready")
+            XCTAssertEqual(error as? CLIError, .commandRejected("No accounts are managed yet"))
+            XCTAssertEqual(error.localizedDescription, "No accounts are managed yet")
         }
     }
 
@@ -85,15 +51,6 @@ final class CSwapClientTests: XCTestCase {
 
         XCTAssertThrowsError(try client.dashboard()) { error in
             XCTAssertEqual(error as? CLIError, .unsupportedSchema(9))
-        }
-    }
-
-    func testInvalidLegacyProfileNameNeverRunsACommand() throws {
-        let executable = try fakeCLI(engineScript)
-        let client = try CSwapClient(executableURL: executable)
-
-        XCTAssertThrowsError(try client.switchLegacyProfile(to: "../../unexpected")) { error in
-            XCTAssertEqual(error as? CLIError, .invalidProfileName)
         }
     }
 
@@ -118,14 +75,14 @@ final class CSwapClientTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 3)
         let groupText = try String(contentsOf: groupPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         let groupID = try XCTUnwrap(Int32(groupText))
-        XCTAssertEqual(kill(-groupID, 0), -1, "the timed-out ccs child process group must be gone")
+        XCTAssertEqual(kill(-groupID, 0), -1, "the timed-out ccshift child process group must be gone")
     }
 
     func testStableLauncherSymlinkIsPreservedAndTargetIsRevalidated() throws {
         let folder = try tempFolder()
-        let first = try fakeCLI(switchReply("alpha"))
-        let second = try fakeCLI(switchReply("beta"))
-        let launcher = folder.appendingPathComponent("ccs")
+        let first = try fakeCLI(switchReply(1))
+        let second = try fakeCLI(switchReply(2))
+        let launcher = folder.appendingPathComponent("ccshift")
         try FileManager.default.createSymbolicLink(at: launcher, withDestinationURL: first)
         let client = try CSwapClient(executableURL: launcher)
 
@@ -134,14 +91,14 @@ final class CSwapClientTests: XCTestCase {
             .appendingPathComponent(launcher.lastPathComponent)
             .standardizedFileURL
         XCTAssertEqual(client.executableURL.path, stableLauncher.path)
-        XCTAssertEqual(try client.switchLegacyProfile(to: "alpha"), "alpha")
+        XCTAssertEqual(try client.switchEngineAccount(to: 1).to.number, 1)
 
         try FileManager.default.removeItem(at: launcher)
         try FileManager.default.createSymbolicLink(at: launcher, withDestinationURL: second)
-        XCTAssertEqual(try client.switchLegacyProfile(to: "beta"), "beta")
+        XCTAssertEqual(try client.switchEngineAccount(to: 2).to.number, 2)
 
         try FileManager.default.removeItem(at: second)
-        XCTAssertThrowsError(try client.switchLegacyProfile(to: "beta")) { error in
+        XCTAssertThrowsError(try client.switchEngineAccount(to: 2)) { error in
             XCTAssertEqual(error as? CLIError, .invalidExecutablePath)
         }
     }
@@ -156,7 +113,7 @@ final class CSwapClientTests: XCTestCase {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o777]
         )
-        let pathCandidate = try writeFakeExecutable(at: unsafeBin.appendingPathComponent("ccs"), permissions: 0o700)
+        let pathCandidate = try writeFakeExecutable(at: unsafeBin.appendingPathComponent("ccshift"), permissions: 0o700)
         let defaults = UserDefaults(suiteName: "ccs-menubar-resolver-\(UUID().uuidString)")!
         let resolved = CLIResolver.executable(
             environment: ["PATH": unsafeBin.path],
@@ -180,7 +137,7 @@ final class CSwapClientTests: XCTestCase {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
-        let protectedExecutable = try writeFakeExecutable(at: protectedChild.appendingPathComponent("ccs"), permissions: 0o700)
+        let protectedExecutable = try writeFakeExecutable(at: protectedChild.appendingPathComponent("ccshift"), permissions: 0o700)
         XCTAssertNil(CLIResolver.validExecutable(protectedExecutable.path))
 
         let safeBin = folder.appendingPathComponent("safe-bin", isDirectory: true)
@@ -195,12 +152,12 @@ final class CSwapClientTests: XCTestCase {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o777]
         )
-        let unsafeTarget = try writeFakeExecutable(at: unsafeTargetDirectory.appendingPathComponent("ccs-real"), permissions: 0o700)
-        let chosenSymlink = safeBin.appendingPathComponent("ccs")
+        let unsafeTarget = try writeFakeExecutable(at: unsafeTargetDirectory.appendingPathComponent("ccshift-real"), permissions: 0o700)
+        let chosenSymlink = safeBin.appendingPathComponent("ccshift")
         try FileManager.default.createSymbolicLink(at: chosenSymlink, withDestinationURL: unsafeTarget)
         XCTAssertNil(CLIResolver.validExecutable(chosenSymlink.path))
 
-        let unsafeFile = try writeFakeExecutable(at: safeBin.appendingPathComponent("ccs-world-writable"), permissions: 0o777)
+        let unsafeFile = try writeFakeExecutable(at: safeBin.appendingPathComponent("ccshift-world-writable"), permissions: 0o777)
         XCTAssertNil(CLIResolver.validExecutable(unsafeFile.path))
     }
 
@@ -214,14 +171,14 @@ final class CSwapClientTests: XCTestCase {
         )
 
         let readOnlyACLExecutable = try writeFakeExecutable(
-            at: safeBin.appendingPathComponent("ccs-read-acl"),
+            at: safeBin.appendingPathComponent("ccshift-read-acl"),
             permissions: 0o700
         )
         try addACL("everyone allow read", to: readOnlyACLExecutable)
         XCTAssertNotNil(CLIResolver.validExecutable(readOnlyACLExecutable.path))
 
         let writableACLExecutable = try writeFakeExecutable(
-            at: safeBin.appendingPathComponent("ccs-write-acl"),
+            at: safeBin.appendingPathComponent("ccshift-write-acl"),
             permissions: 0o700
         )
         try addACL("everyone allow write", to: writableACLExecutable)
@@ -235,7 +192,7 @@ final class CSwapClientTests: XCTestCase {
         )
         try addACL("everyone allow delete_child", to: aclParent)
         let childExecutable = try writeFakeExecutable(
-            at: aclParent.appendingPathComponent("ccs"),
+            at: aclParent.appendingPathComponent("ccshift"),
             permissions: 0o700
         )
         XCTAssertNil(CLIResolver.validExecutable(childExecutable.path))
@@ -258,30 +215,82 @@ final class CSwapClientTests: XCTestCase {
             attributes: [.posixPermissions: 0o700]
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: child) }
-        let executable = try writeFakeExecutable(at: child.appendingPathComponent("ccs"), permissions: 0o700)
+        let executable = try writeFakeExecutable(at: child.appendingPathComponent("ccshift"), permissions: 0o700)
         XCTAssertNotNil(CLIResolver.validExecutable(executable.path))
     }
 
-    func testLegacyUsageTimeoutExceedsCcsFortyFiveSecondLimit() throws {
+    func testDefaultTimeoutCoversAFullUpstreamUsageFetch() throws {
         let client = try CSwapClient(executableURL: fakeCLI(engineScript))
         XCTAssertGreaterThanOrEqual(client.timeout, 45)
     }
 
-    func testLegacyUsageTimeoutScalesPastOneEightAccountBatch() throws {
-        let profileJSON = (1...9).map { index in
-            "{\"name\":\"old-\(index)\",\"kind\":\"managed\",\"selected\":\(index == 1 ? "true" : "false"),\"signedIn\":true,\"authMethod\":\"Claude subscription\"}"
-        }.joined(separator: ",")
-        let executable = try fakeCLI(largeLegacyScript, replacements: ["__PROFILES__": profileJSON])
-        let client = try CSwapClient(executableURL: executable, timeout: 0.5)
+    func testAutoSwitchOnceParsesJSONLinesAndExitCodes() throws {
+        let executable = try fakeCLI(autoScript)
+        let client = try CSwapClient(executableURL: executable)
+        let outcome = try client.autoSwitchOnce(threshold: 84, dryRun: true, cancellation: ProcessCancellation())
+        XCTAssertEqual(outcome.eventKind, "switch")
+        XCTAssertTrue(outcome.dryRun)
+        XCTAssertEqual(outcome.summary, "Would switch to two@example.test.")
+    }
 
-        let dashboard = try client.dashboard()
-        XCTAssertEqual(dashboard.accounts.filter { $0.mode == .legacy }.count, 9)
-        XCTAssertGreaterThanOrEqual(client.legacyUsageTimeout(profileCount: 9), 125)
+    func testResetLabelIsRecomputedFromResetsAtLikeCcshift() throws {
+        let json = #"{"pct":40,"resetsAt":"2026-09-29T23:29:59.123456+00:00","countdown":"21h 51m","clock":"Sep 30 06:29"}"#
+        let window = try JSONDecoder().decode(UsageWindow.self, from: Data(json.utf8))
+        let now = try XCTUnwrap(ResetTime.parse("2026-09-29T01:39:00+00:00"))
+        XCTAssertEqual(window.resetLabel(now: now), "in 21h 50m")
+        XCTAssertEqual(window.resetTooltip, "Resets Sep 30 06:29")
+        let afterReset = try XCTUnwrap(ResetTime.parse("2026-09-30T00:00:00+00:00"))
+        XCTAssertEqual(window.resetLabel(now: afterReset), "in 0m")
+        let daysBefore = try XCTUnwrap(ResetTime.parse("2026-09-24T20:00:00+00:00"))
+        XCTAssertEqual(window.resetLabel(now: daysBefore), "in 5d 3h")
+
+        let usage = try JSONDecoder().decode(AccountUsage.self, from: Data(#"""
+        {"fiveHour":{"pct":4},"scoped":[{"name":"Opus","pct":9,"resetsAt":"2026-10-04T04:57:00+00:00","countdown":"5d 2h","clock":"Oct 4 11:57"}]}
+        """#.utf8))
+        XCTAssertEqual(usage.scoped?.first?.window.resetTooltip, "Resets Oct 4 11:57")
+        XCTAssertEqual(usage.scoped?.first?.window.resetLabel(now: daysBefore), "in 9d 8h")
+    }
+
+    func testResetLabelFallsBackToCountdownThenRawText() throws {
+        let countdownOnly = try JSONDecoder().decode(
+            UsageWindow.self, from: Data(#"{"pct":1,"countdown":"47m","clock":"09:45"}"#.utf8)
+        )
+        XCTAssertEqual(countdownOnly.resetLabel(), "in 47m")
+        XCTAssertEqual(UsageWindow(pct: 1, resetsAt: "tomorrow").resetLabel(), "tomorrow")
+        XCTAssertNil(UsageWindow(pct: 1, resetsAt: nil).resetLabel())
+    }
+
+    func testAutoSwitchNoSwitchEventWithExitTwoIsAResult() throws {
+        let executable = try fakeCLI(#"""
+        #!/bin/sh
+        printf '%s\n' '{"schemaVersion":1,"event":"no-switch","ts":"2026-09-29T00:00:00Z","reason":"active-api-key","detail":"API-key accounts have no quota to watch"}'
+        exit 2
+        """#)
+        let client = try CSwapClient(executableURL: executable)
+        let outcome = try client.autoSwitchOnce(threshold: 90, dryRun: false, cancellation: ProcessCancellation())
+        XCTAssertEqual(outcome.eventKind, "no-switch")
+        XCTAssertEqual(outcome.summary, "active-api-key: API-key accounts have no quota to watch.")
+    }
+
+    func testAutoSwitchUsageErrorWithoutEventsIsAFailure() throws {
+        let executable = try fakeCLI(#"""
+        #!/bin/sh
+        printf '%s\n' 'ccshift: error: unrecognized arguments: accounts' >&2
+        exit 2
+        """#)
+        let client = try CSwapClient(executableURL: executable)
+        XCTAssertThrowsError(
+            try client.autoSwitchOnce(threshold: 90, dryRun: false, cancellation: ProcessCancellation())
+        ) { error in
+            guard case CLIError.failed = error else {
+                return XCTFail("expected CLIError.failed, got \(error)")
+            }
+        }
     }
 
     private func fakeCLI(_ script: String, replacements: [String: String] = [:]) throws -> URL {
         let folder = try tempFolder()
-        let executable = folder.appendingPathComponent("ccs-fake")
+        let executable = folder.appendingPathComponent("ccshift-fake")
         var resolvedScript = script
         for (placeholder, value) in replacements {
             resolvedScript = resolvedScript.replacingOccurrences(of: placeholder, with: value)
@@ -318,107 +327,35 @@ final class CSwapClientTests: XCTestCase {
         return folder
     }
 
-    private func switchReply(_ selected: String) -> String {
+    private func switchReply(_ number: Int) -> String {
         """
         #!/bin/sh
-        printf '{"schemaVersion":1,"selected":"%s"}\n' '\(selected)'
+        printf '{"schemaVersion":1,"switched":true,"from":null,"to":{"number":%s,"email":"x@example.test"}}\n' '\(number)'
         """
+    }
+
+    private var autoScript: String {
+        #"""
+        #!/bin/sh
+        printf '%s\n' '{"schemaVersion":1,"event":"poll","ts":"2026-09-29T00:00:00Z","active":{"number":1,"email":"one@example.test"},"headroomPct":{"1":5.0,"2":90.0},"threshold":84.0}'
+        printf '%s\n' '{"schemaVersion":1,"event":"switch","ts":"2026-09-29T00:00:00Z","trigger":"proactive","from":{"number":1,"email":"one@example.test"},"to":{"number":2,"email":"two@example.test"},"warnings":[],"dryRun":true}'
+        exit 0
+        """#
     }
 
     private var engineScript: String {
         #"""
         #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          printf '%s\n' '{"schemaVersion":1,"launchBackend":"accounts","selectedLegacyProfile":null}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
+        if [ "$1" = "list" ]; then
           cat <<'JSON'
-        {"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","organizationName":"Max","alias":"main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":17,"resetsAt":"in 2h"},"sevenDay":{"pct":32,"resetsAt":"Friday"}},"usageAgeSeconds":5},{"number":2,"email":"team@example.test","organizationName":"Team","alias":"work","active":false,"usageStatus":"stale","usageAgeSeconds":300,"lastGoodUsage":{"sevenDay":{"pct":61,"resetsAt":"Monday"}}}]}
+        {"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","organizationName":"Max","organizationUuid":"","isOrganization":false,"alias":"main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":17,"resetsAt":"2026-06-22T23:29:59Z"},"sevenDay":{"pct":32,"resetsAt":"2026-06-26T17:59:59Z"}},"usageAgeSeconds":5},{"number":2,"email":"team@example.test","organizationName":"Team","alias":"work","active":false,"usageStatus":"unavailable","usage":null,"lastGoodAgeSeconds":300,"lastGoodUsage":{"sevenDay":{"pct":61,"resetsAt":"2026-06-26T17:59:59Z"}}}]}
         JSON
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          cat <<'JSON'
-        {"schemaVersion":1,"active":{"number":1,"email":"main@example.test","managed":true,"usageStatus":"ok"}}
-        JSON
-        elif [ "$1" = "accounts" ] && [ "$2" = "switch" ]; then
-          if [ "$3" = "1" ]; then
-            printf '%s\n' '{"schemaVersion":1,"switched":false,"from":{"number":null,"email":"unmanaged@example.test"},"to":{"number":1,"email":"main@example.test"},"reason":"already-active"}'
-          else
-            printf '{"schemaVersion":1,"switched":true,"from":{"number":null,"email":"unmanaged@example.test"},"to":{"number":%s,"email":"target@example.test"}}\n' "$3"
-          fi
-        elif [ "$1" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"selected":null,"profiles":[],"launchBackend":"accounts","selectedLegacyProfile":null}'
-        else
-          exit 64
-        fi
-        """#
-    }
-
-    private var legacyScript: String {
-        #"""
-        #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          printf '%s\n' '{"schemaVersion":1,"launchBackend":"legacy","selectedLegacyProfile":"main"}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          printf '%s\n' '{"schemaVersion":1,"active":null}'
-        elif [ "$1" = "list" ]; then
-          cat <<'JSON'
-        {"schemaVersion":1,"selected":"main","profiles":[{"name":"main","kind":"default","selected":true,"signedIn":true,"authMethod":"Claude subscription","email":"main@example.test","organization":"Max"},{"name":"team","kind":"managed","selected":false,"signedIn":true,"authMethod":"Claude subscription","email":"team@example.test"}]}
-        JSON
-        elif [ "$1" = "usage" ]; then
-          cat <<'JSON'
-        {"source":"Claude Code /usage","checked_at":"2026-09-29T00:00:00Z","accounts":[{"profile":"main","plan":"Max","five_hour":{"used_percent":17,"resets_at":"in 2h"},"seven_day":{"used_percent":32,"resets_at":"Friday"},"model_weekly":[{"model":"Sonnet","used_percent":0,"resets_at":"Monday"}]},{"profile":"team","error":"Usage query failed"}]}
-        JSON
-          exit 1
         elif [ "$1" = "switch" ]; then
-          printf '{"schemaVersion":1,"selected":"%s","launchBackend":"legacy"}\n' "$2"
-        else
-          exit 64
-        fi
-        """#
-    }
-
-    private var combinedScript: String {
-        #"""
-        #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          printf '%s\n' '{"schemaVersion":1,"launchBackend":"legacy","selectedLegacyProfile":"old-main"}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":7,"accounts":[{"number":7,"email":"engine@example.test","organizationName":"Team","alias":"engine","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":4},"sevenDay":{"pct":5}}}]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          printf '%s\n' '{"schemaVersion":1,"active":{"number":7,"email":"engine@example.test","managed":true}}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "switch" ]; then
-          if [ "$3" = "8" ]; then
-            printf '%s\n' '{"schemaVersion":1,"switched":true,"from":{"number":7},"to":{"number":8},"launchBackend":"legacy","routingChanged":false,"routingWarning":"A newer Existing Profiles selection remained active."}'
+          if [ "$2" = "1" ]; then
+            printf '%s\n' '{"schemaVersion":1,"switched":false,"from":{"number":1,"email":"main@example.test"},"to":{"number":1,"email":"main@example.test"},"strategy":"direct","reason":"already-active","message":"Already on Account-1 (main@example.test)","warnings":[]}'
           else
-            printf '{"schemaVersion":1,"switched":true,"from":{"number":null},"to":{"number":%s},"launchBackend":"accounts","routingChanged":true}\n' "$3"
+            printf '{"schemaVersion":1,"switched":true,"from":null,"to":{"number":%s,"email":"target@example.test"},"strategy":"direct","reason":"switched","warnings":[]}\n' "$2"
           fi
-        elif [ "$1" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"selected":"old-main","profiles":[{"name":"old-main","kind":"managed","selected":true,"signedIn":true,"authMethod":"Claude subscription","email":"old@example.test"}]}'
-        elif [ "$1" = "usage" ]; then
-          printf '%s\n' '{"accounts":[{"profile":"old-main","five_hour":{"used_percent":8},"seven_day":{"used_percent":9}}]}'
-        elif [ "$1" = "switch" ]; then
-          printf '{"schemaVersion":1,"selected":"%s","launchBackend":"legacy"}\n' "$2"
-        else
-          exit 64
-        fi
-        """#
-    }
-
-    private var largeLegacyScript: String {
-        #"""
-        #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          printf '%s\n' '{"schemaVersion":1,"launchBackend":"legacy","selectedLegacyProfile":"old-1"}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          printf '%s\n' '{"schemaVersion":1,"active":null}'
-        elif [ "$1" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"selected":"old-1","profiles":[__PROFILES__]}'
-        elif [ "$1" = "usage" ]; then
-          /bin/sleep 0.8
-          printf '%s\n' '{"accounts":[]}'
         else
           exit 64
         fi

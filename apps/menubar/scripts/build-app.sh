@@ -63,7 +63,8 @@ cat > "$staging/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>CcsMenuBar</string>
   <key>CFBundleIdentifier</key><string>com.namsequence.ccswaper.menubar</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>CC Swaper</string>
+  <key>CFBundleName</key><string>ccshift</string>
+  <key>CFBundleDisplayName</key><string>ccshift</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${app_version}</string>
   <key>CFBundleVersion</key><string>${app_version}</string>

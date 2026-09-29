@@ -12,13 +12,3 @@ dist/
 *.log
 *.jsonl
 *.credentials.json
-/profiles.json
-/sessions.json
-/background-sessions.json
-/monitor*.json
-/pending-removal.json
-/claude.zsh
-/com.cc-swaper.monitor.plist
-/profiles/
-/removed/
-/locks/

@@ -2,25 +2,20 @@ import Foundation
 
 struct Account: Identifiable, Equatable, Sendable {
     let id: String
-    let mode: BackendMode
     let number: Int?
-    let profileName: String?
     let email: String
     let organizationName: String?
     let alias: String?
     var active: Bool
     let disabled: Bool
-    let signedIn: Bool?
     let usageStatus: String
     var usage: AccountUsage?
     let usageAgeSeconds: Double?
     let lastGoodUsage: AccountUsage?
     let lastGoodAgeSeconds: Double?
-    let plan: String?
 
     var displayName: String {
         if let alias, !alias.isEmpty { return alias }
-        if let profileName, !profileName.isEmpty { return profileName }
         if !email.isEmpty { return email }
         return number.map(String.init) ?? "Account"
     }
@@ -34,11 +29,11 @@ struct Account: Identifiable, Equatable, Sendable {
     var usageMessage: String? {
         switch usageStatus {
         case "ok": nil
-        case "token_expired": "This account needs to sign in again."
+        case "token_expired": "Token expired; ccshift refreshes it automatically."
         case "api_key": "Usage is unavailable for an API key account."
         case "keychain_unavailable": "macOS Keychain is unavailable."
-        case "relogin_required": "Sign in to this account again."
-        case "foreign_credential": "This account uses an unsupported credential type."
+        case "relogin_required": "Login expired. Log in with Claude Code, then run ccshift add."
+        case "foreign_credential": "The live login belongs to another account; switching repairs it."
         case "no_credentials": "This account is not signed in."
         case "unavailable": "Usage is temporarily unavailable."
         default: usageStatus
@@ -46,25 +41,10 @@ struct Account: Identifiable, Equatable, Sendable {
     }
 }
 
-enum BackendMode: String, CaseIterable, Identifiable, Sendable {
-    case engine = "Engine Accounts"
-    case legacy = "Existing Profiles"
-
-    var id: String { rawValue }
-}
-
 struct DashboardSnapshot: Sendable {
     let accounts: [Account]
     let activeAccountNumber: Int?
-    let activeProfileName: String?
-    let launchBackend: String?
     let warning: String?
-}
-
-struct RoutingReport: Decodable, Sendable {
-    let schemaVersion: Int
-    let launchBackend: String
-    let selectedLegacyProfile: String?
 }
 
 struct AutoSwitchOutcome: Equatable, Sendable {
@@ -75,7 +55,7 @@ struct AutoSwitchOutcome: Equatable, Sendable {
 }
 
 struct ManualSwitchOutcome: Sendable {
-    let routingWarning: String?
+    let warning: String?
 }
 
 final class ProcessCancellation: @unchecked Sendable {
@@ -116,116 +96,28 @@ struct EngineAccount: Decodable, Sendable {
 
     var account: Account {
         Account(
-            id: "engine:\(number)",
-            mode: .engine,
+            id: "account:\(number)",
             number: number,
-            profileName: nil,
             email: email,
             organizationName: organizationName,
             alias: alias,
             active: active,
             disabled: disabled ?? false,
-            signedIn: nil,
             usageStatus: usageStatus,
             usage: usage,
             usageAgeSeconds: usageAgeSeconds,
             lastGoodUsage: lastGoodUsage,
-            lastGoodAgeSeconds: lastGoodAgeSeconds,
-            plan: nil
+            lastGoodAgeSeconds: lastGoodAgeSeconds
         )
-    }
-}
-
-struct LegacyProfileList: Decodable, Sendable {
-    let schemaVersion: Int
-    let selected: String?
-    let profiles: [LegacyProfile]
-}
-
-struct LegacyProfile: Decodable, Sendable {
-    let name: String
-    let kind: String
-    let selected: Bool
-    let signedIn: Bool
-    let authMethod: String
-    let email: String?
-    let organization: String?
-
-    func account(usage: LegacyUsageAccount?) -> Account {
-        let status: String
-        if let error = usage?.error, !error.isEmpty {
-            status = error
-        } else if !signedIn {
-            status = "Sign-in required (\(authMethod))"
-        } else if usage == nil {
-            status = "Usage unavailable"
-        } else {
-            status = "ok"
-        }
-        let normalizedUsage = usage.map { value in
-            AccountUsage(
-                fiveHour: value.fiveHour,
-                sevenDay: value.sevenDay,
-                scoped: value.modelWeekly
-            )
-        }
-        return Account(
-            id: "legacy:\(name)",
-            mode: .legacy,
-            number: nil,
-            profileName: name,
-            email: email ?? "",
-            organizationName: organization,
-            alias: name,
-            active: selected,
-            disabled: !signedIn,
-            signedIn: signedIn,
-            usageStatus: status,
-            usage: normalizedUsage,
-            usageAgeSeconds: nil,
-            lastGoodUsage: nil,
-            lastGoodAgeSeconds: nil,
-            plan: usage?.plan ?? (kind == "default" ? "Default profile" : nil)
-        )
-    }
-}
-
-struct LegacyUsageReport: Decodable, Sendable {
-    let accounts: [LegacyUsageAccount]
-}
-
-struct LegacyUsageAccount: Decodable, Sendable {
-    let profile: String
-    let plan: String?
-    let fiveHour: UsageWindow?
-    let sevenDay: UsageWindow?
-    let modelWeekly: [ScopedUsage]?
-    let error: String?
-
-    static func unavailable(_ profile: String) -> LegacyUsageAccount {
-        LegacyUsageAccount(
-            profile: profile,
-            plan: nil,
-            fiveHour: nil,
-            sevenDay: nil,
-            modelWeekly: nil,
-            error: "Usage unavailable"
-        )
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case profile
-        case plan
-        case fiveHour = "five_hour"
-        case sevenDay = "seven_day"
-        case modelWeekly = "model_weekly"
-        case error
     }
 }
 
 struct UsageWindow: Decodable, Equatable, Sendable {
     let pct: Double?
     let resetsAt: String?
+    /// ccshift's "21h 50m" / "Sep 30 06:48" strings, computed when it printed the JSON.
+    let countdown: String?
+    let clock: String?
 
     enum CodingKeys: String, CodingKey {
         case pct
@@ -233,11 +125,15 @@ struct UsageWindow: Decodable, Equatable, Sendable {
         case usedPercentCamel = "usedPercent"
         case resetsAt
         case resetsAtSnake = "resets_at"
+        case countdown
+        case clock
     }
 
-    init(pct: Double?, resetsAt: String?) {
+    init(pct: Double?, resetsAt: String?, countdown: String? = nil, clock: String? = nil) {
         self.pct = pct
         self.resetsAt = resetsAt
+        self.countdown = countdown
+        self.clock = clock
     }
 
     init(from decoder: Decoder) throws {
@@ -247,6 +143,45 @@ struct UsageWindow: Decodable, Equatable, Sendable {
             ?? values.decodeIfPresent(Double.self, forKey: .usedPercentCamel)
         resetsAt = try values.decodeIfPresent(String.self, forKey: .resetsAt)
             ?? values.decodeIfPresent(String.self, forKey: .resetsAtSnake)
+        countdown = try values.decodeIfPresent(String.self, forKey: .countdown)
+        clock = try values.decodeIfPresent(String.self, forKey: .clock)
+    }
+
+    /// Time left until the reset, formatted like ccshift ("5d 2h", "21h 50m", "47m").
+    /// Recomputed from `resetsAt` so an open menu does not show a frozen countdown.
+    func resetLabel(now: Date = Date()) -> String? {
+        if let resetsAt, let date = ResetTime.parse(resetsAt) {
+            return "in \(ResetTime.countdown(until: date, now: now))"
+        }
+        if let countdown, !countdown.isEmpty { return "in \(countdown)" }
+        if let resetsAt, !resetsAt.isEmpty { return resetsAt }
+        return nil
+    }
+
+    var resetTooltip: String? {
+        if let clock, !clock.isEmpty { return "Resets \(clock)" }
+        return resetsAt
+    }
+}
+
+enum ResetTime {
+    static func parse(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
+    /// Mirrors ccshift's oauth.format_reset countdown.
+    static func countdown(until reset: Date, now: Date) -> String {
+        let total = max(0, Int(reset.timeIntervalSince(now)))
+        let days = total / 86_400
+        let hours = total % 86_400 / 3_600
+        let minutes = total % 3_600 / 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 }
 
@@ -285,6 +220,8 @@ struct ScopedUsage: Decodable, Equatable, Sendable {
     let model: String?
     let pct: Double?
     let resetsAt: String?
+    let countdown: String?
+    let clock: String?
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -295,6 +232,12 @@ struct ScopedUsage: Decodable, Equatable, Sendable {
         case usedPercentCamel = "usedPercent"
         case resetsAt
         case resetsAtSnake = "resets_at"
+        case countdown
+        case clock
+    }
+
+    var window: UsageWindow {
+        UsageWindow(pct: pct, resetsAt: resetsAt, countdown: countdown, clock: clock)
     }
 
     init(from decoder: Decoder) throws {
@@ -307,36 +250,9 @@ struct ScopedUsage: Decodable, Equatable, Sendable {
             ?? values.decodeIfPresent(Double.self, forKey: .usedPercentCamel)
         resetsAt = try values.decodeIfPresent(String.self, forKey: .resetsAt)
             ?? values.decodeIfPresent(String.self, forKey: .resetsAtSnake)
+        countdown = try values.decodeIfPresent(String.self, forKey: .countdown)
+        clock = try values.decodeIfPresent(String.self, forKey: .clock)
     }
-}
-
-struct EngineStatusReport: Decodable, Sendable {
-    let schemaVersion: Int
-    let active: ActiveAccount?
-    let launchBackend: String?
-
-    enum CodingKeys: String, CodingKey {
-        case schemaVersion
-        case active
-        case launchBackend
-        case launchBackendSnake = "launch_backend"
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        active = try values.decodeIfPresent(ActiveAccount.self, forKey: .active)
-        launchBackend = try values.decodeIfPresent(String.self, forKey: .launchBackend)
-            ?? values.decodeIfPresent(String.self, forKey: .launchBackendSnake)
-    }
-}
-
-struct ActiveAccount: Decodable, Sendable {
-    let number: Int?
-    let email: String?
-    let managed: Bool
-    let usageStatus: String?
-    let usage: AccountUsage?
 }
 
 struct EngineSwitchReport: Decodable, Sendable {
@@ -348,20 +264,11 @@ struct EngineSwitchReport: Decodable, Sendable {
     let reason: String?
     let message: String?
     let warnings: [String]?
-    let launchBackend: String?
-    let routingChanged: Bool?
-    let routingWarning: String?
 }
 
 struct AccountReference: Decodable, Sendable {
     let number: Int?
     let email: String?
-}
-
-struct LegacySwitchReport: Decodable, Sendable {
-    let schemaVersion: Int
-    let selected: String
-    let launchBackend: String?
 }
 
 struct CommandResult: Sendable {
@@ -372,7 +279,6 @@ struct CommandResult: Sendable {
 
 struct AccountRow: Identifiable, Equatable, Sendable {
     let account: Account
-    let mode: BackendMode
     let isActive: Bool
     let isLoading: Bool
     let isStale: Bool
@@ -385,7 +291,6 @@ enum CLIError: LocalizedError, Equatable {
     case executableNotFound
     case invalidExecutablePath
     case invalidAccountNumber
-    case invalidProfileName
     case timedOut
     case cancelled
     case invalidThreshold
@@ -399,31 +304,29 @@ enum CLIError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .executableNotFound:
-            "Could not find the ccs command. Choose its installed executable."
+            "Could not find the ccshift command. Install ccshift or choose its executable."
         case .invalidExecutablePath:
-            "The configured ccs path must be an absolute executable file."
+            "The configured ccshift path must be an absolute executable file."
         case .invalidAccountNumber:
             "That account number is invalid."
-        case .invalidProfileName:
-            "That profile name is invalid."
         case .timedOut:
-            "The ccs command took too long to respond."
+            "The ccshift command took too long to respond."
         case .cancelled:
             "The automatic check was stopped."
         case .invalidThreshold:
             "Choose a threshold from 50% to 99.9%."
         case .failed:
-            "ccs could not complete the request."
+            "ccshift could not complete the request."
         case .invalidJSON:
-            "Could not read ccs data. Update ccs and try again."
+            "Could not read ccshift data. Update ccshift and try again."
         case let .commandRejected(message):
             message
         case let .unsupportedSchema(version):
-            "This ccs version uses unsupported JSON schema version \(version). Update ccs and try again."
+            "This ccshift version uses unsupported JSON schema version \(version). Update the menu bar app or ccshift and try again."
         case let .unexpectedSelection(expected, actual):
-            "ccs selected account \(actual.map(String.init) ?? "unknown") instead of account \(expected)."
+            "ccshift selected account \(actual.map(String.init) ?? "unknown") instead of account \(expected)."
         case let .switchRejected(message):
-            message.isEmpty ? "ccs could not switch accounts." : message
+            message.isEmpty ? "ccshift could not switch accounts." : message
         }
     }
 }
