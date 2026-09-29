@@ -4,14 +4,51 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-swaper"
-version = "0.8.2"
-description = "Select Claude Code account profiles manually and check usage"
+version = "0.9.0"
+description = "Claude Code account switcher and usage tools for macOS"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8.2.8,<9",
+    "truststore>=0.10.4",
+]
+keywords = ["claude", "claude-code", "account-switcher", "cli", "macos"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/nam-sequence/cc-swaper"
+Repository = "https://github.com/nam-sequence/cc-swaper"
+Issues = "https://github.com/nam-sequence/cc-swaper/issues"
 
 [project.scripts]
 ccs = "cc_swaper.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"claude_swap.tui" = ["*.tcss"]
+
+[tool.setuptools.data-files]
+"." = ["THIRD_PARTY_NOTICES.md"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tests_upstream"]
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "no_keychain_fake: opt out of the autouse in-memory Keychain guard",
+    "no_oauth_profile_fake: opt out of the autouse OAuth-profile fetch stub",
+]

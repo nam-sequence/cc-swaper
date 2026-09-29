@@ -5,7 +5,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install.sh"
@@ -308,6 +311,8 @@ def test_standalone_installer_rejects_bad_wheel_checksum(tmp_path: Path) -> None
 def _copy_minimal_builder_repo(tmp_path: Path, *, init_version: str = "0.8.2") -> Path:
     project_dir = tmp_path / "repo"
     (project_dir / "scripts").mkdir(parents=True)
+    menubar_scripts = project_dir / "apps" / "menubar" / "scripts"
+    menubar_scripts.mkdir(parents=True)
     (project_dir / "src" / "cc_swaper").mkdir(parents=True)
     (project_dir / "pyproject.toml").write_text(
         '[project]\nname = "cc-swaper"\nversion = "0.8.2"\n',
@@ -318,6 +323,24 @@ def _copy_minimal_builder_repo(tmp_path: Path, *, init_version: str = "0.8.2") -
     )
     shutil.copy2(INSTALLER, project_dir / "scripts" / "install.sh")
     shutil.copy2(BUILDER, project_dir / "scripts" / "build-release.sh")
+    _write_executable(
+        menubar_scripts / "build-app.sh",
+        '#!/bin/bash\nset -euo pipefail\n'
+        '[[ "${FAKE_APP_BUILD_FAIL:-}" != 1 ]] || exit 9\n'
+        'app="$CC_SWAPER_APP_OUTPUT"\n'
+        'mkdir -p "$app/Contents/MacOS"\n'
+        'cp /bin/echo "$app/Contents/MacOS/CcsMenuBar"\n'
+        'cat > "$app/Contents/Info.plist" <<PLIST\n'
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict>\n'
+        '<key>CFBundleIdentifier</key><string>com.namsequence.ccswaper.menubar</string>\n'
+        '<key>CFBundleShortVersionString</key><string>${CC_SWAPER_APP_VERSION}</string>\n'
+        '<key>CFBundleExecutable</key><string>CcsMenuBar</string>\n'
+        '<key>CFBundlePackageType</key><string>APPL</string>\n'
+        '</dict></plist>\n'
+        'PLIST\n'
+        'codesign --force --deep --sign - --timestamp=none "$app" >/dev/null\n',
+    )
     return project_dir
 
 
@@ -349,6 +372,7 @@ def _fake_builder_bin(tmp_path: Path, *, build_fails: bool = False) -> Path:
     return fake_bin
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS release only")
 def test_release_builder_stages_only_fresh_versioned_assets(tmp_path: Path) -> None:
     project_dir = _copy_minimal_builder_repo(tmp_path)
     stale_root_asset = project_dir / "dist" / "cc_swaper-0.1.0-py3-none-any.whl"
@@ -370,6 +394,7 @@ def test_release_builder_stages_only_fresh_versioned_assets(tmp_path: Path) -> N
     assert {path.name for path in output_dir.iterdir()} == {
         "cc_swaper-0.8.2-py3-none-any.whl",
         "cc_swaper-0.8.2.tar.gz",
+        "CcsMenuBar-v0.8.2-macos-local.zip",
         "install.sh",
         "SHA256SUMS",
     }
@@ -381,12 +406,22 @@ def test_release_builder_stages_only_fresh_versioned_assets(tmp_path: Path) -> N
     assert {line.split(maxsplit=1)[1].lstrip("*") for line in sums} == {
         "cc_swaper-0.8.2-py3-none-any.whl",
         "cc_swaper-0.8.2.tar.gz",
+        "CcsMenuBar-v0.8.2-macos-local.zip",
         "install.sh",
     }
     for line in sums:
         digest, asset = line.split(maxsplit=1)
         asset = asset.lstrip("*")
         assert hashlib.sha256((output_dir / asset).read_bytes()).hexdigest() == digest
+    archive = output_dir / "CcsMenuBar-v0.8.2-macos-local.zip"
+    listing = subprocess.run(
+        ["ditto", "-x", "-k", str(archive), str(tmp_path / "unzipped")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert listing.returncode == 0, listing.stderr
+    assert (tmp_path / "unzipped" / "CcsMenuBar.app" / "Contents" / "MacOS" / "CcsMenuBar").exists()
     assert "Release assets (v0.8.2)" in result.stdout
     assert "stale" not in result.stdout
 
@@ -448,3 +483,21 @@ def test_release_builder_preserves_an_existing_release_directory(tmp_path: Path)
     assert "Release output already exists" in result.stderr
     assert user_file.read_text(encoding="utf-8") == "keep this file"
     assert {path.name for path in (project_dir / "dist").iterdir()} == {"release-v0.8.2"}
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS release only")
+def test_release_builder_does_not_publish_when_app_build_fails(tmp_path: Path) -> None:
+    project_dir = _copy_minimal_builder_repo(tmp_path)
+    fake_bin = _fake_builder_bin(tmp_path)
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        "REAL_PYTHON": shutil.which("python3") or "python3",
+        "FAKE_APP_BUILD_FAIL": "1",
+    })
+
+    result = _run_bash(project_dir / "scripts" / "build-release.sh", env=env)
+
+    assert result.returncode == 1
+    assert "Menu bar app build failed" in result.stderr
+    assert list((project_dir / "dist").iterdir()) == []

@@ -1,23 +1,130 @@
 # cc-swaper (`ccs`)
 
-A small CLI for Claude Code accounts. Add profiles, choose which account new Claude processes use, and check usage. Switching is manual. Profiles keep separate sign-ins while sharing project session history and loading the default account's personal customizations in new sessions. Claude runs directly in the current terminal, without tmux, a background monitor, or automatic account switching.
+A macOS CLI and native menu bar app for Claude Code accounts. The `ccs accounts`
+engine adapts the [MIT-licensed claude-swap project](https://github.com/realiti4/claude-swap)
+for account slots, quota-aware switching, usage, an optional auto-switcher,
+parallel sessions, directory mappings, and a terminal dashboard. The Swift app
+shows usage and lets you switch from the menu bar. Existing `ccs` profile
+commands remain available separately.
 
 ## Install
 
-Requires Claude Code, Python 3.10+, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). The `claude` shell wrapper supports interactive Zsh; `ccs` works from any shell. `tmux` is no longer required.
+Requires macOS 14+, Claude Code, Python 3.12+, and
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/). Building the
+menu bar app requires Swift 6.2 and Xcode. The `claude` shell wrapper supports
+interactive Zsh; `ccs` works from any shell. `tmux` is not required.
 
-Install from the v0.8.2 release:
+Install the current v0.9.0 source from this checkout. First preserve the
+profile registry so a downgrade to v0.8.2 remains possible:
 
 ```bash
-curl -fL -o install.sh https://github.com/nam-sequence/cc-swaper/releases/download/v0.8.2/install.sh
-bash install.sh
+bash -euo pipefail -c '
+  registry="${CC_SWAPER_HOME:-$HOME/.config/cc-swaper}/profiles.json"
+  if [[ -f "$registry" && ! -e "$registry.pre-v0.9.0" ]]; then
+    cp -p "$registry" "$registry.pre-v0.9.0"
+  fi
+  bash scripts/install.sh
+'
+ccs --version
 ```
 
-The script downloads the matching wheel and `SHA256SUMS`, verifies the wheel's SHA-256, installs it with `uv tool install`, registers the existing Claude login as `main` if needed, and runs `ccs setup`. Setup installs the new Zsh wrapper and removes the old background monitor. It does not stop old tmux sessions. Use `bash install.sh --no-setup` to skip profile initialization and Zsh setup; an old macOS monitor is still removed before replacement.
+The source installer installs the CLI, registers the existing Claude login as
+`main` if needed, and runs `ccs setup`. Setup installs the Zsh wrapper and
+removes the old background monitor. It leaves old tmux sessions running. Use
+`--no-setup` to skip profile initialization and Zsh setup. The currently
+published v0.8.2 release is the previous profile-only version; its installer
+does not contain the account engine or Swift app.
 
-For a local checkout, run `bash scripts/install.sh`. With a manual `uv tool install .`, run `ccs init` if no profiles exist, then `ccs setup`.
+To build the native app locally:
 
-## Everyday use
+```bash
+swift test --package-path apps/menubar
+bash apps/menubar/scripts/build-app.sh
+mkdir -p ~/Applications
+ditto apps/menubar/dist/CcsMenuBar.app ~/Applications/CcsMenuBar.app
+open ~/Applications/CcsMenuBar.app
+```
+
+The menu bar app resolves the installed `ccs` executable and offers **Choose
+CLI…** if it is elsewhere. Its **Launch at Login** control uses macOS Login
+Items; macOS may ask you to enable the app in System Settings. The app does
+not start auto-switching until you enable that control separately.
+
+If an independently installed `claude-swap` is present, verify the new CLI
+and app first, stop its old menu-bar service if it is running, then run
+`uv tool uninstall claude-swap`. This removes the old `cswap` executable; it
+does not delete `~/.claude-swap-backup`. Do not run both automatic switchers
+against Claude's default login.
+
+## Account engine
+
+`ccs accounts` has the upstream account-management command set in a dedicated
+namespace. The new engine stores slot metadata under
+`~/.config/cc-swaper/account-engine` and credential backups in its own
+macOS Keychain service; it does not import the existing
+`~/.config/cc-swaper/profiles` entries. Add each account again when ready.
+
+```bash
+ccs accounts add                         # save the current default Claude login
+ccs accounts list                        # quota and reset-time dashboard
+ccs accounts status                      # active default Claude account
+ccs accounts switch 2                    # select an account for new `claude` launches
+ccs accounts switch --strategy best      # choose by remaining quota
+ccs accounts use                         # use the current default login, no switch
+ccs accounts run 2 --share-history -- --resume  # parallel account, shared history
+ccs accounts auto --once --dry-run       # inspect an auto-switch decision
+ccs accounts auto --threshold 80         # foreground auto-switch loop
+ccs accounts map 2 ~/work/project        # use account 2 in that directory
+ccs accounts tui                         # interactive terminal dashboard
+ccs routing                              # show which backend `claude` uses
+```
+
+`ccs accounts --help` lists add-token, alias, move/swap, disable/enable,
+unclaimed, configuration, export/import, usage import, purge, and the other
+advanced commands. `add-token` accepts a hidden prompt or stdin. Never type a
+token as a command argument: the CLI rejects it, but shell history or the
+process list may already have recorded it. Exports are plaintext credentials;
+store them privately.
+
+`ccs accounts import backup.cswap` restores account login data and keeps only
+`oauthAccount` from imported Claude configuration. To restore all settings
+from a backup you trust, use `ccs accounts import backup.cswap --trust-config`
+in an interactive terminal and type `TRUST` at the prompt. Full configuration
+may include commands in hooks, status lines, or MCP servers.
+
+Session mode keeps an account's transcripts separate by default. Add
+`--share-history` when you want `/resume` to see the same project history;
+the default-login switch path already uses Claude's normal `~/.claude`
+history. Do not resume the same transcript in two terminals simultaneously.
+
+The old `ccs switch <profile>` command selects an existing profile and routes
+new `claude` launches through its separate `CLAUDE_CONFIG_DIR`. An engine
+`switch` routes new launches through Claude's default login. The two groups
+stay separate in the menu bar and no running Claude process changes account
+mid-session. The legacy `main` profile is the same default `~/.claude` login
+that the engine changes, so it cannot hold an independent account. Auto-switch
+stays off by default and pauses while an existing profile controls new
+launches. Use `ccs accounts run` for simultaneous account sessions without
+changing the global route.
+
+If the separately installed upstream `claude-swap` is still present, keep
+only one auto-switcher enabled: both can change Claude's default login and
+their per-account token backups do not share a refresh lock. Installing this
+package never imports or deletes `~/.claude-swap-backup`.
+
+Existing profile registries are upgraded to version 2 when first changed by
+this build. Older ccs v0.8.2 cannot read that registry afterwards; reinstall
+the new build before using the old profile commands again. This upgrade does
+not remove any profile, transcript, skill, plugin, or running Claude session.
+
+To roll back the CLI before using new account-engine data, restore the saved
+`profiles.json.pre-v0.9.0` (mode 0600) and reinstall the v0.8.2 wheel from
+its [GitHub release](https://github.com/nam-sequence/cc-swaper/releases/tag/v0.8.2).
+Keep the v0.9.0 engine store intact until you have confirmed any accounts you
+added no longer need it. The previous `claude-swap` tool can be reinstalled
+separately without importing or removing its saved backup store.
+
+## Existing profile commands
 
 ```bash
 ccs list                        # * marks the selected account
@@ -57,19 +164,30 @@ From v0.8.1, ccs repairs a managed profile's missing Claude TUI onboarding marke
 
 Marketplace plugins are offered from the default account's read-only plugin seed while each profile keeps its own synced plugins and mutable plugin state; marketplace entries with credential-bearing URLs are omitted. Credential-free user MCP definitions from the default account are passed to normal sessions through a private `--mcp-config` snapshot. By default, ccs skips definitions with headers, helpers, inline credential patterns, or a nonempty `env` map; the reviewed `FIRECRAWL_API_URL` with a credential-free URL is the only allowed environment entry. Other MCP definitions must be configured separately for that account. MCP OAuth sign-ins remain per account. To authenticate a shared MCP server, open a normal Claude session under the selected profile and use `/mcp`; the native `claude mcp` command does not load the temporary shared server list. Generated snapshots live inside each private managed profile and can contain MCP connection details; `ccs` never prints their values. Main-account plugin code, command-valued settings such as `statusLine`, and shared MCP commands run as your OS user inside the selected profile's Claude process. `CLAUDE_CONFIG_DIR` separates Claude's stored account data; it does not restrict those commands from reading other files or inherited environment variables available to your OS user. Restart a running Claude process to pick up changes to the default account's settings or resources.
 
-To uninstall later, run `ccs shell uninstall`, then `uv tool uninstall cc-swaper`. This leaves the profile registry and Claude's own data intact.
+To uninstall later, quit and remove `CcsMenuBar.app`, run `ccs shell uninstall`,
+then `uv tool uninstall cc-swaper`. This leaves the profile registry, account
+engine backups, and Claude's own data intact. `ccs accounts purge` is a
+separate, destructive action for the engine's own account data. Purge removes
+the engine data root and its Keychain backups after active session/refresh
+checks. Small private coordination files remain in `~/.config/cc-swaper` to
+block late refreshes; an explicit new account add/import reopens the engine.
 
 ## Build a release
 
-Run `bash scripts/build-release.sh` to build `dist/release-v0.8.2/`:
+Run `bash scripts/build-release.sh` on macOS to build a versioned directory
+under `dist/`:
 
 | Asset | Purpose |
 | --- | --- |
-| `cc_swaper-0.8.2-py3-none-any.whl` | Installable wheel |
-| `cc_swaper-0.8.2.tar.gz` | Source distribution |
+| `cc_swaper-X.Y.Z-py3-none-any.whl` | Installable CLI wheel |
+| `cc_swaper-X.Y.Z.tar.gz` | Source distribution |
+| `CcsMenuBar-vX.Y.Z-macos-local.zip` | Ad-hoc-signed local macOS menu bar app |
 | `install.sh` | Version-pinned standalone installer |
-| `SHA256SUMS` | SHA-256 hashes for the other three assets |
+| `SHA256SUMS` | SHA-256 hashes for those four assets |
 
-Verify from the release directory with `shasum -a 256 -c SHA256SUMS` on macOS or `sha256sum -c SHA256SUMS` on Linux. Checksums establish consistency with the release manifest; they are not a separate publisher signature.
+Verify from the release directory with `shasum -a 256 -c SHA256SUMS`. The app
+is ad-hoc signed for local use; public distribution may require a Developer ID
+signature and notarization. Checksums establish consistency with the release
+manifest; they are not a separate publisher signature.
 
 Claude Code references: [configuration directories](https://code.claude.com/docs/en/env-vars), [authentication](https://code.claude.com/docs/en/authentication), [sessions](https://code.claude.com/docs/en/sessions), and [`/usage`](https://code.claude.com/docs/en/commands).

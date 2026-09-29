@@ -177,6 +177,17 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
         payload = json.loads(contents.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise ValueError(f"invalid JSON in {path.name}") from None
+    # Python's JSON parser has a version-dependent nesting ceiling. Apply a
+    # stable limit before inspecting an untrusted project configuration.
+    pending: list[tuple[Any, int]] = [(payload, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > 256:
+            raise ValueError(f"invalid JSON in {path.name}")
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
     if not isinstance(payload, dict):
         raise ValueError(f"invalid JSON object in {path.name}")
     return payload

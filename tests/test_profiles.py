@@ -766,10 +766,8 @@ def test_preexisting_profile_path_is_not_overwritten(tmp_path: Path) -> None:
     marker = conflicting / "keep.txt"
     marker.write_text("keep", encoding="utf-8")
 
-    store = ProfileStore(store_home)
-    store.add_default("personal")
-    with pytest.raises(FileExistsError):
-        store.add_managed("work")
+    with pytest.raises(ValueError, match="profile metadata is missing"):
+        ProfileStore(store_home)
     assert marker.read_text(encoding="utf-8") == "keep"
 
 
