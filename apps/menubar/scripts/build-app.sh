@@ -54,6 +54,22 @@ mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
 cp "$build_path/release/CcsMenuBar" "$staging/Contents/MacOS/CcsMenuBar"
 chmod 755 "$staging/Contents/MacOS/CcsMenuBar"
 
+# The Icon Composer icon compiles to Assets.car (Liquid Glass on macOS 26) plus
+# an AppIcon.icns fallback for macOS 14 and 15. actool ships with Xcode only;
+# without it the app is built without an icon.
+icon_plist_keys=""
+if xcrun --find actool >/dev/null 2>&1; then
+  xcrun actool "$package_dir/Resources/AppIcon.icon" \
+    --compile "$staging/Contents/Resources" \
+    --platform macosx --target-device mac --minimum-deployment-target 14.0 \
+    --app-icon AppIcon --output-partial-info-plist "$build_path/icon-info.plist" \
+    >/dev/null
+  icon_plist_keys="<key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>"
+else
+  printf 'actool not found (install Xcode); building without the app icon.\n' >&2
+fi
+
 cat > "$staging/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -61,6 +77,7 @@ cat > "$staging/Contents/Info.plist" <<PLIST
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>CcsMenuBar</string>
+  ${icon_plist_keys}
   <key>CFBundleIdentifier</key><string>com.namsequence.ccswaper.menubar</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>ccshift</string>
