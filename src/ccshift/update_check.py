@@ -160,7 +160,7 @@ def run_self_upgrade() -> int:
             "To upgrade manually, run one of:\n"
             "  uv tool upgrade ccshift\n"
             "  pipx upgrade ccshift\n"
-            f"  {sys.executable} -m pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/cc-swaper'\n"
+            f"  {sys.executable} -m pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/ccshift'\n"
             "If you installed with `pip install -e .`, use `git pull` instead."
         )
         return 1

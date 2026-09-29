@@ -307,7 +307,7 @@ class TestRunSelfUpgrade:
         err = capsys.readouterr().err
         assert "uv tool upgrade ccshift" in err
         assert "pipx upgrade ccshift" in err
-        assert "pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/cc-swaper'" in err
+        assert "pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/ccshift'" in err
 
     @patch(
         "ccshift.update_check.subprocess.run", side_effect=FileNotFoundError
@@ -348,4 +348,4 @@ class TestRunSelfUpgradeWindows:
         err = capsys.readouterr().err
         assert "uv tool upgrade ccshift" in err
         assert "pipx upgrade ccshift" in err
-        assert "pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/cc-swaper'" in err
+        assert "pip install --upgrade 'ccshift @ git+https://github.com/nam-sequence/ccshift'" in err
