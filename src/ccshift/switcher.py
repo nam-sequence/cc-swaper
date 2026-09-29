@@ -3484,7 +3484,8 @@ class ClaudeAccountSwitcher:
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
-    ) -> None:
+        set_active: bool = True,
+    ) -> dict | None:
         """Add current account to managed accounts.
 
         Args:
@@ -3496,6 +3497,14 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+            set_active: Record the account as the active one. False when the
+                  login being captured is not Claude Code's live login (a
+                  separate sign-in profile, see ``ccshift.login``).
+
+        Returns:
+            ``{"number", "email", "alias", "created"}`` for the stored account
+            (``created`` is False when an existing account's credentials were
+            refreshed in place), or None when the overwrite prompt was declined.
         """
         self._refuse_session_shell()
         self._setup_directories()
@@ -3568,7 +3577,8 @@ class ClaudeAccountSwitcher:
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
+            if set_active:
+                seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
 
@@ -3578,7 +3588,12 @@ class ClaudeAccountSwitcher:
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
             )
-            return
+            return {
+                "number": int(account_num),
+                "email": current_email,
+                "alias": seq["accounts"][account_num].get("alias") or None,
+                "created": False,
+            }
 
         # Determine slot number and collect confirmation decisions
         # (no destructive operations until new account is verified readable)
@@ -3723,7 +3738,8 @@ class ClaudeAccountSwitcher:
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
+        if set_active:
+            data["activeAccountNumber"] = int(account_num)
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
@@ -3732,6 +3748,12 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        return {
+            "number": int(account_num),
+            "email": current_email,
+            "alias": carried_alias or None,
+            "created": True,
+        }
 
     def add_account_from_token(
         self,
@@ -3941,11 +3963,16 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
-    def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
+    def remove_account(self, identifier: str, assume_yes: bool = False) -> dict | None:
         """Remove account from managed accounts.
 
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
+
+        Returns ``{"number", "email", "alias", "wasActive"}`` for the removed
+        account (``wasActive``: Claude Code is signed in to it), or None when
+        the removal was cancelled at a prompt. With ``assume_yes`` an email
+        that matches several accounts raises instead of prompting.
         """
         self._refuse_session_shell()
         if not self.sequence_file.exists():
@@ -3968,6 +3995,12 @@ class ClaudeAccountSwitcher:
                     num for num, acc in (data or {}).get("accounts", {}).items()
                     if acc.get("email") == identifier
                 ]
+                if len(matches) > 1 and assume_yes:
+                    # Nobody is there to pick one (scripts, --json, the app).
+                    raise ValidationError(
+                        f"Multiple accounts match '{identifier}'; "
+                        f"pass the account number ({', '.join(sorted(matches, key=int))})"
+                    )
                 if len(matches) > 1:
                     print(f"Multiple accounts found for '{identifier}':")
                     for num in matches:
@@ -3998,6 +4031,9 @@ class ClaudeAccountSwitcher:
 
         email = account_info.get("email")
         active_account = data.get("activeAccountNumber")
+        # Whether Claude Code is signed in to this account right now (the
+        # recorded active slot lags a manual /login).
+        was_live = self.current_account_number() == account_num
 
         # Check before the confirmation prompt (better UX); the chokepoint in
         # _delete_account_files re-checks as a safety net for all paths.
@@ -4028,6 +4064,12 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        return {
+            "number": int(account_num),
+            "email": email,
+            "alias": account_info.get("alias") or None,
+            "wasActive": was_live,
+        }
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

@@ -2,6 +2,14 @@ import AppKit
 import Combine
 import Foundation
 
+/// The Settings window's tabs; the model owns the selection so the popover
+/// can open Settings on the Accounts tab.
+enum SettingsTab: Hashable, Sendable {
+    case accounts
+    case general
+    case automaticSwitching
+}
+
 @MainActor
 final class MenuBarModel: ObservableObject {
     @Published private(set) var accounts: [Account] = []
@@ -19,24 +27,64 @@ final class MenuBarModel: ObservableObject {
     @Published private(set) var autoSwitchLastResult: String?
     @Published private(set) var launchAtLoginStatus: LaunchAtLoginStatus
     @Published private(set) var launchAtLoginError: String?
+    @Published var settingsTab: SettingsTab = .accounts
+    @Published var isAddAccountSheetPresented = false
+    /// The account whose removal is waiting for the confirmation dialog.
+    @Published var accountPendingRemoval: Account?
+    @Published private(set) var currentLogin: CurrentLoginState = .unknown
+    @Published private(set) var isChangingAccounts = false
+    /// A browser sign-in (`ccshift add --login`) is waiting for the person.
+    /// Kept apart from `isChangingAccounts`: it can take minutes, and nothing
+    /// else needs to wait for it.
+    @Published private(set) var isSigningIn = false
+    @Published private(set) var accountChangeError: String?
+    @Published private(set) var accountChangeNotice: String?
+    @Published private(set) var availableUpdate: AvailableUpdate?
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var lastUpdateCheck: Date?
+    @Published private(set) var updateCheckError: String?
+    @Published private(set) var autoCheckForUpdates: Bool
+    @Published private(set) var skippedUpdateVersion: String?
+    /// The installed command line tool's version, once read.
+    @Published private(set) var cliVersion: String?
+    let appVersion: String
 
     private let defaults: UserDefaults
     private let launchAtLoginManager: any LaunchAtLoginManaging
+    private let signInPresenter: any SignInWindowPresenting
+    private let releaseFetcher: any ReleaseFetching
+    private let updateNotifier: (any UpdateNotifying)?
+    private var updateCheckTask: Task<Void, Never>?
+    static let updateCheckInterval: TimeInterval = 24 * 60 * 60
     private let autoSwitchInterval: TimeInterval
     private var client: CSwapClient?
     private var refreshGeneration = 0
     private var autoSwitchTask: Task<Void, Never>?
     private var autoSwitchCancellation: ProcessCancellation?
     private var autoTickInFlight = false
+    private var loginCheckGeneration = 0
+    private var signInCancellation: ProcessCancellation?
+    private var signInURLWatch: Task<Void, Never>?
 
     init(
         defaults: UserDefaults = .standard,
         executableURL: URL? = CLIResolver.executable(),
         launchAtLoginManager: (any LaunchAtLoginManaging)? = nil,
+        signInPresenter: (any SignInWindowPresenting)? = nil,
+        releaseFetcher: (any ReleaseFetching)? = nil,
+        updateNotifier: (any UpdateNotifying)? = nil,
+        appVersion: String = AppVersion.current,
         autoSwitchInterval: TimeInterval = 60
     ) {
         self.defaults = defaults
+        self.releaseFetcher = releaseFetcher ?? GitHubReleaseFetcher()
+        self.updateNotifier = updateNotifier
+        self.appVersion = appVersion
+        self.autoCheckForUpdates = defaults.object(forKey: "ccsAutoCheckForUpdates") as? Bool ?? true
+        self.skippedUpdateVersion = defaults.string(forKey: "ccsSkippedUpdateVersion")
+        self.lastUpdateCheck = defaults.object(forKey: "ccsLastUpdateCheck") as? Date
         self.launchAtLoginManager = launchAtLoginManager ?? SystemLaunchAtLoginManager()
+        self.signInPresenter = signInPresenter ?? SystemSignInWindowPresenter()
         self.autoSwitchInterval = max(0.1, autoSwitchInterval)
         self.autoSwitchEnabled = defaults.object(forKey: "ccsAutoSwitchEnabled") as? Bool ?? false
         self.autoSwitchThreshold = defaults.object(forKey: "ccsAutoSwitchThreshold") as? Double ?? 90
@@ -158,7 +206,7 @@ final class MenuBarModel: ObservableObject {
     }
 
     func switchTo(_ account: Account) {
-        guard switchingAccountID == nil else { return }
+        guard switchingAccountID == nil, !isChangingAccounts else { return }
         guard let client else {
             alertMessage = CLIError.executableNotFound.localizedDescription
             return
@@ -184,6 +232,328 @@ final class MenuBarModel: ObservableObject {
             case let .failure(message):
                 self.refresh(afterSwitchWarning: message)
             }
+        }
+    }
+
+    // MARK: Adding and removing accounts
+
+    /// Opens the Add Account sheet on the Settings window's Accounts tab.
+    func beginAddingAccount() {
+        settingsTab = .accounts
+        accountChangeError = nil
+        accountChangeNotice = nil
+        isAddAccountSheetPresented = true
+    }
+
+    /// Selects the Accounts tab and asks for confirmation before removing.
+    func requestRemoval(of account: Account) {
+        settingsTab = .accounts
+        accountChangeError = nil
+        accountChangeNotice = nil
+        accountPendingRemoval = account
+    }
+
+    func checkCurrentLogin() {
+        guard let client else {
+            currentLogin = .failed(CLIError.executableNotFound.localizedDescription)
+            return
+        }
+        loginCheckGeneration += 1
+        let generation = loginCheckGeneration
+        currentLogin = .checking
+        Task { [weak self] in
+            let result = await Self.load { try client.currentLogin() }
+            guard let self, self.loginCheckGeneration == generation else { return }
+            switch result {
+            case let .success(login):
+                self.currentLogin = login.map(CurrentLoginState.signedIn) ?? .signedOut
+            case let .failure(message):
+                self.currentLogin = .failed(message)
+            }
+        }
+    }
+
+    /// Saves the current Claude Code login with ccshift. An empty alias keeps
+    /// ccshift's default name (the email, or an alias set earlier).
+    func addCurrentAccount(alias: String) {
+        guard !isChangingAccounts, !isSigningIn, switchingAccountID == nil else { return }
+        guard let client else {
+            accountChangeError = CLIError.executableNotFound.localizedDescription
+            return
+        }
+        let alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        isChangingAccounts = true
+        accountChangeError = nil
+        accountChangeNotice = nil
+        Task { [weak self] in
+            let result = await Self.load {
+                try client.addCurrentAccount(alias: alias.isEmpty ? nil : alias)
+            }
+            guard let self else { return }
+            self.isChangingAccounts = false
+            switch result {
+            case let .success(report):
+                self.isAddAccountSheetPresented = false
+                self.accountChangeNotice = Self.notice(for: report)
+                self.refresh()
+            case let .failure(message):
+                self.accountChangeError = message
+                self.refresh(keepingAlert: true)
+            }
+        }
+    }
+
+    /// Signs in with the browser and adds that account. Empty fields are left
+    /// out: no email hint, ccshift's default name.
+    func signInAndAddAccount(
+        email: String,
+        sso: Bool,
+        alias: String,
+        opener: SignInOpener = .defaultBrowser
+    ) {
+        guard !isChangingAccounts, !isSigningIn else { return }
+        guard let client else {
+            accountChangeError = CLIError.executableNotFound.localizedDescription
+            return
+        }
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        var handoffDirectory: URL?
+        var privateBrowser: String?
+        switch opener {
+        case .privateWindow:
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ccshift-signin-\(UUID().uuidString)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
+                )
+                handoffDirectory = directory
+            } catch {
+                accountChangeError = "Could not prepare the sign-in window."
+                return
+            }
+        case let .privateBrowser(bundleID):
+            privateBrowser = bundleID
+        case .defaultBrowser:
+            break
+        }
+        let handoffFile = handoffDirectory?.appendingPathComponent("url")
+        let browser = privateBrowser
+        let cancellation = ProcessCancellation()
+        signInCancellation = cancellation
+        isSigningIn = true
+        accountChangeError = nil
+        accountChangeNotice = nil
+        if let handoffFile {
+            signInURLWatch = Task { [weak self] in
+                await self?.openSignInWindow(whenWrittenTo: handoffFile, cancellation: cancellation)
+            }
+        }
+        Task { [weak self] in
+            let result = await Self.load {
+                try client.signInAndAddAccount(
+                    email: email.isEmpty ? nil : email,
+                    sso: sso,
+                    alias: alias.isEmpty ? nil : alias,
+                    handoffFile: handoffFile?.path,
+                    privateBrowser: browser,
+                    cancellation: cancellation
+                )
+            }
+            guard let self else { return }
+            if let handoffDirectory {
+                self.signInURLWatch?.cancel()
+                self.signInURLWatch = nil
+                self.signInPresenter.dismiss()
+                try? FileManager.default.removeItem(at: handoffDirectory)
+            }
+            self.isSigningIn = false
+            if self.signInCancellation === cancellation { self.signInCancellation = nil }
+            // Stopped by the person: nothing to report.
+            guard !cancellation.isCancelled else { return }
+            switch result {
+            case let .success(report):
+                self.isAddAccountSheetPresented = false
+                self.accountChangeNotice = Self.notice(for: report)
+                self.refresh()
+            case let .failure(message):
+                self.accountChangeError = message
+            }
+        }
+    }
+
+    func cancelSignIn() {
+        signInCancellation?.cancel()
+    }
+
+    /// Waits for ccshift to hand over the sign-in page's URL, then opens it in
+    /// the private sign-in window. Closing that window stops the sign-in.
+    private func openSignInWindow(whenWrittenTo file: URL, cancellation: ProcessCancellation) async {
+        while !Task.isCancelled, !cancellation.isCancelled {
+            if let text = try? String(contentsOf: file, encoding: .utf8) {
+                try? FileManager.default.removeItem(at: file)
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let url = URL(string: trimmed), SignInURLPolicy.isAllowed(url) else {
+                    accountChangeError = "ccshift handed over an unexpected sign-in address, so it was not opened."
+                    cancelSignIn()
+                    return
+                }
+                signInPresenter.present(url) { [weak self] in self?.cancelSignIn() }
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    /// Cancel or Escape: a failed attempt's error belongs to the sheet only,
+    /// and a sign-in still waiting in the browser is stopped.
+    func addAccountSheetDismissed() {
+        if isSigningIn { cancelSignIn() }
+        if !isChangingAccounts { accountChangeError = nil }
+    }
+
+    func removeAccount(_ account: Account) {
+        accountPendingRemoval = nil
+        guard !isChangingAccounts, !isSigningIn, switchingAccountID == nil else { return }
+        guard let client else {
+            accountChangeError = CLIError.executableNotFound.localizedDescription
+            return
+        }
+        guard let known = accounts.first(where: { $0.id == account.id && $0.email == account.email }) else {
+            accountChangeError = "That account is unavailable. Refresh the account list and try again."
+            return
+        }
+        let emailIsShared = accounts.filter { $0.email == known.email }.count > 1
+        isChangingAccounts = true
+        accountChangeError = nil
+        accountChangeNotice = nil
+        Task { [weak self] in
+            let result = await Self.load { try client.removeAccount(known, emailIsShared: emailIsShared) }
+            guard let self else { return }
+            self.isChangingAccounts = false
+            switch result {
+            case let .success(report):
+                self.accountChangeNotice = Self.notice(for: report)
+                self.refresh()
+            case let .failure(message):
+                self.accountChangeError = message
+                self.refresh(keepingAlert: true)
+            }
+        }
+    }
+
+    static func notice(for report: AccountChangeReport) -> String {
+        guard let account = report.account else { return "ccshift updated the accounts." }
+        let name = account.displayName
+        switch report.action {
+        case "added":
+            return "Added \(name) as account \(account.number)."
+        case "refreshed":
+            return "\(name) is already account \(account.number). ccshift saved its current login."
+        case "removed":
+            let stillSignedIn = report.wasActive == true ? " Claude Code is still signed in to it." : ""
+            return "Removed \(name) (account \(account.number)).\(stillSignedIn)"
+        default:
+            return "ccshift updated the accounts."
+        }
+    }
+
+    // MARK: Updates
+
+    /// The app's model, with automatic update checks. Tests and previews build
+    /// the model directly, so they never reach GitHub.
+    static func makeForApp() -> MenuBarModel {
+        SystemUpdateNotifier.shared.install()
+        let model = MenuBarModel(updateNotifier: SystemUpdateNotifier.shared)
+        model.startAutomaticUpdateChecks()
+        return model
+    }
+
+    /// The update to show in the menu: none once the person skipped that version.
+    var visibleUpdate: AvailableUpdate? {
+        guard let availableUpdate, availableUpdate.version != skippedUpdateVersion else { return nil }
+        return availableUpdate
+    }
+
+    /// Why the command line tool should be upgraded too, if it should.
+    var cliUpdateHint: String? {
+        guard let cliVersion else { return nil }
+        if let availableUpdate, AppVersion.isNewer(availableUpdate.version, than: cliVersion) {
+            return "Update the command line tool too: run ccshift upgrade in Terminal."
+        }
+        if AppVersion.isNewer(appVersion, than: cliVersion) {
+            return "The command line tool (\(cliVersion)) is older than this app. Run ccshift upgrade in Terminal."
+        }
+        return nil
+    }
+
+    /// Checks shortly after launch, then whenever the last check is a day old.
+    func startAutomaticUpdateChecks(initialDelay: TimeInterval = 8, pollInterval: TimeInterval = 60 * 60) {
+        guard updateCheckTask == nil else { return }
+        updateCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(initialDelay))
+            while !Task.isCancelled {
+                guard let self else { return }
+                let due = self.lastUpdateCheck.map { Date().timeIntervalSince($0) >= Self.updateCheckInterval } ?? true
+                if self.autoCheckForUpdates, due {
+                    await self.checkForUpdates(userInitiated: false)
+                }
+                try? await Task.sleep(for: .seconds(pollInterval))
+            }
+        }
+    }
+
+    func checkForUpdates(userInitiated: Bool) async {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        updateCheckError = nil
+        refreshCLIVersion()
+        do {
+            let release = try await releaseFetcher.latestRelease()
+            let update = release.update(over: appVersion)
+            availableUpdate = update
+            let now = Date()
+            lastUpdateCheck = now
+            defaults.set(now, forKey: "ccsLastUpdateCheck")
+            if let update, update.version != skippedUpdateVersion,
+               defaults.string(forKey: "ccsNotifiedUpdateVersion") != update.version {
+                defaults.set(update.version, forKey: "ccsNotifiedUpdateVersion")
+                if !userInitiated { updateNotifier?.notify(update) }
+            }
+        } catch {
+            updateCheckError = error.localizedDescription
+        }
+        isCheckingForUpdates = false
+    }
+
+    func setAutoCheckForUpdates(_ enabled: Bool) {
+        autoCheckForUpdates = enabled
+        defaults.set(enabled, forKey: "ccsAutoCheckForUpdates")
+    }
+
+    func skipAvailableUpdate() {
+        guard let availableUpdate else { return }
+        skippedUpdateVersion = availableUpdate.version
+        defaults.set(availableUpdate.version, forKey: "ccsSkippedUpdateVersion")
+    }
+
+    func downloadUpdate() {
+        guard let availableUpdate else { return }
+        NSWorkspace.shared.open(availableUpdate.downloadURL ?? availableUpdate.releaseURL)
+    }
+
+    func openReleaseNotes() {
+        guard let availableUpdate else { return }
+        NSWorkspace.shared.open(availableUpdate.releaseURL)
+    }
+
+    func refreshCLIVersion() {
+        guard let client else { return }
+        Task { [weak self] in
+            let result = await Self.load { try client.cliVersion() }
+            guard let self else { return }
+            if case let .success(version) = result { self.cliVersion = version }
         }
     }
 
@@ -224,6 +594,8 @@ final class MenuBarModel: ObservableObject {
     }
 
     func shutdown() {
+        updateCheckTask?.cancel()
+        cancelSignIn()
         stopAutoSwitchLoop()
     }
 
@@ -236,7 +608,7 @@ final class MenuBarModel: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(100))
                 }
                 guard !Task.isCancelled else { break }
-                if self.isRefreshing {
+                if self.isRefreshing || self.isChangingAccounts {
                     try? await Task.sleep(for: .milliseconds(100))
                     continue
                 }
@@ -376,6 +748,19 @@ extension MenuBarModel {
         var autoSwitchLastResult: String?
         var launchAtLoginStatus: LaunchAtLoginStatus = .notRegistered
         var launchAtLoginError: String?
+        var settingsTab: SettingsTab = .accounts
+        var isAddAccountSheetPresented = false
+        var accountPendingRemoval: Account?
+        var currentLogin: CurrentLoginState = .unknown
+        var isChangingAccounts = false
+        var isSigningIn = false
+        var availableUpdate: AvailableUpdate?
+        var lastUpdateCheck: Date?
+        var updateCheckError: String?
+        var cliVersion: String?
+        var appVersion = "1.1.0"
+        var accountChangeError: String?
+        var accountChangeNotice: String?
     }
 
     private static func previewReset(hours: Double) -> String {
@@ -460,7 +845,8 @@ extension MenuBarModel {
         let model = MenuBarModel(
             defaults: UserDefaults(suiteName: suite)!,
             executableURL: nil,
-            launchAtLoginManager: PreviewLaunchAtLoginManager(status: state.launchAtLoginStatus)
+            launchAtLoginManager: PreviewLaunchAtLoginManager(status: state.launchAtLoginStatus),
+            appVersion: state.appVersion
         )
         model.accounts = state.accounts
         model.isRefreshing = state.isRefreshing
@@ -475,6 +861,18 @@ extension MenuBarModel {
         model.autoSwitchIsRunning = state.autoSwitchIsRunning
         model.autoSwitchLastResult = state.autoSwitchLastResult
         model.launchAtLoginError = state.launchAtLoginError
+        model.settingsTab = state.settingsTab
+        model.isAddAccountSheetPresented = state.isAddAccountSheetPresented
+        model.accountPendingRemoval = state.accountPendingRemoval
+        model.currentLogin = state.currentLogin
+        model.isChangingAccounts = state.isChangingAccounts
+        model.isSigningIn = state.isSigningIn
+        model.availableUpdate = state.availableUpdate
+        model.lastUpdateCheck = state.lastUpdateCheck
+        model.updateCheckError = state.updateCheckError
+        model.cliVersion = state.cliVersion
+        model.accountChangeError = state.accountChangeError
+        model.accountChangeNotice = state.accountChangeNotice
         return model
     }
 

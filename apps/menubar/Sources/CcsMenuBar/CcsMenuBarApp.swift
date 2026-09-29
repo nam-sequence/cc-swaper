@@ -10,7 +10,7 @@ private final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate 
 @main
 struct CcsMenuBarApp: App {
     @NSApplicationDelegateAdaptor(MenuBarApplicationDelegate.self) private var delegate
-    @StateObject private var model = MenuBarModel()
+    @StateObject private var model = MenuBarModel.makeForApp()
 
     var body: some Scene {
         MenuBarExtra {

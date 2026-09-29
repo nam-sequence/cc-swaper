@@ -64,6 +64,102 @@ struct CSwapClient: Sendable {
         throw CLIError.unexpectedSelection(expected: number, actual: response.to.number)
     }
 
+    /// The installed command line tool's version (`ccshift --version`).
+    func cliVersion() throws -> String? {
+        let result = try run(arguments: ["--version"], timeout: 15)
+        guard result.terminationStatus == 0 else { return nil }
+        return AppVersion.parseCLIVersion(String(decoding: result.output, as: UTF8.self))
+    }
+
+    /// The login Claude Code is using now; nil when it is signed out.
+    func currentLogin() throws -> CurrentLogin? {
+        let status: EngineStatus = try decodeVersionOne(run(arguments: ["status", "--json"]))
+        return status.active
+    }
+
+    /// Saves the current Claude Code login as an account (or refreshes the
+    /// saved login when that account is already managed).
+    func addCurrentAccount(alias: String?) throws -> AccountChangeReport {
+        var arguments = ["add", "--json"]
+        // One token, so an alias that starts with "-" reaches ccshift's own
+        // alias check instead of failing argparse.
+        if let alias, !alias.isEmpty { arguments.append("--alias=\(alias)") }
+        return try accountChange(run(arguments: arguments))
+    }
+
+    /// Long enough to finish signing in (SSO, MFA) in the browser; ccshift's own
+    /// limit is 15 minutes.
+    static let signInTimeout: TimeInterval = 16 * 60
+
+    /// Signs in with a browser and adds that account: `ccshift add --login`
+    /// runs Claude Code's own `claude auth login` in a separate profile, so the
+    /// live Claude Code login is not changed. Waits for the person to finish
+    /// in the browser; `cancellation` stops the sign-in.
+    /// `handoffFile` makes ccshift write the sign-in page's URL there for the
+    /// app's own private sign-in window; `privateBrowser` (a bundle identifier)
+    /// opens it in that browser's private window; neither uses a normal window
+    /// of the default browser.
+    func signInAndAddAccount(
+        email: String?,
+        sso: Bool,
+        alias: String?,
+        handoffFile: String? = nil,
+        privateBrowser: String? = nil,
+        cancellation: ProcessCancellation
+    ) throws -> AccountChangeReport {
+        var arguments = ["add", "--login", "--json"]
+        if sso { arguments.append("--sso") }
+        if let handoffFile {
+            arguments.append("--handoff-file=\(handoffFile)")
+        } else if let privateBrowser, !privateBrowser.isEmpty {
+            arguments += ["--private", "--browser=\(privateBrowser)"]
+        }
+        if let email, !email.isEmpty { arguments.append("--email=\(email)") }
+        if let alias, !alias.isEmpty { arguments.append("--alias=\(alias)") }
+        return try accountChange(
+            run(arguments: arguments, cancellation: cancellation, timeout: Self.signInTimeout)
+        )
+    }
+
+    /// Removes a managed account; the confirmation is the app's own dialog.
+    ///
+    /// The account is named by its email, so a list that went stale (a
+    /// `ccshift swap` or `remove` in Terminal) cannot hit whatever sits in its
+    /// old slot now. An email several accounts share is resolved by number,
+    /// after re-reading the list to check the slot still holds this account.
+    func removeAccount(_ account: Account, emailIsShared: Bool) throws -> AccountChangeReport {
+        guard let number = account.number, number > 0 else { throw CLIError.invalidAccountNumber }
+        var identifier = account.email
+        if emailIsShared || account.email.isEmpty {
+            let current = try dashboard().accounts.first(where: { $0.number == number })
+            guard let current,
+                  current.email == account.email,
+                  current.organizationName == account.organizationName
+            else {
+                throw CLIError.accountListChanged
+            }
+            identifier = String(number)
+        }
+        return try accountChange(run(arguments: ["remove", identifier, "--yes", "--json"]))
+    }
+
+    /// ccshift before 1.1.0 rejects `--json` on add/remove (and `--yes`) as a
+    /// usage error: exit 2, nothing on stdout, and one of these messages.
+    private func accountChange(_ result: CommandResult) throws -> AccountChangeReport {
+        let stdoutIsEmpty = result.output.allSatisfy { $0 == 0x20 || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }
+        if result.terminationStatus == 2, stdoutIsEmpty,
+           result.standardError.contains("--json can only be used with")
+            || result.standardError.contains("unrecognized arguments") {
+            throw CLIError.accountCommandsUnsupported
+        }
+        if result.terminationStatus == 2, stdoutIsEmpty {
+            throw CLIError.failed(result.standardError)
+        }
+        let report: AccountChangeReport = try decodeVersionOne(result)
+        if report.action == "cancelled" { throw CLIError.commandRejected("ccshift cancelled the change.") }
+        return report
+    }
+
     func autoSwitchOnce(
         threshold: Double,
         dryRun: Bool,

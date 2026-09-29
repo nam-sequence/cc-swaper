@@ -224,6 +224,108 @@ final class SnapshotRenderTests: XCTestCase {
         try settings("settings-auto-paused", state, pane: .automaticSwitching)
     }
 
+    func testSettingsAccounts() throws {
+        try settings("settings-accounts", .init(), pane: .accounts)
+    }
+
+    func testSettingsAccountsAfterRemoval() throws {
+        var state = MenuBarModel.PreviewState()
+        state.accounts = [MenuBarModel.previewAccounts[0], MenuBarModel.previewAccounts[2]]
+        state.accountChangeNotice = "Removed work (account 2)."
+        try settings("settings-accounts-notice", state, pane: .accounts)
+    }
+
+    func testSettingsAccountsRemovalFailed() throws {
+        var state = MenuBarModel.PreviewState()
+        state.accountChangeError = "Account 2 is in use by a running ccshift session. Close it, then try again."
+        try settings("settings-accounts-error", state, pane: .accounts)
+    }
+
+    func testSettingsAccountsEmpty() throws {
+        var state = MenuBarModel.PreviewState()
+        state.accounts = []
+        try settings("settings-accounts-empty", state, pane: .accounts)
+    }
+
+    func testAddAccountSheetSignIn() throws {
+        try addSheet("add-sheet-sign-in", .init(), method: .signIn)
+    }
+
+    func testAddAccountSheetSigningIn() throws {
+        var state = MenuBarModel.PreviewState()
+        state.isSigningIn = true
+        try addSheet("add-sheet-signing-in", state, method: .signIn)
+    }
+
+    func testAddAccountSheetSignInFailed() throws {
+        var state = MenuBarModel.PreviewState()
+        state.accountChangeError = "Sign-in did not complete (claude auth login exited 1). Nothing was changed."
+        try addSheet("add-sheet-sign-in-error", state, method: .signIn)
+    }
+
+    func testAddAccountSheetChecking() throws {
+        var state = MenuBarModel.PreviewState()
+        state.currentLogin = .checking
+        try addSheet("add-sheet-checking", state)
+    }
+
+    func testAddAccountSheetNewLogin() throws {
+        var state = MenuBarModel.PreviewState()
+        state.currentLogin = .signedIn(CurrentLogin(
+            email: "new@example.com", managed: false, number: nil, alias: nil, organizationName: "Pro"
+        ))
+        try addSheet("add-sheet-new-login", state)
+    }
+
+    func testAddAccountSheetNewLoginWithError() throws {
+        var state = MenuBarModel.PreviewState()
+        state.currentLogin = .signedIn(CurrentLogin(
+            email: "new@example.com", managed: false, number: nil, alias: nil, organizationName: nil
+        ))
+        state.accountChangeError = "Alias 'work' is already used by account 2"
+        try addSheet("add-sheet-error", state)
+    }
+
+    func testAddAccountSheetAlreadySaved() throws {
+        var state = MenuBarModel.PreviewState()
+        state.currentLogin = .signedIn(CurrentLogin(
+            email: "nam@example.com", managed: true, number: 1, alias: "main", organizationName: "Max"
+        ))
+        try addSheet("add-sheet-already-saved", state)
+    }
+
+    func testAddAccountSheetSignedOut() throws {
+        var state = MenuBarModel.PreviewState()
+        state.currentLogin = .signedOut
+        try addSheet("add-sheet-signed-out", state)
+    }
+
+    func testSettingsGeneralUpdateAvailable() throws {
+        var state = MenuBarModel.PreviewState()
+        state.availableUpdate = Self.sampleUpdate
+        state.cliVersion = "1.0.0"
+        try settings("settings-general-update", state, pane: .general)
+    }
+
+    func testSettingsGeneralUpToDate() throws {
+        var state = MenuBarModel.PreviewState()
+        state.lastUpdateCheck = Date()
+        state.cliVersion = "1.1.0"
+        try settings("settings-general-up-to-date", state, pane: .general)
+    }
+
+    func testPopoverUpdateAvailable() throws {
+        var state = MenuBarModel.PreviewState()
+        state.availableUpdate = Self.sampleUpdate
+        try popover("popover-update", state)
+    }
+
+    private static let sampleUpdate = AvailableUpdate(
+        version: "1.2.0",
+        releaseURL: URL(string: "https://github.com/nam-sequence/ccshift/releases/tag/v1.2.0")!,
+        downloadURL: nil
+    )
+
     func testSettingsWholeWindowContent() throws {
         try render("settings-tabview", chrome: .settings) {
             SettingsView(model: .preview(.init()))
@@ -239,14 +341,27 @@ final class SnapshotRenderTests: XCTestCase {
         }
     }
 
+    private func addSheet(
+        _ name: String,
+        _ state: MenuBarModel.PreviewState,
+        method: AddAccountSheet.Method = .currentLogin
+    ) throws {
+        let model = MenuBarModel.preview(state)
+        try render(name, chrome: .settings) {
+            AddAccountSheet(model: model, method: method)
+        }
+    }
+
     private func settings(
         _ name: String,
         _ state: MenuBarModel.PreviewState,
-        pane: SettingsView.Tab
+        pane: SettingsTab
     ) throws {
         let model = MenuBarModel.preview(state)
         try render(name, chrome: .settings) {
             switch pane {
+            case .accounts:
+                AccountsSettingsPane(model: model)
             case .general:
                 GeneralSettingsPane(model: model)
             case .automaticSwitching:

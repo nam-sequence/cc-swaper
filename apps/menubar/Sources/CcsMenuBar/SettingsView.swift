@@ -1,29 +1,22 @@
 import SwiftUI
 
-/// The native macOS Settings window ("ccshift Settings…", ⌘,). Two tabs of
+/// The native macOS Settings window ("ccshift Settings…", ⌘,). Three tabs of
 /// grouped forms; the popover keeps only the quick automatic-switching toggle.
+/// The model owns the selected tab, so the popover can open Accounts directly.
 struct SettingsView: View {
     @ObservedObject var model: MenuBarModel
-    @State private var selection: Tab
-
-    enum Tab: Hashable {
-        case general
-        case automaticSwitching
-    }
-
-    init(model: MenuBarModel, selection: Tab = .general) {
-        self.model = model
-        _selection = State(initialValue: selection)
-    }
 
     var body: some View {
-        TabView(selection: $selection) {
+        TabView(selection: $model.settingsTab) {
+            AccountsSettingsPane(model: model)
+                .tabItem { Label("Accounts", systemImage: "person.2") }
+                .tag(SettingsTab.accounts)
             GeneralSettingsPane(model: model)
                 .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(Tab.general)
+                .tag(SettingsTab.general)
             AutomaticSwitchingSettingsPane(model: model)
                 .tabItem { Label("Automatic Switching", systemImage: "arrow.triangle.2.circlepath") }
-                .tag(Tab.automaticSwitching)
+                .tag(SettingsTab.automaticSwitching)
         }
     }
 }
@@ -81,6 +74,8 @@ struct GeneralSettingsPane: View {
                 }
             }
 
+            UpdatesSection(model: model)
+
             Section {
                 LabeledContent("ccshift") {
                     HStack(spacing: 10) {
@@ -109,6 +104,98 @@ struct GeneralSettingsPane: View {
         .formStyle(.grouped)
         .fixedSize(horizontal: false, vertical: true)
         .frame(width: SettingsMetrics.width)
+    }
+}
+
+// MARK: - Updates
+
+/// Settings › General › Updates: the running version, the command line tool's,
+/// and the latest release on GitHub.
+struct UpdatesSection: View {
+    @ObservedObject var model: MenuBarModel
+
+    var body: some View {
+        Section {
+            LabeledContent("Version", value: model.appVersion)
+            if let cliVersion = model.cliVersion {
+                LabeledContent("Command Line Tool", value: cliVersion)
+            }
+            Toggle(
+                "Check for Updates Automatically",
+                isOn: Binding(
+                    get: { model.autoCheckForUpdates },
+                    set: { model.setAutoCheckForUpdates($0) }
+                )
+            )
+            if let update = model.availableUpdate {
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        if update.version != model.skippedUpdateVersion {
+                            Button("Skip This Version", action: model.skipAvailableUpdate)
+                        }
+                        Button("Release Notes", action: model.openReleaseNotes)
+                        Button("Download…", action: model.downloadUpdate)
+                            .keyboardShortcut(.defaultAction)
+                    }
+                } label: {
+                    Label {
+                        Text("ccshift \(update.version) is available")
+                    } icon: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundStyle(.tint)
+                    }
+                }
+            } else {
+                LabeledContent {
+                    Button("Check Now") {
+                        Task { await model.checkForUpdates(userInitiated: true) }
+                    }
+                    .disabled(model.isCheckingForUpdates)
+                } label: {
+                    if model.isCheckingForUpdates {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Checking for updates…")
+                        }
+                    } else if model.updateCheckError == nil, model.lastUpdateCheck != nil {
+                        Text("ccshift is up to date")
+                    } else {
+                        Text("Updates")
+                    }
+                }
+            }
+        } header: {
+            Text("Updates")
+        } footer: {
+            updatesFooter
+        }
+        .onAppear { model.refreshCLIVersion() }
+    }
+
+    @ViewBuilder
+    private var updatesFooter: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let error = model.updateCheckError {
+                Label {
+                    Text(error)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+            } else if model.availableUpdate != nil {
+                Text("Unzip the download and replace CcsMenuBar.app in Applications with it.")
+            } else if let lastCheck = model.lastUpdateCheck {
+                Text("Last checked \(lastCheck.formatted(date: .abbreviated, time: .shortened)).")
+            }
+            if let hint = model.cliUpdateHint {
+                Label {
+                    Text(hint)
+                } icon: {
+                    Image(systemName: "terminal")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }
 
@@ -213,10 +300,18 @@ struct AutomaticSwitchingSettingsPane: View {
     }
 }
 
-#Preview("Settings · General") {
+#Preview("Settings · Accounts") {
     SettingsView(model: .preview)
 }
 
+#Preview("Settings · General") {
+    var state = MenuBarModel.PreviewState()
+    state.settingsTab = .general
+    return SettingsView(model: .preview(state))
+}
+
 #Preview("Settings · Automatic Switching") {
-    SettingsView(model: .preview, selection: .automaticSwitching)
+    var state = MenuBarModel.PreviewState()
+    state.settingsTab = .automaticSwitching
+    return SettingsView(model: .preview(state))
 }

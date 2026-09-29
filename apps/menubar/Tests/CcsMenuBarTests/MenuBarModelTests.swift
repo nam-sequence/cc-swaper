@@ -259,6 +259,221 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(model.accounts.first?.usageMessage, "Usage is unavailable for an API key account.")
     }
 
+    func testAddingTheCurrentLoginClosesTheSheetAndRefreshesTheList() async throws {
+        let folder = try makeFolder()
+        let statePath = folder.appendingPathComponent("accounts")
+        try Data("1".utf8).write(to: statePath)
+        let executable = try fakeCLI(accountsScript, replacements: ["__STATE__": statePath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        model.refresh()
+        let loaded = await waitUntil { model.accounts.count == 1 }
+        XCTAssertTrue(loaded)
+
+        model.settingsTab = .general
+        model.beginAddingAccount()
+        XCTAssertEqual(model.settingsTab, .accounts)
+        XCTAssertTrue(model.isAddAccountSheetPresented)
+        model.checkCurrentLogin()
+        let checked = await waitUntil {
+            model.currentLogin == .signedIn(CurrentLogin(
+                email: "new@example.test", managed: false, number: nil, alias: nil, organizationName: nil
+            ))
+        }
+        XCTAssertTrue(checked)
+
+        model.addCurrentAccount(alias: "  dev  ")
+        let added = await waitUntil { model.accounts.count == 2 && !model.isAddAccountSheetPresented }
+        XCTAssertTrue(added)
+        XCTAssertEqual(model.accountChangeNotice, "Added dev as account 2.")
+        XCTAssertNil(model.accountChangeError)
+        XCTAssertEqual(model.accounts.last?.alias, "dev")
+    }
+
+    func testRemovingAnAccountConfirmsThroughTheModelAndReportsFailures() async throws {
+        let folder = try makeFolder()
+        let statePath = folder.appendingPathComponent("accounts")
+        try Data("2".utf8).write(to: statePath)
+        let executable = try fakeCLI(accountsScript, replacements: ["__STATE__": statePath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        model.refresh()
+        let loaded = await waitUntil { model.accounts.count == 2 }
+        XCTAssertTrue(loaded)
+        let second = try XCTUnwrap(model.accounts.last)
+
+        model.requestRemoval(of: second)
+        XCTAssertEqual(model.accountPendingRemoval?.id, second.id)
+        model.removeAccount(second)
+        XCTAssertNil(model.accountPendingRemoval)
+        let removed = await waitUntil { model.accounts.count == 1 && !model.isChangingAccounts }
+        XCTAssertTrue(removed)
+        XCTAssertEqual(model.accountChangeNotice, "Removed dev (account 2).")
+
+        // The fake refuses to remove the last account, like a live session would.
+        let first = try XCTUnwrap(model.accounts.first)
+        model.removeAccount(first)
+        let failed = await waitUntil { model.accountChangeError != nil && !model.isChangingAccounts }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(model.accountChangeError, "Account 1 is in use by a running session.")
+        XCTAssertEqual(model.accounts.count, 1)
+    }
+
+    func testBrowserSignInAddsTheAccountWithoutTouchingTheBusyFlag() async throws {
+        let folder = try makeFolder()
+        let statePath = folder.appendingPathComponent("accounts")
+        try Data("1".utf8).write(to: statePath)
+        let executable = try fakeCLI(accountsScript, replacements: ["__STATE__": statePath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        model.refresh()
+        let loaded = await waitUntil { model.accounts.count == 1 }
+        XCTAssertTrue(loaded)
+
+        model.beginAddingAccount()
+        model.signInAndAddAccount(email: " new@example.test ", sso: true, alias: "dev")
+        XCTAssertTrue(model.isSigningIn)
+        // A browser sign-in can take minutes; switching and auto-switch go on.
+        XCTAssertFalse(model.isChangingAccounts)
+        let added = await waitUntil { model.accounts.count == 2 && !model.isSigningIn }
+        XCTAssertTrue(added)
+        XCTAssertFalse(model.isAddAccountSheetPresented)
+        XCTAssertEqual(model.accountChangeNotice, "Added dev as account 2.")
+    }
+
+    func testStoppingABrowserSignInReportsNothing() async throws {
+        let folder = try makeFolder()
+        let statePath = folder.appendingPathComponent("accounts")
+        try Data("1".utf8).write(to: statePath)
+        let executable = try fakeCLI(accountsScript, replacements: ["__STATE__": statePath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+
+        model.beginAddingAccount()
+        model.signInAndAddAccount(email: "slow@example.test", sso: false, alias: "")
+        XCTAssertTrue(model.isSigningIn)
+        try await Task.sleep(for: .milliseconds(200))
+        model.addAccountSheetDismissed()
+        let stopped = await waitUntil(timeout: 4) { !model.isSigningIn }
+        XCTAssertTrue(stopped)
+        XCTAssertNil(model.accountChangeError)
+        XCTAssertNil(model.accountChangeNotice)
+    }
+
+    func testPrivateWindowSignInOpensTheHandedOffPageAndClosesItWhenDone() async throws {
+        let presenter = FakeSignInPresenter()
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: try fakeCLI(handoffScript(url: "https://claude.com/cai/oauth/authorize?state=abc", then: "finish"), replacements: [:]),
+            launchAtLoginManager: FakeLaunchAtLoginManager(),
+            signInPresenter: presenter
+        )
+
+        model.signInAndAddAccount(email: "", sso: false, alias: "", opener: .privateWindow)
+        let presented = await waitUntil { presenter.presented.count == 1 }
+        XCTAssertTrue(presented)
+        XCTAssertEqual(presenter.presented.first?.absoluteString, "https://claude.com/cai/oauth/authorize?state=abc")
+        let finished = await waitUntil(timeout: 4) { !model.isSigningIn }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(presenter.dismissals, 1)
+        XCTAssertEqual(model.accountChangeNotice, "Added fresh@example.test as account 5.")
+    }
+
+    func testClosingThePrivateWindowStopsTheSignIn() async throws {
+        let presenter = FakeSignInPresenter()
+        presenter.closesAfterPresenting = true
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: try fakeCLI(handoffScript(url: "https://claude.com/cai/oauth/authorize", then: "wait"), replacements: [:]),
+            launchAtLoginManager: FakeLaunchAtLoginManager(),
+            signInPresenter: presenter
+        )
+
+        model.signInAndAddAccount(email: "", sso: false, alias: "", opener: .privateWindow)
+        let stopped = await waitUntil(timeout: 4) { !model.isSigningIn }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(presenter.presented.count, 1)
+        XCTAssertNil(model.accountChangeError)
+        XCTAssertNil(model.accountChangeNotice)
+    }
+
+    func testAHandedOffAddressOutsideClaudeIsNotOpened() async throws {
+        let presenter = FakeSignInPresenter()
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: try fakeCLI(handoffScript(url: "https://example.test/phish", then: "wait"), replacements: [:]),
+            launchAtLoginManager: FakeLaunchAtLoginManager(),
+            signInPresenter: presenter
+        )
+
+        model.signInAndAddAccount(email: "", sso: false, alias: "", opener: .privateWindow)
+        let stopped = await waitUntil(timeout: 4) { !model.isSigningIn }
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(presenter.presented.isEmpty)
+        XCTAssertEqual(model.accountChangeError, "ccshift handed over an unexpected sign-in address, so it was not opened.")
+    }
+
+    /// A fake `ccshift add --login --handoff-file=PATH`: writes the sign-in URL
+    /// like the $BROWSER hook does, then finishes or waits to be stopped.
+    private func handoffScript(url: String, then ending: String) -> String {
+        #"""
+        #!/bin/sh
+        for arg in "$@"; do
+          case "$arg" in --handoff-file=*) file="${arg#--handoff-file=}" ;; esac
+        done
+        [ -n "$file" ] || { echo "no handoff file" >&2; exit 2; }
+        printf '%s' '__URL__' > "$file"
+        if [ '__ENDING__' = wait ]; then exec /bin/sleep 30; fi
+        /bin/sleep 0.4
+        printf '%s\n' '{"schemaVersion":1,"action":"added","account":{"number":5,"email":"fresh@example.test"}}'
+        """#
+        .replacingOccurrences(of: "__URL__", with: url)
+        .replacingOccurrences(of: "__ENDING__", with: ending)
+    }
+
+    private var accountsScript: String {
+        #"""
+        #!/bin/sh
+        count=$(cat '__STATE__')
+        row1='{"number":1,"email":"main@example.test","alias":"main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":12},"sevenDay":{"pct":18}}}'
+        row2='{"number":2,"email":"new@example.test","alias":"dev","active":false,"usageStatus":"ok","usage":{"fiveHour":{"pct":3},"sevenDay":{"pct":4}}}'
+        case "$1" in
+          list)
+            if [ "$count" = "2" ]; then rows="$row1,$row2"; else rows="$row1"; fi
+            printf '%s\n' "{\"schemaVersion\":1,\"activeAccountNumber\":1,\"accounts\":[$rows]}" ;;
+          status)
+            printf '%s\n' '{"schemaVersion":1,"active":{"email":"new@example.test","managed":false}}' ;;
+          add)
+            case "$*" in
+              *--email=slow@example.test*) exec /bin/sleep 30 ;;
+              *"--login --json --sso --email=new@example.test --alias=dev"*) ;;
+              *--login*) printf '%s\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"unexpected arguments"}}'; exit 1 ;;
+            esac
+            printf '2' > '__STATE__'
+            printf '%s\n' '{"schemaVersion":1,"action":"added","account":{"number":2,"email":"new@example.test","alias":"dev"}}' ;;
+          remove)
+            if [ "$2" = "main@example.test" ]; then
+              printf '%s\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"Account 1 is in use by a running session."}}'
+              exit 1
+            fi
+            printf '1' > '__STATE__'
+            printf '%s\n' '{"schemaVersion":1,"action":"removed","account":{"number":2,"email":"new@example.test","alias":"dev"},"wasActive":false}' ;;
+        esac
+        """#
+    }
+
     private func isolatedDefaults() -> UserDefaults {
         let suite = "ccs-menubar-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -339,6 +554,27 @@ final class MenuBarModelTests: XCTestCase {
           exit 64
         fi
         """#
+    }
+}
+
+@MainActor
+private final class FakeSignInPresenter: SignInWindowPresenting {
+    var presented: [URL] = []
+    var dismissals = 0
+    var closesAfterPresenting = false
+
+    func present(_ url: URL, onClose: @escaping @MainActor () -> Void) {
+        presented.append(url)
+        if closesAfterPresenting {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(100))
+                onClose()
+            }
+        }
+    }
+
+    func dismiss() {
+        dismissals += 1
     }
 }
 
