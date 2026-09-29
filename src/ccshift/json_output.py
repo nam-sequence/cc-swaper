@@ -368,7 +368,8 @@ def account_change_payload(result: dict, action: str) -> dict:
 
     ``result`` is what ``add_account`` or ``remove_account`` returned;
     ``action`` is ``"added"``, ``"refreshed"`` (add on an already-managed
-    login) or ``"removed"``.
+    login), ``"removed"``, or ``"disabled"`` / ``"enabled"`` (with
+    ``changed`` and ``rotationEmpty``).
     """
     account: dict = {"number": result["number"], "email": result["email"]}
     if result.get("alias"):
@@ -380,6 +381,9 @@ def account_change_payload(result: dict, action: str) -> dict:
     }
     if action == "removed":
         payload["wasActive"] = bool(result.get("wasActive"))
+    if action in ("disabled", "enabled"):
+        payload["changed"] = bool(result.get("changed"))
+        payload["rotationEmpty"] = bool(result.get("rotationEmpty"))
     return payload
 
 

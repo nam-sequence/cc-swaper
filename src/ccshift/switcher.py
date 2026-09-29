@@ -1858,7 +1858,7 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(data, str(num))
         ]
 
-    def set_account_disabled(self, identifier: str, disabled: bool) -> None:
+    def set_account_disabled(self, identifier: str, disabled: bool) -> dict:
         """Hold an account out of rotation (``disabled=True``) or return it.
 
         Disabling only affects automatic selection — the auto-switch engine,
@@ -1867,6 +1867,10 @@ class ClaudeAccountSwitcher:
         still a valid explicit ``ccshift switch <num|email>`` target, so you can
         park an account without losing its stored login. Re-enabling restores
         it to rotation in its original sequence position.
+
+        Returns ``{"number", "email", "alias", "changed", "rotationEmpty"}``:
+        ``changed`` is False when the account already was in that state, and
+        ``rotationEmpty`` is True when no account is left in rotation.
 
         Raises:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
@@ -1884,9 +1888,17 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
         verb = "disabled" if disabled else "enabled"
+        result = {
+            "number": int(account_num),
+            "email": email,
+            "alias": record.get("alias") or None,
+            "changed": False,
+            "rotationEmpty": False,
+        }
         if bool(record.get("disabled")) == disabled:
             print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
-            return
+            result["rotationEmpty"] = not self.switchable_account_numbers()
+            return result
 
         if disabled:
             record["disabled"] = True
@@ -1906,6 +1918,7 @@ class ClaudeAccountSwitcher:
                     "away; it just won't be an automatic switch target."
                 ))
             if not self.switchable_account_numbers():
+                result["rotationEmpty"] = True
                 warning(
                     "  No accounts remain in rotation — auto-switch and bare "
                     "switch have nothing to pick. Re-enable one with "
@@ -1913,6 +1926,8 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+        result["changed"] = True
+        return result
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""

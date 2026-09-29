@@ -23,6 +23,10 @@ struct AccountsSettingsPane: View {
                             isBusy: model.isChangingAccounts || model.switchingAccountID != nil
                                 || model.isAddAccountSheetPresented,
                             switchAction: { model.switchTo(account) },
+                            usesAutomaticSwitching: Binding(
+                                get: { !account.disabled },
+                                set: { model.setAccountDisabled(account, !$0) }
+                            ),
                             removeAction: { model.requestRemoval(of: account) }
                         )
                     }
@@ -111,6 +115,8 @@ struct AccountSettingsRow: View {
     let isSwitching: Bool
     let isBusy: Bool
     let switchAction: () -> Void
+    /// Off holds the account out of automatic switching (`ccshift disable`).
+    let usesAutomaticSwitching: Binding<Bool>
     let removeAction: () -> Void
 
     private var details: String? {
@@ -173,6 +179,10 @@ struct AccountSettingsRow: View {
     private var actions: some View {
         Button("Switch to This Account", action: switchAction)
             .disabled(account.active || isBusy)
+        // Like Auto-Join for a Wi-Fi network: off keeps ccshift from switching
+        // to the account by itself; a manual switch still works.
+        Toggle("Use for Automatic Switching", isOn: usesAutomaticSwitching)
+            .disabled(isBusy)
         Divider()
         Button("Remove Account…", role: .destructive, action: removeAction)
             .disabled(isBusy)

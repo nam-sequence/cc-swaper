@@ -128,23 +128,36 @@ struct CSwapClient: Sendable {
     /// old slot now. An email several accounts share is resolved by number,
     /// after re-reading the list to check the slot still holds this account.
     func removeAccount(_ account: Account, emailIsShared: Bool) throws -> AccountChangeReport {
-        guard let number = account.number, number > 0 else { throw CLIError.invalidAccountNumber }
-        var identifier = account.email
-        if emailIsShared || account.email.isEmpty {
-            let current = try dashboard().accounts.first(where: { $0.number == number })
-            guard let current,
-                  current.email == account.email,
-                  current.organizationName == account.organizationName
-            else {
-                throw CLIError.accountListChanged
-            }
-            identifier = String(number)
-        }
+        let identifier = try accountIdentifier(account, emailIsShared: emailIsShared)
         return try accountChange(run(arguments: ["remove", identifier, "--yes", "--json"]))
     }
 
-    /// ccshift before 1.1.0 rejects `--json` on add/remove (and `--yes`) as a
-    /// usage error: exit 2, nothing on stdout, and one of these messages.
+    /// Holds an account out of automatic switching (`ccshift disable`) or puts
+    /// it back (`ccshift enable`). It stays a valid target for a manual switch.
+    func setAccountDisabled(_ account: Account, disabled: Bool, emailIsShared: Bool) throws -> AccountChangeReport {
+        let identifier = try accountIdentifier(account, emailIsShared: emailIsShared)
+        return try accountChange(run(arguments: [disabled ? "disable" : "enable", identifier, "--json"]))
+    }
+
+    /// The account's email, so a stale list cannot hit whatever sits in its old
+    /// slot now; its number when several accounts share the email, after
+    /// re-reading the list to check the slot still holds this account.
+    private func accountIdentifier(_ account: Account, emailIsShared: Bool) throws -> String {
+        guard let number = account.number, number > 0 else { throw CLIError.invalidAccountNumber }
+        guard emailIsShared || account.email.isEmpty else { return account.email }
+        let current = try dashboard().accounts.first(where: { $0.number == number })
+        guard let current,
+              current.email == account.email,
+              current.organizationName == account.organizationName
+        else {
+            throw CLIError.accountListChanged
+        }
+        return String(number)
+    }
+
+    /// An older ccshift rejects `--json` on add/remove (before 1.1.0) or on
+    /// enable/disable (before 1.2.0), and `--yes`, as a usage error: exit 2,
+    /// nothing on stdout, and one of these messages.
     private func accountChange(_ result: CommandResult) throws -> AccountChangeReport {
         let stdoutIsEmpty = result.output.allSatisfy { $0 == 0x20 || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }
         if result.terminationStatus == 2, stdoutIsEmpty,

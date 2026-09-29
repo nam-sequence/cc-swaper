@@ -366,7 +366,7 @@ The input is `ccshift list --json` output. Each row with `usageStatus: "ok"` is 
 
 ### JSON output for scripting
 
-Add `--json` to `list`, `status`, `switch`, `add` or `remove` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+Add `--json` to `list`, `status`, `switch`, `add`, `remove`, `disable` or `enable` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
 
 ```bash
 ccshift list --json                   # all accounts with usage/quota
@@ -392,7 +392,7 @@ ccshift remove 2 --yes --json         # remove without prompting, then report it
 }
 ```
 
-Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`. `add` and `remove` report `{"action": "added"|"refreshed"|"removed", "account": {"number", "email", "alias"?}}` (`refreshed` means the login was already managed and its stored credentials were updated; `remove` adds `wasActive`, true when Claude Code is signed in to the removed account). A declined prompt reports `{"action": "cancelled"}`. JSON mode cannot answer a confirmation prompt, so `remove --json` and `add --slot N --json` also need `--yes`.
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`. `add` and `remove` report `{"action": "added"|"refreshed"|"removed", "account": {"number", "email", "alias"?}}` (`refreshed` means the login was already managed and its stored credentials were updated; `remove` adds `wasActive`, true when Claude Code is signed in to the removed account). A declined prompt reports `{"action": "cancelled"}`. `disable` and `enable` report `{"action": "disabled"|"enabled", "account": …, "changed": …, "rotationEmpty": …}` (`changed` is false when the account already was in that state; `rotationEmpty` is true when no account is left for automatic switching). JSON mode cannot answer a confirmation prompt, so `remove --json` and `add --slot N --json` also need `--yes`.
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `ccshift disable` carries an additive `"disabled": true` on its row (absent otherwise).
 

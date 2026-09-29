@@ -443,6 +443,40 @@ final class MenuBarModel: ObservableObject {
         }
     }
 
+    /// Holds an account out of automatic switching, or puts it back. A
+    /// failure is also shown in the menu, where the toggle is too.
+    func setAccountDisabled(_ account: Account, _ disabled: Bool) {
+        guard !isChangingAccounts, !isSigningIn, switchingAccountID == nil else { return }
+        guard let client else {
+            accountChangeError = CLIError.executableNotFound.localizedDescription
+            return
+        }
+        guard let known = accounts.first(where: { $0.id == account.id && $0.email == account.email }) else {
+            accountChangeError = "That account is unavailable. Refresh the account list and try again."
+            return
+        }
+        let emailIsShared = accounts.filter { $0.email == known.email }.count > 1
+        isChangingAccounts = true
+        accountChangeError = nil
+        accountChangeNotice = nil
+        Task { [weak self] in
+            let result = await Self.load {
+                try client.setAccountDisabled(known, disabled: disabled, emailIsShared: emailIsShared)
+            }
+            guard let self else { return }
+            self.isChangingAccounts = false
+            switch result {
+            case let .success(report):
+                self.accountChangeNotice = Self.notice(for: report)
+                self.refresh()
+            case let .failure(message):
+                self.accountChangeError = message
+                self.alertMessage = message
+                self.refresh(keepingAlert: true)
+            }
+        }
+    }
+
     static func notice(for report: AccountChangeReport) -> String {
         guard let account = report.account else { return "ccshift updated the accounts." }
         let name = account.displayName
@@ -454,6 +488,11 @@ final class MenuBarModel: ObservableObject {
         case "removed":
             let stillSignedIn = report.wasActive == true ? " Claude Code is still signed in to it." : ""
             return "Removed \(name) (account \(account.number)).\(stillSignedIn)"
+        case "disabled":
+            let empty = report.rotationEmpty == true ? " No account is left for automatic switching." : ""
+            return "\(name) won’t be used for automatic switching.\(empty)"
+        case "enabled":
+            return "\(name) is back in automatic switching."
         default:
             return "ccshift updated the accounts."
         }

@@ -325,6 +325,56 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(model.accounts.count, 1)
     }
 
+    func testTurningAutomaticSwitchingOffAndOnForAnAccount() async throws {
+        let folder = try makeFolder()
+        let statePath = folder.appendingPathComponent("disabled")
+        try Data("no".utf8).write(to: statePath)
+        let script = #"""
+        #!/bin/sh
+        state=$(cat '__STATE__')
+        case "$1" in
+          list)
+            if [ "$state" = "yes" ]; then flag=',"disabled":true'; else flag=''; fi
+            printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","alias":"main","active":true,"usageStatus":"ok"},{"number":2,"email":"work@example.test","alias":"work","active":false,"usageStatus":"ok"'"$flag"'}]}' ;;
+          disable)
+            if [ "$2" = "main@example.test" ]; then
+              printf '%s\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"Nope."}}'; exit 1
+            fi
+            printf 'yes' > '__STATE__'
+            printf '%s\n' '{"schemaVersion":1,"action":"disabled","account":{"number":2,"email":"work@example.test","alias":"work"},"changed":true,"rotationEmpty":false}' ;;
+          enable)
+            printf 'no' > '__STATE__'
+            printf '%s\n' '{"schemaVersion":1,"action":"enabled","account":{"number":2,"email":"work@example.test","alias":"work"},"changed":true,"rotationEmpty":false}' ;;
+        esac
+        """#
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: try fakeCLI(script, replacements: ["__STATE__": statePath.path]),
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        model.refresh()
+        let loaded = await waitUntil { model.accounts.count == 2 }
+        XCTAssertTrue(loaded)
+        let work = try XCTUnwrap(model.accounts.last)
+        XCTAssertFalse(work.disabled)
+
+        model.setAccountDisabled(work, true)
+        let disabled = await waitUntil { model.accounts.last?.disabled == true && !model.isChangingAccounts }
+        XCTAssertTrue(disabled)
+        XCTAssertEqual(model.accountChangeNotice, "work won’t be used for automatic switching.")
+
+        model.setAccountDisabled(try XCTUnwrap(model.accounts.last), false)
+        let enabled = await waitUntil { model.accounts.last?.disabled == false && !model.isChangingAccounts }
+        XCTAssertTrue(enabled)
+        XCTAssertEqual(model.accountChangeNotice, "work is back in automatic switching.")
+
+        // A failure shows in Settings and in the menu, where the toggle also is.
+        model.setAccountDisabled(try XCTUnwrap(model.accounts.first), true)
+        let failed = await waitUntil { model.accountChangeError == "Nope." && !model.isChangingAccounts }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(model.alertMessage, "Nope.")
+    }
+
     func testBrowserSignInAddsTheAccountWithoutTouchingTheBusyFlag() async throws {
         let folder = try makeFolder()
         let statePath = folder.appendingPathComponent("accounts")
