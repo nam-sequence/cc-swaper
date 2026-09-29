@@ -48,7 +48,7 @@ final class MenuBarModelTests: XCTestCase {
         let lockPath = folder.appendingPathComponent("tick-lock")
         let overlapPath = folder.appendingPathComponent("overlap")
         let argsPath = folder.appendingPathComponent("args")
-        let script = autoSwitchScript(routing: "accounts")
+        let script = autoSwitchScript()
         let executable = try fakeCLI(script, replacements: [
             "__TICK_COUNT__": countPath.path,
             "__TICK_LOCK__": lockPath.path,
@@ -65,7 +65,7 @@ final class MenuBarModelTests: XCTestCase {
 
         XCTAssertFalse(model.autoSwitchEnabled)
         model.refresh()
-        let didLoadAccounts = await waitUntil { model.launchBackend == "accounts" && !model.accounts.isEmpty }
+        let didLoadAccounts = await waitUntil { !model.accounts.isEmpty }
         XCTAssertTrue(didLoadAccounts)
         XCTAssertFalse(FileManager.default.fileExists(atPath: countPath.path))
 
@@ -89,17 +89,14 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertTrue(didStop)
     }
 
-    func testAutoSwitchStaysPausedWhenLegacyBackendIsSelected() async throws {
+    func testPersistedAutoSwitchRefreshesAtStartupWithoutOpeningMenuAndTicks() async throws {
         let folder = try makeFolder()
         let countPath = folder.appendingPathComponent("ticks")
-        let lockPath = folder.appendingPathComponent("tick-lock")
-        let overlapPath = folder.appendingPathComponent("overlap")
-        let argsPath = folder.appendingPathComponent("args")
-        let executable = try fakeCLI(autoSwitchScript(routing: "legacy"), replacements: [
+        let executable = try fakeCLI(autoSwitchScript(), replacements: [
             "__TICK_COUNT__": countPath.path,
-            "__TICK_LOCK__": lockPath.path,
-            "__OVERLAP__": overlapPath.path,
-            "__AUTO_ARGS__": argsPath.path,
+            "__TICK_LOCK__": folder.appendingPathComponent("tick-lock").path,
+            "__OVERLAP__": folder.appendingPathComponent("overlap").path,
+            "__AUTO_ARGS__": folder.appendingPathComponent("args").path,
         ])
         let defaults = isolatedDefaults()
         defaults.set(true, forKey: "ccsAutoSwitchEnabled")
@@ -109,27 +106,22 @@ final class MenuBarModelTests: XCTestCase {
             launchAtLoginManager: FakeLaunchAtLoginManager(),
             autoSwitchInterval: 0.05
         )
-        XCTAssertTrue(model.autoSwitchEnabled)
-        let didLoadLegacyRouting = await waitUntil { model.launchBackend == "legacy" && !model.accounts.isEmpty }
-        XCTAssertTrue(didLoadLegacyRouting)
-        try await Task.sleep(for: .milliseconds(250))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: countPath.path))
-        XCTAssertTrue(model.autoSwitchAvailabilityMessage?.contains("Engine Accounts") == true)
+        let loaded = await waitUntil { !model.accounts.isEmpty }
+        XCTAssertTrue(loaded)
+        let ticked = await waitUntil(timeout: 3) { FileManager.default.fileExists(atPath: countPath.path) }
+        XCTAssertTrue(ticked)
         model.setAutoSwitchEnabled(false)
     }
 
-    func testPersistedAutoSwitchRefreshesRoutingAtStartupWithoutOpeningMenu() async throws {
-        let folder = try makeFolder()
-        let countPath = folder.appendingPathComponent("ticks")
-        let lockPath = folder.appendingPathComponent("tick-lock")
-        let overlapPath = folder.appendingPathComponent("overlap")
-        let argsPath = folder.appendingPathComponent("args")
-        let executable = try fakeCLI(autoSwitchScript(routing: "legacy"), replacements: [
-            "__TICK_COUNT__": countPath.path,
-            "__TICK_LOCK__": lockPath.path,
-            "__OVERLAP__": overlapPath.path,
-            "__AUTO_ARGS__": argsPath.path,
-        ])
+    func testAutoSwitchIsPausedUntilAnAccountExists() async throws {
+        let executable = try fakeCLI(#"""
+        #!/bin/sh
+        if [ "$1" = "list" ]; then
+          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}'
+        else
+          exit 64
+        fi
+        """#, replacements: [:])
         let defaults = isolatedDefaults()
         defaults.set(true, forKey: "ccsAutoSwitchEnabled")
         let model = MenuBarModel(
@@ -138,18 +130,18 @@ final class MenuBarModelTests: XCTestCase {
             launchAtLoginManager: FakeLaunchAtLoginManager(),
             autoSwitchInterval: 0.05
         )
-
-        let loadedWithoutOpeningMenu = await waitUntil { model.launchBackend == "legacy" && !model.accounts.isEmpty }
-        XCTAssertTrue(loadedWithoutOpeningMenu)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: countPath.path))
+        let refreshed = await waitUntil { model.lastUpdated != nil }
+        XCTAssertTrue(refreshed)
+        XCTAssertTrue(model.accounts.isEmpty)
+        XCTAssertNotNil(model.autoSwitchAvailabilityMessage)
         model.setAutoSwitchEnabled(false)
     }
 
-    func testRoutingRaceRefreshesSelectionAndMenuTitleFollowsCurrentBackend() async throws {
+    func testSwitchRefreshesActiveAccountAndMenuTitleAndSurfacesCLIWarnings() async throws {
         let folder = try makeFolder()
-        let backendPath = folder.appendingPathComponent("backend")
-        try Data("accounts".utf8).write(to: backendPath)
-        let executable = try fakeCLI(routingRaceScript, replacements: ["__BACKEND_FILE__": backendPath.path])
+        let activePath = folder.appendingPathComponent("active")
+        try Data("7".utf8).write(to: activePath)
+        let executable = try fakeCLI(switchScript, replacements: ["__ACTIVE_FILE__": activePath.path])
         let model = MenuBarModel(
             defaults: isolatedDefaults(),
             executableURL: executable,
@@ -157,34 +149,107 @@ final class MenuBarModelTests: XCTestCase {
         )
 
         model.refresh()
-        let engineLoaded = await waitUntil { model.launchBackend == "accounts" && model.accounts.count == 3 }
-        XCTAssertTrue(engineLoaded)
-        XCTAssertEqual(model.selectedAccount?.mode, .engine)
+        let loaded = await waitUntil { model.accounts.count == 2 }
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(model.selectedAccount?.number, 7)
         XCTAssertEqual(model.menuTitle, "engine-main")
 
         let target = try XCTUnwrap(model.accounts.first(where: { $0.number == 8 }))
         model.switchTo(target)
-        let legacyWonRace = await waitUntil {
-            model.launchBackend == "legacy"
-                && model.alertMessage == "A newer Existing Profiles selection remained active."
+        let switched = await waitUntil {
+            model.selectedAccount?.number == 8
+                && model.alertMessage == "Claude Code sessions are running; restart them to use the new account."
         }
-        XCTAssertTrue(legacyWonRace)
-        XCTAssertEqual(model.selectedAccount?.mode, .legacy)
-        XCTAssertEqual(model.menuTitle, "old-main")
+        XCTAssertTrue(switched)
+        XCTAssertEqual(model.menuTitle, "engine-target")
+    }
 
-        try Data("accounts".utf8).write(to: backendPath)
-        model.refresh()
-        let engineRouteRestored = await waitUntil { model.launchBackend == "accounts" }
-        XCTAssertTrue(engineRouteRestored)
-        XCTAssertEqual(model.selectedAccount?.mode, .engine)
-        XCTAssertEqual(model.menuTitle, "engine-main")
+    func testAutoSwitchRetriesAFailedRosterReadAndTicksWhenAccountsAppear() async throws {
+        let folder = try makeFolder()
+        let stage = folder.appendingPathComponent("stage")
+        try Data("fail".utf8).write(to: stage)
+        let executable = try fakeCLI(#"""
+        #!/bin/sh
+        stage=$(/bin/cat '__STAGE__')
+        if [ "$1" = "list" ]; then
+          if [ "$stage" = "fail" ]; then
+            printf '%s\n' 'Keychain is locked' >&2
+            exit 1
+          fi
+          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"one@example.test","organizationName":"","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":4},"sevenDay":{"pct":5}}}]}'
+        elif [ "$1" = "auto" ]; then
+          printf '%s\n' '{"schemaVersion":1,"event":"no-switch","ts":"2026-09-29T00:00:00Z","reason":"below-threshold","detail":"4% < 90%"}'
+          exit 2
+        else
+          exit 64
+        fi
+        """#, replacements: ["__STAGE__": stage.path])
+        let defaults = isolatedDefaults()
+        defaults.set(true, forKey: "ccsAutoSwitchEnabled")
+        let model = MenuBarModel(
+            defaults: defaults,
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager(),
+            autoSwitchInterval: 0.1
+        )
+        let failed = await waitUntil { model.rosterReadFailed && !model.isRefreshing }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(model.autoSwitchAvailabilityMessage, "Paused: could not read accounts from ccshift. Retrying every minute.")
+        XCTAssertNotNil(model.alertMessage)
 
-        try Data("unknown".utf8).write(to: backendPath)
+        try Data("ok".utf8).write(to: stage)
+        let ticked = await waitUntil { model.autoSwitchLastResult?.hasPrefix("below-threshold") == true }
+        XCTAssertTrue(ticked)
+        XCTAssertEqual(model.accounts.count, 1)
+        XCTAssertFalse(model.rosterReadFailed)
+        XCTAssertNil(model.autoSwitchAvailabilityMessage)
+        model.setAutoSwitchEnabled(false)
+    }
+
+    func testDisabledAccountCanStillBeSwitchedToExplicitly() async throws {
+        let folder = try makeFolder()
+        let activePath = folder.appendingPathComponent("active")
+        try Data("7".utf8).write(to: activePath)
+        let executable = try fakeCLI(switchScript, replacements: [
+            "__ACTIVE_FILE__": activePath.path,
+            #""alias":"engine-target","#: #""alias":"engine-target","disabled":true,"#,
+        ])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+
         model.refresh()
-        let unknownRouteLoaded = await waitUntil { model.launchBackend == "unknown" }
-        XCTAssertTrue(unknownRouteLoaded)
+        let loaded = await waitUntil { model.accounts.count == 2 }
+        XCTAssertTrue(loaded)
+        let target = try XCTUnwrap(model.accounts.first(where: { $0.number == 8 }))
+        XCTAssertTrue(target.disabled)
+        model.switchTo(target)
+        let switched = await waitUntil { model.selectedAccount?.number == 8 }
+        XCTAssertTrue(switched)
+    }
+
+    func testMenuTitleFallsBackToCommandNameWhenNoAccountIsActive() async throws {
+        let executable = try fakeCLI(#"""
+        #!/bin/sh
+        if [ "$1" = "list" ]; then
+          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[{"number":1,"email":"a@example.test","organizationName":"","active":false,"usageStatus":"api_key","usage":null}]}'
+        else
+          exit 64
+        fi
+        """#, replacements: [:])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        model.refresh()
+        let loaded = await waitUntil { model.accounts.count == 1 }
+        XCTAssertTrue(loaded)
         XCTAssertNil(model.selectedAccount)
-        XCTAssertEqual(model.menuTitle, "ccs")
+        XCTAssertEqual(model.menuTitle, "ccshift")
+        XCTAssertEqual(model.accounts.first?.usageMessage, "Usage is unavailable for an API key account.")
     }
 
     private func isolatedDefaults() -> UserDefaults {
@@ -230,18 +295,12 @@ final class MenuBarModelTests: XCTestCase {
         return condition()
     }
 
-    private func autoSwitchScript(routing: String) -> String {
+    private func autoSwitchScript() -> String {
         #"""
         #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          printf '%s\n' '{"schemaVersion":1,"launchBackend":"__ROUTING__","selectedLegacyProfile":"main"}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
+        if [ "$1" = "list" ]; then
           printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","organizationName":"Max","alias":"main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":12},"sevenDay":{"pct":18}}}]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          printf '%s\n' '{"schemaVersion":1,"active":{"number":1,"email":"main@example.test","managed":true}}'
-        elif [ "$1" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"selected":"main","profiles":[]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "auto" ]; then
+        elif [ "$1" = "auto" ]; then
           count=0
           if [ -f '__TICK_COUNT__' ]; then count=$(/bin/cat '__TICK_COUNT__'); fi
           count=$((count + 1))
@@ -255,26 +314,20 @@ final class MenuBarModelTests: XCTestCase {
         else
           exit 64
         fi
-        """#.replacingOccurrences(of: "__ROUTING__", with: routing)
+        """#
     }
 
-    private var routingRaceScript: String {
+    private var switchScript: String {
         #"""
         #!/bin/sh
-        if [ "$1" = "routing" ]; then
-          backend=$(/bin/cat '__BACKEND_FILE__')
-          printf '{"schemaVersion":1,"launchBackend":"%s","selectedLegacyProfile":"old-main"}\n' "$backend"
-        elif [ "$1" = "accounts" ] && [ "$2" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":7,"accounts":[{"number":7,"email":"engine@example.test","organizationName":"Team","alias":"engine-main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":4},"sevenDay":{"pct":5}}},{"number":8,"email":"target@example.test","organizationName":"Team","alias":"engine-target","active":false,"usageStatus":"ok","usage":{"fiveHour":{"pct":6},"sevenDay":{"pct":7}}}]}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "status" ]; then
-          printf '%s\n' '{"schemaVersion":1,"active":{"number":7,"email":"engine@example.test","managed":true}}'
-        elif [ "$1" = "accounts" ] && [ "$2" = "switch" ] && [ "$3" = "8" ]; then
-          printf legacy > '__BACKEND_FILE__'
-          printf '%s\n' '{"schemaVersion":1,"switched":true,"from":{"number":7},"to":{"number":8},"launchBackend":"legacy","routingChanged":false,"routingWarning":"A newer Existing Profiles selection remained active."}'
-        elif [ "$1" = "list" ]; then
-          printf '%s\n' '{"schemaVersion":1,"selected":"old-main","profiles":[{"name":"old-main","kind":"managed","selected":true,"signedIn":true,"authMethod":"Claude subscription","email":"old@example.test"}]}'
-        elif [ "$1" = "usage" ]; then
-          printf '%s\n' '{"accounts":[{"profile":"old-main","five_hour":{"used_percent":8},"seven_day":{"used_percent":9}}]}'
+        active=$(/bin/cat '__ACTIVE_FILE__')
+        if [ "$1" = "list" ]; then
+          a7=false; a8=false
+          if [ "$active" = "7" ]; then a7=true; else a8=true; fi
+          printf '{"schemaVersion":1,"activeAccountNumber":%s,"accounts":[{"number":7,"email":"engine@example.test","organizationName":"","alias":"engine-main","active":%s,"usageStatus":"ok","usage":{"fiveHour":{"pct":4},"sevenDay":{"pct":5}}},{"number":8,"email":"target@example.test","organizationName":"","alias":"engine-target","active":%s,"usageStatus":"ok","usage":{"fiveHour":{"pct":6},"sevenDay":{"pct":7}}}]}\n' "$active" "$a7" "$a8"
+        elif [ "$1" = "switch" ] && [ "$2" = "8" ]; then
+          printf 8 > '__ACTIVE_FILE__'
+          printf '%s\n' '{"schemaVersion":1,"switched":true,"from":{"number":7,"email":"engine@example.test"},"to":{"number":8,"email":"target@example.test"},"strategy":"direct","reason":"switched","message":"Switched to Account-8","warnings":["Claude Code sessions are running; restart them to use the new account."]}'
         else
           exit 64
         fi

@@ -5,8 +5,9 @@ import Foundation
 @MainActor
 final class MenuBarModel: ObservableObject {
     @Published private(set) var accounts: [Account] = []
-    @Published private(set) var launchBackend: String?
     @Published private(set) var isRefreshing = false
+    /// The last completed account-list read failed (drives the paused reason).
+    @Published private(set) var rosterReadFailed = false
     @Published private(set) var switchingAccountID: String?
     @Published private(set) var lastUpdated: Date?
     @Published var alertMessage: String?
@@ -48,40 +49,21 @@ final class MenuBarModel: ObservableObject {
         }
     }
 
-    var engineAccount: Account? { accounts.first(where: { $0.mode == .engine && $0.active }) }
-    var legacyProfile: Account? { accounts.first(where: { $0.mode == .legacy && $0.active }) }
-    var selectedAccount: Account? {
-        switch launchBackend {
-        case "accounts": engineAccount
-        case "legacy": legacyProfile
-        default: nil
-        }
-    }
+    var selectedAccount: Account? { accounts.first(where: \.active) }
 
     var menuTitle: String {
-        guard let selectedAccount else { return "ccs" }
+        guard let selectedAccount else { return "ccshift" }
         return selectedAccount.displayName
     }
 
     var activeSummary: String {
-        let engine = engineAccount.map { "Engine: \($0.displayName)" } ?? "Engine: none"
-        let legacy = legacyProfile.map { "Existing profiles: \($0.displayName)" } ?? "Existing profiles: none"
-        return "\(engine)  ·  \(legacy)"
-    }
-
-    var launchBackendTitle: String {
-        switch launchBackend {
-        case "accounts": "Engine Accounts"
-        case "legacy": "Existing Profiles"
-        default: "checking status"
-        }
+        selectedAccount.map { "Active: \($0.displayName)" } ?? "No active account"
     }
 
     var rows: [AccountRow] {
         accounts.map { account in
             AccountRow(
                 account: account,
-                mode: account.mode,
                 isActive: account.active,
                 isLoading: isRefreshing && account.visibleUsage == nil,
                 isStale: account.isStale,
@@ -98,18 +80,17 @@ final class MenuBarModel: ObservableObject {
         if let launchAtLoginError { return launchAtLoginError }
         return switch launchAtLoginStatus {
         case .notRegistered, .enabled: nil
-        case .requiresApproval: "Allow CC Swaper in System Settings → General → Login Items."
+        case .requiresApproval: "Allow ccshift in System Settings → General → Login Items."
         case .notFound: "Launch at login is unavailable for this app bundle."
         }
     }
 
     var autoSwitchAvailabilityMessage: String? {
         guard autoSwitchEnabled else { return nil }
-        guard !accounts.filter({ $0.mode == .engine }).isEmpty else {
-            return "Paused: add an account to Engine Accounts first."
-        }
-        guard launchBackend == "accounts" else {
-            return "Paused: set Claude launches to Engine Accounts to enable auto-switching."
+        guard !accounts.isEmpty else {
+            return rosterReadFailed
+                ? "Paused: could not read accounts from ccshift. Retrying every minute."
+                : "Paused: add an account with ccshift first."
         }
         return nil
     }
@@ -127,8 +108,8 @@ final class MenuBarModel: ObservableObject {
 
     func chooseExecutable() {
         let panel = NSOpenPanel()
-        panel.title = "Choose ccs executable"
-        panel.message = "Select the installed ccs command."
+        panel.title = "Choose ccshift executable"
+        panel.message = "Select the installed ccshift command."
         panel.prompt = "Choose"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -140,36 +121,37 @@ final class MenuBarModel: ObservableObject {
             alertMessage = CLIError.invalidExecutablePath.localizedDescription
             return
         }
-        defaults.set(newClient.executableURL.path, forKey: "ccsExecutablePath")
+        defaults.set(newClient.executableURL.path, forKey: "ccshiftExecutablePath")
         configure(executableURL: newClient.executableURL)
         refresh()
     }
 
-    func refresh(afterSwitchWarning: String? = nil) {
+    /// `keepingAlert` is for background retries: the current error stays on
+    /// screen until the retry finishes instead of flickering away.
+    func refresh(afterSwitchWarning: String? = nil, keepingAlert: Bool = false) {
         launchAtLoginStatus = launchAtLoginManager.status()
         if launchAtLoginStatus == .enabled { launchAtLoginError = nil }
         guard let client else {
             alertMessage = CLIError.executableNotFound.localizedDescription
+            rosterReadFailed = true
             return
         }
         refreshGeneration += 1
         let generation = refreshGeneration
         isRefreshing = true
-        alertMessage = nil
+        if !keepingAlert { alertMessage = nil }
 
         Task { [weak self] in
             let result = await Self.load { try client.dashboard() }
             guard let self, self.refreshGeneration == generation else { return }
             switch result {
             case let .success(snapshot):
-                self.launchBackend = snapshot.launchBackend
                 self.accounts = snapshot.accounts
                 self.lastUpdated = Date()
+                self.rosterReadFailed = false
                 self.alertMessage = afterSwitchWarning ?? snapshot.warning
-                if self.autoSwitchEnabled, self.launchBackend != "accounts" {
-                    self.autoSwitchCancellation?.cancel()
-                }
             case let .failure(message):
+                self.rosterReadFailed = true
                 self.alertMessage = afterSwitchWarning ?? message
             }
             self.isRefreshing = false
@@ -182,7 +164,7 @@ final class MenuBarModel: ObservableObject {
             alertMessage = CLIError.executableNotFound.localizedDescription
             return
         }
-        guard let known = accounts.first(where: { $0.id == account.id }), !known.disabled else {
+        guard let known = accounts.first(where: { $0.id == account.id }) else {
             alertMessage = "That account is unavailable. Refresh the account list and try again."
             return
         }
@@ -191,26 +173,15 @@ final class MenuBarModel: ObservableObject {
         alertMessage = nil
         Task { [weak self] in
             let result = await Self.load { () throws -> ManualSwitchOutcome in
-                switch known.mode {
-                case .engine:
-                    guard let number = known.number else { throw CLIError.invalidAccountNumber }
-                    let report = try client.switchEngineAccount(to: number)
-                    let routingWarning = report.routingWarning
-                        ?? (report.routingChanged == false && report.launchBackend == "legacy"
-                            ? "The engine account changed, but Claude launches still use Existing Profiles."
-                            : nil)
-                    return ManualSwitchOutcome(routingWarning: routingWarning)
-                case .legacy:
-                    guard let name = known.profileName else { throw CLIError.invalidProfileName }
-                    _ = try client.switchLegacyProfile(to: name)
-                    return ManualSwitchOutcome(routingWarning: nil)
-                }
+                guard let number = known.number else { throw CLIError.invalidAccountNumber }
+                let report = try client.switchEngineAccount(to: number)
+                return ManualSwitchOutcome(warning: report.warnings?.first(where: { !$0.isEmpty }))
             }
             guard let self else { return }
             self.switchingAccountID = nil
             switch result {
             case let .success(outcome):
-                self.refresh(afterSwitchWarning: outcome.routingWarning)
+                self.refresh(afterSwitchWarning: outcome.warning)
             case let .failure(message):
                 self.refresh(afterSwitchWarning: message)
             }
@@ -270,12 +241,22 @@ final class MenuBarModel: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(100))
                     continue
                 }
-                if self.accounts.contains(where: { $0.mode == .engine }),
-                   self.launchBackend == "accounts" {
+                if !self.accounts.isEmpty {
                     await self.runAutoSwitchTick()
-                } else if self.autoSwitchLastResult == nil {
-                    self.autoSwitchLastResult = self.autoSwitchAvailabilityMessage
-                        ?? "Waiting for account status."
+                } else {
+                    // The live paused label already explains why; drop any
+                    // older result. Retry the roster so a failed startup read
+                    // or an account added from the terminal does not pause
+                    // auto-switching until the menu is opened, and check at
+                    // once when accounts appear.
+                    self.autoSwitchLastResult = nil
+                    self.refresh(keepingAlert: true)
+                    while self.isRefreshing && !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    if !Task.isCancelled, !self.accounts.isEmpty {
+                        await self.runAutoSwitchTick()
+                    }
                 }
                 do {
                     try await Task.sleep(for: .seconds(self.autoSwitchInterval))
@@ -297,7 +278,6 @@ final class MenuBarModel: ObservableObject {
     private func runAutoSwitchTick() async {
         guard !autoTickInFlight,
               autoSwitchEnabled,
-              launchBackend == "accounts",
               let client
         else { return }
         autoTickInFlight = true
@@ -345,47 +325,33 @@ private enum LoadResult<Value: Sendable>: Sendable {
 }
 
 extension MenuBarModel {
+    private static func previewReset(hours: Double) -> String {
+        ISO8601DateFormatter().string(from: Date().addingTimeInterval(hours * 3_600))
+    }
+
     static var preview: MenuBarModel {
-        let defaults = UserDefaults(suiteName: "com.namsequence.ccswaper.menubar.preview")!
+        let defaults = UserDefaults(suiteName: "com.namsequence.cccshifter.menubar.preview")!
         defaults.set(false, forKey: "ccsAutoSwitchEnabled")
         let model = MenuBarModel(defaults: defaults, executableURL: nil)
         model.accounts = [
             Account(
-                id: "engine:1", mode: .engine,
-                number: 1, profileName: nil, email: "nam@example.com", organizationName: "Max",
-                alias: "main", active: true, disabled: false, signedIn: nil, usageStatus: "ok",
-                usage: AccountUsage(fiveHour: UsageWindow(pct: 17, resetsAt: "in 2h 10m"), sevenDay: UsageWindow(pct: 32, resetsAt: "Fri 2:00 AM"), scoped: []),
-                usageAgeSeconds: 18, lastGoodUsage: nil, lastGoodAgeSeconds: nil, plan: nil
+                id: "account:1",
+                number: 1, email: "nam@example.com", organizationName: "Max",
+                alias: "main", active: true, disabled: false, usageStatus: "ok",
+                usage: AccountUsage(fiveHour: UsageWindow(pct: 17, resetsAt: previewReset(hours: 2.2)), sevenDay: UsageWindow(pct: 32, resetsAt: previewReset(hours: 75)), scoped: []),
+                usageAgeSeconds: 18, lastGoodUsage: nil, lastGoodAgeSeconds: nil
             ),
             Account(
-                id: "engine:2", mode: .engine,
-                number: 2, profileName: nil, email: "team@example.com", organizationName: "Team",
-                alias: "work", active: false, disabled: false, signedIn: nil, usageStatus: "stale",
+                id: "account:2",
+                number: 2, email: "team@example.com", organizationName: "Team",
+                alias: "work", active: false, disabled: false, usageStatus: "unavailable",
                 usage: nil,
                 usageAgeSeconds: 9_300,
-                lastGoodUsage: AccountUsage(fiveHour: UsageWindow(pct: 74, resetsAt: "in 48m"), sevenDay: UsageWindow(pct: 61, resetsAt: "Mon 12:00 AM"), scoped: []),
-                lastGoodAgeSeconds: 9_300, plan: nil
-            ),
-            Account(
-                id: "legacy:main", mode: .legacy,
-                number: nil, profileName: "main", email: "old-main@example.com", organizationName: "Max",
-                alias: "main", active: true, disabled: false, signedIn: true, usageStatus: "ok",
-                usage: AccountUsage(fiveHour: UsageWindow(pct: 22, resetsAt: "in 1h"), sevenDay: UsageWindow(pct: 28, resetsAt: "Friday"), scoped: []),
-                usageAgeSeconds: nil, lastGoodUsage: nil, lastGoodAgeSeconds: nil, plan: "Max"
+                lastGoodUsage: AccountUsage(fiveHour: UsageWindow(pct: 74, resetsAt: previewReset(hours: 0.8)), sevenDay: UsageWindow(pct: 61, resetsAt: previewReset(hours: 130)), scoped: []),
+                lastGoodAgeSeconds: 9_300
             ),
         ]
-        model.launchBackend = "accounts"
         model.lastUpdated = Date()
-        return model
-    }
-
-    static var legacyPreview: MenuBarModel {
-        let defaults = UserDefaults(suiteName: "com.namsequence.ccswaper.menubar.preview.legacy")!
-        defaults.set(false, forKey: "ccsAutoSwitchEnabled")
-        let model = MenuBarModel(defaults: defaults, executableURL: nil)
-        model.accounts = preview.accounts.filter { $0.mode == .legacy }
-        model.accounts.indices.forEach { model.accounts[$0].active = true }
-        model.launchBackend = "legacy"
         return model
     }
 }

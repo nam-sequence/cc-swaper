@@ -14,9 +14,14 @@ struct MenuBarView: View {
                 emptyState
             } else {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        accountSection(.engine)
-                        accountSection(.legacy)
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.rows) { row in
+                            AccountCard(
+                                row: row,
+                                isSwitching: model.switchingAccountID == row.account.id,
+                                switchAction: { model.switchTo(row.account) }
+                            )
+                        }
                     }
                     .padding(.vertical, 1)
                 }
@@ -55,9 +60,6 @@ struct MenuBarView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                Text("Claude launches: \(model.launchBackendTitle)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
             }
             Spacer(minLength: 4)
             Button(action: { model.refresh() }) {
@@ -71,25 +73,6 @@ struct MenuBarView: View {
             .buttonStyle(.borderless)
             .disabled(model.isRefreshing)
             .help("Refresh account usage")
-        }
-    }
-
-    @ViewBuilder
-    private func accountSection(_ mode: BackendMode) -> some View {
-        let accounts = model.rows.filter { $0.mode == mode }
-        if !accounts.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(mode.rawValue)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                ForEach(accounts) { row in
-                    AccountCard(
-                        row: row,
-                        isSwitching: model.switchingAccountID == row.account.id,
-                        switchAction: { model.switchTo(row.account) }
-                    )
-                }
-            }
         }
     }
 
@@ -126,7 +109,7 @@ struct MenuBarView: View {
                         set: { model.setAutoSwitchEnabled($0) }
                     )
                 )
-                Text("When enabled, ccs checks usage every minute and chooses whether to switch.")
+                Text("When enabled, ccshift checks usage every minute and chooses whether to switch.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -183,12 +166,12 @@ struct MenuBarView: View {
                 ProgressView("Loading accounts and usage…")
                     .controlSize(.small)
             } else if model.executablePath == nil {
-                Text("Connect ccs")
+                Text("Connect ccshift")
                     .font(.headline)
-                Text("Choose the installed ccs command to view accounts and usage.")
+                Text("Install ccshift (uv tool install git+https://github.com/nam-sequence/cc-swaper) or choose the installed ccshift command.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                Button("Choose ccs executable…", action: model.chooseExecutable)
+                Button("Choose ccshift executable…", action: model.chooseExecutable)
                     .padding(.top, 3)
             } else if let error = model.alertMessage {
                 Text("Could not load accounts")
@@ -201,7 +184,7 @@ struct MenuBarView: View {
             } else {
                 Text("No accounts configured")
                     .font(.headline)
-                Text("Add an account with ccs, then refresh this menu.")
+                Text("Run ccshift add to register an account, then refresh this menu.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -218,7 +201,7 @@ struct MenuBarView: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
             } else {
-                Text(model.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "ccs not connected")
+                Text(model.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "ccshift not connected")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -257,6 +240,12 @@ private struct AccountCard: View {
                                 .foregroundStyle(.green)
                         }
                     }
+                    if row.account.disabled {
+                        Text("Not in auto-switch")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help("Disabled with ccshift disable. You can still switch to it here.")
+                    }
                     if let organization = row.account.organizationName, !organization.isEmpty {
                         Text(organization)
                             .font(.caption2)
@@ -287,7 +276,6 @@ private struct AccountCard: View {
                     Button("Switch", action: switchAction)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .disabled(row.account.disabled == true)
                 }
             }
 
@@ -297,7 +285,7 @@ private struct AccountCard: View {
                 ForEach(Array((usage.scoped ?? []).enumerated()), id: \.offset) { _, scoped in
                     UsageWindowView(
                         title: scoped.label ?? scoped.name ?? scoped.model ?? "Other",
-                        window: UsageWindow(pct: scoped.pct, resetsAt: scoped.resetsAt),
+                        window: scoped.window,
                         isLoading: row.isLoading,
                         isStale: row.isStale
                     )
@@ -330,7 +318,7 @@ private struct AccountCard: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(row.account.disabled == true ? "Account disabled" : "Usage unavailable")
+                Text("Usage unavailable")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -370,13 +358,13 @@ private struct UsageWindowView: View {
                 Text("\(Int(percent.rounded()))%")
                     .font(.system(.caption, design: .monospaced))
                     .frame(width: 34, alignment: .trailing)
-                if let reset = window?.resetsAt, !reset.isEmpty {
+                if let reset = window?.resetLabel() {
                     Text(reset)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .frame(maxWidth: 104, alignment: .trailing)
-                        .help(reset)
+                        .help(window?.resetTooltip ?? reset)
                 } else {
                     Text("Reset unavailable")
                         .font(.caption2)
@@ -416,8 +404,4 @@ private struct UsageWindowView: View {
 
 #Preview("Menu bar · loaded") {
     MenuBarView(model: .preview)
-}
-
-#Preview("Menu bar · legacy profiles") {
-    MenuBarView(model: .legacyPreview)
 }

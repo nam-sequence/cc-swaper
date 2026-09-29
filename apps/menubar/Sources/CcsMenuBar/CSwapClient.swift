@@ -29,7 +29,7 @@ struct CSwapClient: Sendable {
         else {
             throw CLIError.invalidExecutablePath
         }
-        // Keep the launcher's stable path (often ~/.local/bin/ccs -> versioned
+        // Keep the launcher's stable path (often ~/.local/bin/ccshift -> versioned
         // uv shim). Resolve and validate its current target immediately before
         // each spawn instead of persisting the target path here.
         self.executableURL = stableLauncher
@@ -37,86 +37,14 @@ struct CSwapClient: Sendable {
     }
 
     func dashboard() throws -> DashboardSnapshot {
-        var warnings: [String] = []
-        let routing: RoutingReport?
-        do {
-            routing = try decodeVersionOne(
-                run(arguments: ["routing", "--json"]),
-                as: RoutingReport.self
-            )
-        } catch {
-            routing = nil
-            warnings.append("Claude launch setting: \(error.localizedDescription)")
-        }
-        let engine: EngineAccountList = try decodeVersionOne(
-            run(arguments: ["accounts", "list", "--json"])
-        )
-
-        let status: EngineStatusReport?
-        do {
-            status = try decodeVersionOne(
-                run(arguments: ["accounts", "status", "--json"]),
-                as: EngineStatusReport.self
-            )
-        } catch {
-            status = nil
-            warnings.append("Engine status: \(error.localizedDescription)")
-        }
-        let activeNumber = status?.active?.number ?? engine.activeAccountNumber
-            ?? engine.accounts.first(where: \.active)?.number
-        var engineAccounts = engine.accounts.map(\.account)
-        if let activeNumber,
-           let active = status?.active,
-           let index = engineAccounts.firstIndex(where: { $0.number == activeNumber }) {
-            engineAccounts[index].usage = engineAccounts[index].usage ?? active.usage
-        }
-        engineAccounts = engineAccounts.map { account in
-            var copy = account
-            copy.active = copy.number == activeNumber
-            return copy
-        }
-
-        let legacy: LegacyProfileList = try decodeVersionOne(
-            run(arguments: ["list", "--json"])
-        )
-        let usageReport: LegacyUsageReport?
-        if legacy.profiles.isEmpty {
-            usageReport = LegacyUsageReport(accounts: [])
-        } else {
-            do {
-                usageReport = try decodeUnversioned(
-                    run(
-                        arguments: ["usage", "--json"],
-                        timeout: legacyUsageTimeout(profileCount: legacy.profiles.count)
-                    ),
-                    as: LegacyUsageReport.self
-                )
-            } catch {
-                usageReport = nil
-                warnings.append("Existing profile usage: \(error.localizedDescription)")
-            }
-        }
-        let usages = Dictionary(
-            (usageReport?.accounts ?? []).map { ($0.profile, $0) },
-            uniquingKeysWith: { _, latest in latest }
-        )
-        let activeName = routing?.selectedLegacyProfile ?? legacy.selected
-            ?? legacy.profiles.first(where: \.selected)?.name
-        let legacyAccounts = legacy.profiles.map { profile -> Account in
-            var account = profile.account(usage: usages[profile.name])
-            if usageReport == nil, profile.signedIn {
-                account = profile.account(usage: LegacyUsageAccount.unavailable(profile.name))
-            }
-            account.active = profile.name == activeName
+        let list: EngineAccountList = try decodeVersionOne(run(arguments: ["list", "--json"]))
+        let activeNumber = list.activeAccountNumber ?? list.accounts.first(where: \.active)?.number
+        let accounts = list.accounts.map { row -> Account in
+            var account = row.account
+            account.active = account.number == activeNumber
             return account
         }
-        return DashboardSnapshot(
-            accounts: engineAccounts + legacyAccounts,
-            activeAccountNumber: activeNumber,
-            activeProfileName: activeName,
-            launchBackend: routing?.launchBackend,
-            warning: warnings.isEmpty ? nil : warnings.joined(separator: " ")
-        )
+        return DashboardSnapshot(accounts: accounts, activeAccountNumber: activeNumber, warning: nil)
     }
 
     func switchEngineAccount(to number: Int) throws -> EngineSwitchReport {
@@ -124,10 +52,10 @@ struct CSwapClient: Sendable {
             throw CLIError.invalidAccountNumber
         }
         let response: EngineSwitchReport = try decodeVersionOne(
-            run(arguments: ["accounts", "switch", String(number), "--json"])
+            run(arguments: ["switch", String(number), "--json"])
         )
         if response.to.number == number {
-            // ccs may return switched=false for an already-active target.
+            // ccshift reports switched=false / reason=already-active for the live account.
             return response
         }
         if !response.switched {
@@ -136,34 +64,13 @@ struct CSwapClient: Sendable {
         throw CLIError.unexpectedSelection(expected: number, actual: response.to.number)
     }
 
-    func switchLegacyProfile(to name: String) throws -> String {
-        guard name.range(of: #"^[A-Za-z0-9][A-Za-z0-9_-]*$"#, options: .regularExpression) != nil else {
-            throw CLIError.invalidProfileName
-        }
-        let response: LegacySwitchReport = try decodeVersionOne(
-            run(arguments: ["switch", name, "--json"])
-        )
-        if let launchBackend = response.launchBackend, launchBackend != "legacy" {
-            throw CLIError.commandRejected("Claude launches are still using Engine Accounts. Change the launch setting before switching to Existing Profiles.")
-        }
-        guard response.selected == name else {
-            throw CLIError.failed("ccs selected '\(response.selected)' instead of '\(name)'.")
-        }
-        return response.selected
-    }
-
-    func legacyUsageTimeout(profileCount: Int) -> TimeInterval {
-        let batches = ceil(Double(max(profileCount, 0)) / 8.0)
-        return max(timeout, batches * 55.0 + 15.0)
-    }
-
     func autoSwitchOnce(
         threshold: Double,
         dryRun: Bool,
         cancellation: ProcessCancellation
     ) throws -> AutoSwitchOutcome {
         guard (50...99.9).contains(threshold) else { throw CLIError.invalidThreshold }
-        var arguments = ["accounts", "auto", "--once", "--json", "--threshold", "\(threshold)"]
+        var arguments = ["auto", "--once", "--json", "--threshold", "\(threshold)"]
         if dryRun { arguments.append("--dry-run") }
         let result = try run(arguments: arguments, cancellation: cancellation)
         let lines = String(decoding: result.output, as: UTF8.self)
@@ -197,6 +104,11 @@ struct CSwapClient: Sendable {
         guard [0, 2, 3].contains(result.terminationStatus) else {
             throw CLIError.failed(result.standardError)
         }
+        // argparse usage errors also exit 2, but print no JSON events. Only a
+        // reported no-switch or all-exhausted event makes 2 or 3 a result.
+        if events.isEmpty, result.terminationStatus != 0 {
+            throw CLIError.failed(result.standardError)
+        }
         return AutoSwitchOutcome(
             eventKind: meaningful?["event"] as? String,
             summary: describeAutoEvent(meaningful, exitCode: result.terminationStatus),
@@ -220,7 +132,10 @@ struct CSwapClient: Sendable {
         case "no-switch":
             let reason = event["reason"] as? String ?? "No change needed"
             let detail = event["detail"] as? String
-            if let detail, !detail.isEmpty { return "\(reason): \(detail)" }
+            if let detail, !detail.isEmpty {
+                let ended = detail.hasSuffix(".") || detail.hasSuffix("!") || detail.hasSuffix("?")
+                return "\(reason): \(detail)\(ended ? "" : ".")"
+            }
             return "\(reason)."
         case "all-exhausted":
             if let reset = event["earliestResetAt"] as? String, !reset.isEmpty {
@@ -293,7 +208,7 @@ struct CSwapClient: Sendable {
         }
 
         guard outputGroup.wait(timeout: .now() + 2) == .success else {
-            // A child spawned by ccs still holds one of the output descriptors.
+            // A child spawned by ccshift still holds one of the output descriptors.
             // They inherit the dedicated process group, so kill only this tree.
             terminateProcessGroup(pid, outputGroup: outputGroup)
             if cancellation?.isCancelled == true { throw CLIError.cancelled }
@@ -349,7 +264,7 @@ struct CSwapClient: Sendable {
         for value in [executablePath] + arguments {
             guard let copy = strdup(value) else {
                 strings.forEach { free($0) }
-                throw CLIError.failed("Could not prepare ccs arguments.")
+                throw CLIError.failed("Could not prepare ccshift arguments.")
             }
             strings.append(copy)
         }
@@ -358,10 +273,10 @@ struct CSwapClient: Sendable {
         argv.append(nil)
 
         var environmentStrings: [UnsafeMutablePointer<CChar>] = []
-        for (key, value) in ccsEnvironment() {
+        for (key, value) in ccshiftEnvironment() {
             guard let copy = strdup("\(key)=\(value)") else {
                 environmentStrings.forEach { free($0) }
-                throw CLIError.failed("Could not prepare the ccs environment.")
+                throw CLIError.failed("Could not prepare the ccshift environment.")
             }
             environmentStrings.append(copy)
         }
@@ -379,9 +294,9 @@ struct CSwapClient: Sendable {
         return child
     }
 
-    private func ccsEnvironment() -> [(String, String)] {
+    private func ccshiftEnvironment() -> [(String, String)] {
         let inherited = ProcessInfo.processInfo.environment
-        let safeKeys: Set<String> = ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "XDG_CONFIG_HOME", "CC_SWAPER_HOME"]
+        let safeKeys: Set<String> = ["HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"]
         var environment = inherited.filter { key, _ in safeKeys.contains(key) || key.hasPrefix("LC_") }
         var searchPaths = [URL(fileURLWithPath: executableURL.path).deletingLastPathComponent().path]
         for candidate in ["\(NSHomeDirectory())/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"] {
@@ -440,13 +355,13 @@ struct CSwapClient: Sendable {
     ) throws -> Value {
         do {
             guard let root = try JSONSerialization.jsonObject(with: result.output) as? [String: Any] else {
-                throw CLIError.invalidJSON("Could not read ccs data. Update ccs and try again.")
+                throw CLIError.invalidJSON("Could not read ccshift data. Update ccshift and try again.")
             }
             if let message = commandError(in: root) {
                 throw CLIError.commandRejected(message)
             }
             guard let schemaVersion = root["schemaVersion"] as? Int else {
-                throw CLIError.invalidJSON("The ccs response is missing schemaVersion.")
+                throw CLIError.invalidJSON("The ccshift response is missing schemaVersion.")
             }
             guard schemaVersion == 1 else {
                 throw CLIError.unsupportedSchema(schemaVersion)
@@ -455,26 +370,7 @@ struct CSwapClient: Sendable {
         } catch let error as CLIError {
             throw error
         } catch {
-            throw CLIError.invalidJSON("Could not read ccs data. Update ccs and try again.")
-        }
-    }
-
-    private func decodeUnversioned<Value: Decodable & Sendable>(
-        _ result: CommandResult,
-        as type: Value.Type
-    ) throws -> Value {
-        do {
-            guard let root = try JSONSerialization.jsonObject(with: result.output) as? [String: Any] else {
-                throw CLIError.invalidJSON("Could not read usage data.")
-            }
-            if let message = commandError(in: root) {
-                throw CLIError.commandRejected(message)
-            }
-            return try JSONDecoder().decode(type, from: result.output)
-        } catch let error as CLIError {
-            throw error
-        } catch {
-            throw CLIError.invalidJSON("Could not read usage data.")
+            throw CLIError.invalidJSON("Could not read ccshift data. Update ccshift and try again.")
         }
     }
 
@@ -491,7 +387,7 @@ struct CSwapClient: Sendable {
             for key in ["message", "reason", "detail"] {
                 if let value = root[key] as? String, !value.isEmpty { return value }
             }
-            return "ccs rejected the request."
+            return "ccshift rejected the request."
         }
         return nil
     }
@@ -505,7 +401,7 @@ enum CLIResolver {
         homeDirectory: String = NSHomeDirectory(),
         standardBinDirectories: [String] = ["/opt/homebrew/bin", "/usr/local/bin"]
     ) -> URL? {
-        if let configured = defaults.string(forKey: "ccsExecutablePath"),
+        if let configured = defaults.string(forKey: "ccshiftExecutablePath"),
            let url = validExecutable(configured) {
             return url
         }
@@ -514,8 +410,8 @@ enum CLIResolver {
             return url
         }
 
-        let preferredPaths = ["\(homeDirectory)/.local/bin/ccs"]
-            + standardBinDirectories.map { URL(fileURLWithPath: $0).appendingPathComponent("ccs").path }
+        let preferredPaths = ["\(homeDirectory)/.local/bin/ccshift"]
+            + standardBinDirectories.map { URL(fileURLWithPath: $0).appendingPathComponent("ccshift").path }
         for path in preferredPaths {
             if let url = validExecutable(path) { return url }
         }
@@ -524,7 +420,7 @@ enum CLIResolver {
             .map(String.init)
             .filter { $0.hasPrefix("/") }
         for directory in directories {
-            if let url = validExecutable(URL(fileURLWithPath: directory).appendingPathComponent("ccs").path) {
+            if let url = validExecutable(URL(fileURLWithPath: directory).appendingPathComponent("ccshift").path) {
                 return url
             }
         }

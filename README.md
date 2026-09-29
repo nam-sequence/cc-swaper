@@ -1,193 +1,445 @@
-# cc-swaper (`ccs`)
+# ccshift
 
-A macOS CLI and native menu bar app for Claude Code accounts. The `ccs accounts`
-engine adapts the [MIT-licensed claude-swap project](https://github.com/realiti4/claude-swap)
-for account slots, quota-aware switching, usage, an optional auto-switcher,
-parallel sessions, directory mappings, and a terminal dashboard. The Swift app
-shows usage and lets you switch from the menu bar. Existing `ccs` profile
-commands remain available separately.
+Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
-## Install
+ccshift is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
+(commit `3a4e5c1`, v0.27.0b1), renamed end to end: the command, the Python
+package, the data directory (`~/.ccshift`) and the Keychain service (`ccshift`).
+It never reads or changes a `claude-swap` install or its `~/.claude-swap-backup`
+store. This repository also contains a native macOS menu bar app in
+[`apps/menubar`](apps/menubar).
 
-Requires macOS 14+, Claude Code, Python 3.12+, and
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/). Building the
-menu bar app requires Swift 6.2 and Xcode. The `claude` shell wrapper supports
-interactive Zsh; `ccs` works from any shell. `tmux` is not required.
+## Installation
 
-Install the current v0.9.0 source from this checkout. First preserve the
-profile registry so a downgrade to v0.8.2 remains possible:
+ccshift is not published on PyPI. Install it from this repository:
 
 ```bash
-bash -euo pipefail -c '
-  registry="${CC_SWAPER_HOME:-$HOME/.config/cc-swaper}/profiles.json"
-  if [[ -f "$registry" && ! -e "$registry.pre-v0.9.0" ]]; then
-    cp -p "$registry" "$registry.pre-v0.9.0"
-  fi
-  bash scripts/install.sh
-'
-ccs --version
+uv tool install git+https://github.com/nam-sequence/cc-swaper
 ```
 
-The source installer installs the CLI, registers the existing Claude login as
-`main` if needed, and runs `ccs setup`. Setup installs the Zsh wrapper and
-removes the old background monitor. It leaves old tmux sessions running. Use
-`--no-setup` to skip profile initialization and Zsh setup. The currently
-published v0.8.2 release is the previous profile-only version; its installer
-does not contain the account engine or Swift app.
+### From source
 
-To build the native app locally:
+```bash
+git clone https://github.com/nam-sequence/cc-swaper.git
+cd cc-swaper
+uv sync
+uv run ccshift help
+```
+
+### Updating
+
+```bash
+ccshift upgrade          # auto-detects the uv tool install and upgrades it
+# or run uv directly:
+uv tool upgrade ccshift
+```
+
+### Migrating from cc-swaper (`ccs`)
+
+Earlier versions of this repository shipped `cc-swaper` (the `ccs` command,
+its profiles and a zsh `claude()` wrapper). ccshift does not read any of that
+data. To remove it, quit every Claude Code session started through `ccs`, open
+a new Terminal and run from a checkout of this repository
+(`git clone https://github.com/nam-sequence/cc-swaper.git && cd cc-swaper`):
+
+```bash
+bash scripts/remove-cc-swaper.sh           # dry run: lists what would be removed
+bash scripts/remove-cc-swaper.sh --apply   # remove it
+```
+
+The script refuses to delete anything while a process still uses the old data
+and lists those processes. Quit them, or add `--kill-running` to stop them.
+
+This removes the ccs profiles and their Keychain logins, the zsh wrapper
+(`~/.zshrc` is backed up first), the `cc-swaper` uv tool, the old menu bar app
+and a leftover `~/.claude-swap-backup` store. Your default Claude Code login
+and history (`~/.claude`) are kept. Add `--keep-history-backup` to keep the
+session-history copy that ccs saved under `~/.config/cc-swaper/session-backups`.
+Then add your accounts again with `ccshift add`.
+
+## Usage
+
+### Add your first account
+
+Log into Claude Code with your first account, then:
+
+```bash
+ccshift add
+```
+
+### Add more accounts
+
+Log in with another account, then:
+
+```bash
+ccshift add
+```
+
+Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+
+### Switch accounts
+
+Rotate to the next account:
+
+```bash
+ccshift switch
+```
+
+Or switch to a specific account:
+
+```bash
+ccshift switch 2
+ccshift switch user@example.com
+ccshift switch dev                # or by alias, once set with `ccshift alias 2 dev`
+```
+
+Not sure which one? `ccshift list` is the dashboard — every account's 5-hour and 7-day usage and reset times at a glance:
+
+```bash
+ccshift list
+```
+
+Or let ccshift auto-pick by remaining quota — `ccshift switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
+
+**Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
+
+### Automatic switching
+
+Let ccshift watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+
+```bash
+ccshift auto                     # foreground loop, polls every 60s
+ccshift auto --threshold 80      # switch earlier
+ccshift auto --model Fable       # also switch when the Fable weekly limit is hit
+ccshift auto --once              # single check-and-switch, for cron/scripts
+ccshift auto --dry-run           # log what it would do, never switch
+ccshift auto --strategy consume-first   # burn the soonest-resetting account first
+```
+
+<details>
+<summary>How it behaves & advanced usage</summary>
+
+- Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
+- A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Strategies** (`--strategy`, or `ccshift config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
+- It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
+- An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `ccshift add --slot N`, or replace its stored credentials from a known-good export — a plain `ccshift import backup.ccshift` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
+- To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `ccshift disable <num|email>`; `ccshift enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `ccshift switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `ccshift switch <num|email>` target. They show a `(disabled)` marker in `ccshift list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
+- By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `ccshift config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
+  - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `ccshift list` (e.g. a line reading `Fable: 100%`).
+
+For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
+
+```bash
+*/5 * * * * ccshift auto --once --json >> ~/.ccshift-auto.log 2>&1
+```
+
+Defaults like the threshold and cooldown are configurable with `ccshift config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
+
+</details>
+
+### Run multiple accounts at the same time (session mode)
+
+Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
+
+```bash
+ccshift run 2                     # launch Claude Code as account 2, here only
+ccshift run user@example.com      # by email
+ccshift run 2 -- --resume         # everything after '--' is forwarded to claude
+ccshift run 2 --share-history     # share your chat history with this account too
+ccshift run 2 --require-session   # refuse rather than run plain claude if 2 is the default login
+```
+
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
+
+Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
+  
+A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `ccshift switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by ccshift; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
+
+<details>
+<summary>Sharing details — MCP servers & chat history</summary>
+
+- With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
+- `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
+
+</details>
+
+<details>
+<summary>Map accounts to directories — auto-pick per repo</summary>
+
+Bind a directory to an account, and a bare `ccshift run` there launches that account in session mode — e.g. work account in work repos, personal elsewhere:
+
+```bash
+ccshift map 2 ~/work/client-app   # map a directory to account 2
+ccshift map user@example.com      # map the current directory
+ccshift map                       # list mappings
+ccshift unmap ~/work/client-app   # remove one (defaults to current directory)
+
+cd ~/work/client-app/src
+ccshift run                       # → account 2, session mode
+```
+
+Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `ccshift run` just launches plain `claude` with your default login. Mappings are per-machine (not part of `ccshift export`) and are cleaned up when their account is removed.
+
+</details>
+
+### Interactive dashboard (TUI)
+
+Run `ccshift` on its own (or `ccshift tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `ccshift watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
+
+<img src="assets/tui-watch.png" width="760" alt="ccshift watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
+
+### Refresh expired tokens
+
+If an account's token expires, log back into Claude Code with that account and re-run:
+
+```bash
+ccshift add
+```
+
+This will update the stored credentials without creating a duplicate.
+
+### Other commands
+
+```bash
+ccshift run 2                     # Run an account in this terminal only (session mode)
+ccshift auto                      # Auto-switch when nearing rate limits (see above)
+ccshift config                    # Show or edit settings (see Configuration below)
+ccshift list                      # Show all accounts with 5h/7d usage and reset times
+ccshift list --token-status       # Add source-labelled OAuth token diagnostics
+ccshift status                    # Show current account
+ccshift add --slot 3              # Add account to a specific slot (prompts before overwrite)
+ccshift add --alias dev           # Add account and give it a short alias
+ccshift remove 2                  # Remove an account
+ccshift disable 2                 # Hold an account out of auto-rotation (keeps its login)
+ccshift enable 2                  # Return a disabled account to rotation
+ccshift alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
+ccshift alias 2 --unset           # Remove an account's alias
+ccshift alias                     # List all aliases
+ccshift move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+ccshift unclaimed                 # List stashed credential entries (slot + why they were stashed)
+ccshift unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `ccshift add`)
+ccshift tui                       # Interactive dashboard (also: bare `ccshift`)
+ccshift watch                     # Dashboard, opened on the live watch page
+ccshift upgrade                   # Upgrade ccshift to the latest version
+ccshift purge                     # Remove all ccshift data
+```
+
+The original flag spellings (`ccshift --switch`, `ccshift --list`, ...) keep working.
+
+## Tips
+
+- **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
+- **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — run `ccshift switch` in any terminal and carry on. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
+
+## How it works
+
+- Backs up OAuth tokens and config when you add an account
+- Swaps only the account-specific Claude login when you switch accounts;
+  live account-independent OAuth state (such as MCP server logins) is
+  preserved instead of being overwritten by a slot's older snapshot
+- Account credentials stored securely using platform-appropriate methods
+- Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
+- Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `ccshift add --slot N`, or by replacing its stored credentials from a known-good export — a plain `ccshift import backup.ccshift` replaces dead-token slots automatically)
+- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping ccshift comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+
+## Data locations
+
+| Platform | Credentials | Config backups |
+|----------|-------------|----------------|
+| Windows | File-based (inside the backup directory, under `credentials/`) | `~/.ccshift/` |
+| macOS | macOS Keychain | `~/.ccshift/` |
+| Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/ccshift/` |
+
+Session-mode profiles (`ccshift run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+
+On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
+
+## Menu bar (macOS)
+
+### Native app
+
+[`apps/menubar`](apps/menubar) is a native SwiftUI menu bar app. It shows every
+account's 5-hour and 7-day usage, switches with a click, and can run
+`ccshift auto --once` every minute. It calls the installed `ccshift` command
+(`~/.local/bin/ccshift` by default) and never reads credentials itself.
 
 ```bash
 swift test --package-path apps/menubar
 bash apps/menubar/scripts/build-app.sh
-mkdir -p ~/Applications
 ditto apps/menubar/dist/CcsMenuBar.app ~/Applications/CcsMenuBar.app
-open ~/Applications/CcsMenuBar.app
 ```
 
-The menu bar app resolves the installed `ccs` executable and offers **Choose
-CLI…** if it is elsewhere. Its **Launch at Login** control uses macOS Login
-Items; macOS may ask you to enable the app in System Settings. The app does
-not start auto-switching until you enable that control separately.
+Run only one automatic switcher at a time: the native app's auto-switch,
+`ccshift auto`, or the Python status item below.
 
-If an independently installed `claude-swap` is present, verify the new CLI
-and app first, stop its old menu-bar service if it is running, then run
-`uv tool uninstall claude-swap`. This removes the old `cswap` executable; it
-does not delete `~/.claude-swap-backup`. Do not run both automatic switchers
-against Claude's default login.
+### Python status item
 
-## Account engine
+<details>
+<summary>Optional macOS menu bar app — usage at a glance, click to switch</summary>
 
-`ccs accounts` has the upstream account-management command set in a dedicated
-namespace. The new engine stores slot metadata under
-`~/.config/cc-swaper/account-engine` and credential backups in its own
-macOS Keychain service; it does not import the existing
-`~/.config/cc-swaper/profiles` entries. Add each account again when ready.
+Needs the `menubar` extra (macOS only):
 
 ```bash
-ccs accounts add                         # save the current default Claude login
-ccs accounts list                        # quota and reset-time dashboard
-ccs accounts status                      # active default Claude account
-ccs accounts switch 2                    # select an account for new `claude` launches
-ccs accounts switch --strategy best      # choose by remaining quota
-ccs accounts use                         # use the current default login, no switch
-ccs accounts run 2 --share-history -- --resume  # parallel account, shared history
-ccs accounts auto --once --dry-run       # inspect an auto-switch decision
-ccs accounts auto --threshold 80         # foreground auto-switch loop
-ccs accounts map 2 ~/work/project        # use account 2 in that directory
-ccs accounts tui                         # interactive terminal dashboard
-ccs routing                              # show which backend `claude` uses
+uv tool install --python 3.12 'ccshift[menubar] @ git+https://github.com/nam-sequence/cc-swaper'
+ccshift menubar
 ```
 
-`ccs accounts --help` lists add-token, alias, move/swap, disable/enable,
-unclaimed, configuration, export/import, usage import, purge, and the other
-advanced commands. `add-token` accepts a hidden prompt or stdin. Never type a
-token as a command argument: the CLI rejects it, but shell history or the
-process list may already have recorded it. Exports are plaintext credentials;
-store them privately.
+Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`ccshift auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
-`ccs accounts import backup.cswap` restores account login data and keeps only
-`oauthAccount` from imported Claude configuration. To restore all settings
-from a backup you trust, use `ccs accounts import backup.cswap --trust-config`
-in an interactive terminal and type `TRUST` at the prompt. Full configuration
-may include commands in hooks, status lines, or MCP servers.
-
-Session mode keeps an account's transcripts separate by default. Add
-`--share-history` when you want `/resume` to see the same project history;
-the default-login switch path already uses Claude's normal `~/.claude`
-history. Do not resume the same transcript in two terminals simultaneously.
-
-The old `ccs switch <profile>` command selects an existing profile and routes
-new `claude` launches through its separate `CLAUDE_CONFIG_DIR`. An engine
-`switch` routes new launches through Claude's default login. The two groups
-stay separate in the menu bar and no running Claude process changes account
-mid-session. The legacy `main` profile is the same default `~/.claude` login
-that the engine changes, so it cannot hold an independent account. Auto-switch
-stays off by default and pauses while an existing profile controls new
-launches. Use `ccs accounts run` for simultaneous account sessions without
-changing the global route.
-
-If the separately installed upstream `claude-swap` is still present, keep
-only one auto-switcher enabled: both can change Claude's default login and
-their per-account token backups do not share a refresh lock. Installing this
-package never imports or deletes `~/.claude-swap-backup`.
-
-Existing profile registries are upgraded to version 2 when first changed by
-this build. Older ccs v0.8.2 cannot read that registry afterwards; reinstall
-the new build before using the old profile commands again. This upgrade does
-not remove any profile, transcript, skill, plugin, or running Claude session.
-
-To roll back the CLI before using new account-engine data, restore the saved
-`profiles.json.pre-v0.9.0` (mode 0600) and reinstall the v0.8.2 wheel from
-its [GitHub release](https://github.com/nam-sequence/cc-swaper/releases/tag/v0.8.2).
-Keep the v0.9.0 engine store intact until you have confirmed any accounts you
-added no longer need it. The previous `claude-swap` tool can be reinstalled
-separately without importing or removing its saved backup store.
-
-## Existing profile commands
+**Keep it running without a terminal.** `ccshift menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash, no `.app` bundle:
 
 ```bash
-ccs list                        # * marks the selected account
-ccs add work                    # add a profile and sign in via Claude Code
-ccs switch                      # use Up/Down, Enter to select, Esc to cancel
-ccs switch work                 # select by name
-claude                          # native Claude with the selected account
-claude -c                       # continue a shared session using the selected account
-ccs usage                       # table for all accounts, checked in parallel
-ccs usage work                  # one account
-ccs usage --json                # machine-readable report
+ccshift menubar --install-service     # start now, and at every login
+ccshift menubar --service-status      # installed? loaded? pid?
+ccshift menubar --uninstall-service   # stop it and remove the plist
 ```
 
-`ccs switch` changes only the account used by **new** `claude` processes. It does not change an open Claude process or launch Claude. Exit Claude and run `claude` again after switching. The new process can find conversations in the shared project history with Claude's native `-c`, `-r`, or `/resume` commands. Do not resume the same conversation in two terminals at once: their messages can interleave in one transcript.
+The agent lives at `~/Library/LaunchAgents/com.ccshift.menubar.plist` and logs to `~/Library/Logs/com.ccshift.menubar.{log,err}`. It pins the `ccshift` console script, whose path survives an upgrade — but the running process keeps the old build until it restarts, so after `ccshift upgrade` either re-run `--install-service` or `launchctl kickstart -k gui/$(id -u)/com.ccshift.menubar`.
 
-To create a profile without opening the browser, use `ccs add work --no-login` and later `ccs login work`. `ccs list --show-identity` shows the email and organization reported by Claude Code. The `main` profile uses your existing default Claude configuration; added profiles get separate private configuration directories for account settings and credentials. Their `projects` entries link to `~/.claude/projects`, so `/resume` can see the same project transcripts under any selected profile. `ccs init` registers the default account on a fresh installation.
+</details>
 
-`ccs usage` invokes Claude Code's local `/usage` command for each profile, checking up to eight in parallel. The table shows loading states, percentage bars, 5-hour and 7-day windows, model-specific weekly limits when available, and Claude's reset times. Missing reset times display as **Reset time unavailable**. It does not show a subscription end date. Redirected output and `--json` omit the animation.
+## Advanced
 
-To remove an added profile, run `ccs remove work` to log out and archive its profile data, or `ccs remove work --purge-data` to delete that profile's local data. Shared project transcripts are kept by both options. You can also run `ccs remove main` to log out and unregister the default account. This archives only its ccs registration directory; `~/.claude`, including shared settings, skills, plugins, and project history, stays in place. `--purge-data` is unavailable for the default account. Exit any Claude process using a profile, including agents or background processes it started, before removing it; ccs refuses removal while that profile is locked. If you remove the last profile, `ccs add <name>` or `ccs init` can register a new one. An upgrade will not silently recreate a deliberately removed default account.
+### Configuration
 
-A registry without a default profile requires ccs v0.8.2 or later. Older versions expect the default profile to be present, so reinstall this version before using ccs again if you downgrade by accident.
+Tool preferences live in `settings.json` in the backup root; `ccshift config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
 
-## Migrating from v0.6
+<details>
+<summary>Commands & usage</summary>
 
-Installing v0.7 updates the Zsh wrapper and removes the LaunchAgent monitor. Open a new terminal or run `source ~/.zshrc` in an existing Zsh shell to load the new wrapper. New `claude` invocations use the selected account directly.
+```bash
+ccshift config                              # list effective settings ("(default)" = not set)
+ccshift config get autoswitch.threshold
+ccshift config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
+ccshift config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+ccshift config unset autoswitch.threshold   # back to the default
+ccshift config path                         # where settings.json lives
+```
 
-Old tmux sessions remain running so their current work is not interrupted. They retain the behavior they started with, including possible automatic switching, until they exit. Use `ccs attach` and `ccs stop` for these existing sessions, or inspect them with `tmux -L cc-swaper list-sessions`. These commands are retained only for migration; new sessions are not created in tmux.
+`ccshift config --help` lists every key with its valid range and default. Hand-editing the file still works — `ccshift config` is just a safer front door. `list` and `get` take `--json` for scripting.
 
-The profile registry and sign-ins in `~/.config/cc-swaper` (or `$CC_SWAPER_HOME`) survive the upgrade. `ccs` does not read or copy Claude OAuth credentials. Claude Code handles those credentials; `ccs` invokes `claude auth login` and `claude auth status` under each profile. The CLI removes inherited environment variables that could override a claude.ai login. Claude project settings still apply, so use the wrapper in projects whose configuration you trust.
+</details>
 
-From v0.7.2, `ccs` accepts only an exact managed `projects` link to the user's `~/.claude/projects` directory and creates that link for new managed profiles. Existing physical `projects` directories are preserved; `ccs` does not merge or replace them automatically. Do not delete those directories to enable sharing. Shared transcripts and project auto memory are readable from every profile and may be sent to a different account when you resume them. Claude's `project purge` and transcript retention can affect this shared history for every profile.
+### Backup and migration
 
-From v0.8.0, normal Claude launches under an added profile also load a private snapshot of the default account's selected user preferences, authored skills, agents, rules, and commands. The profile's own settings file and account-synced skills remain untouched; values already set in that profile take precedence over the shared snapshot. Account authentication, permissions, trust, and remote-control settings are excluded. Unknown or unsupported settings keys stay profile-local. The default account is the source of truth for shared customizations. The snapshot uses `--settings`, which Claude applies above project and local settings for that session; shared plugin enablement can therefore override a project-level plugin choice. Authentication commands and `ccs usage` do not load this snapshot. ccs rejects native `claude --bg` for every profile because it cannot safely retain the profile lock after Claude detaches.
+Move account data between machines or back it up:
 
-From v0.8.1, ccs repairs a managed profile's missing Claude TUI onboarding marker before launching a session if Claude reports that profile as already signed in. Claude can otherwise show its login wizard despite valid credentials, particularly after `claude auth login` or an IDE sign-in. The one-time repair changes only `hasCompletedOnboarding` in that profile's private `.claude.json`; it leaves the account and project values intact and does not read or copy credential tokens. ccs waits for another ccs launch to finish the same repair. If a different session keeps that profile in use, exit it and retry. Open a new terminal after upgrading so the Zsh wrapper uses the current Claude binary.
+```bash
+ccshift export backup.ccshift                    # All accounts to a file
+ccshift export backup.ccshift --account 2        # One account
+ccshift export backup.ccshift --full             # Include full ~/.claude.json and credential object (same-PC backup)
+ccshift import backup.ccshift                    # Skips accounts that already exist
+ccshift import backup.ccshift --force            # Overwrite existing
+```
 
-Marketplace plugins are offered from the default account's read-only plugin seed while each profile keeps its own synced plugins and mutable plugin state; marketplace entries with credential-bearing URLs are omitted. Credential-free user MCP definitions from the default account are passed to normal sessions through a private `--mcp-config` snapshot. By default, ccs skips definitions with headers, helpers, inline credential patterns, or a nonempty `env` map; the reviewed `FIRECRAWL_API_URL` with a credential-free URL is the only allowed environment entry. Other MCP definitions must be configured separately for that account. MCP OAuth sign-ins remain per account. To authenticate a shared MCP server, open a normal Claude session under the selected profile and use `/mcp`; the native `claude mcp` command does not load the temporary shared server list. Generated snapshots live inside each private managed profile and can contain MCP connection details; `ccs` never prints their values. Main-account plugin code, command-valued settings such as `statusLine`, and shared MCP commands run as your OS user inside the selected profile's Claude process. `CLAUDE_CONFIG_DIR` separates Claude's stored account data; it does not restrict those commands from reading other files or inherited environment variables available to your OS user. Restart a running Claude process to pick up changes to the default account's settings or resources.
+The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `ccshift export - | gpg -c > backup.gpg`).
 
-To uninstall later, quit and remove `CcsMenuBar.app`, run `ccs shell uninstall`,
-then `uv tool uninstall cc-swaper`. This leaves the profile registry, account
-engine backups, and Claude's own data intact. `ccs accounts purge` is a
-separate, destructive action for the engine's own account data. Purge removes
-the engine data root and its Keychain backups after active session/refresh
-checks. Small private coordination files remain in `~/.config/cc-swaper` to
-block late refreshes; an explicit new account add/import reopens the engine.
+If an imported account is the one you're currently logged in as, activate the imported credentials with `ccshift switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
-## Build a release
+### Share usage readings between machines
 
-Run `bash scripts/build-release.sh` on macOS to build a versioned directory
-under `dist/`:
+Machines that hold the same accounts can end up spending one usage-endpoint budget: when they share a login (moved between them with `export`/`import`, so the same token is live on each), or when the account's usage requests are limited per account rather than per token. Their polling then adds up. `import-usage` lets one machine poll and hand its readings to the others:
 
-| Asset | Purpose |
-| --- | --- |
-| `cc_swaper-X.Y.Z-py3-none-any.whl` | Installable CLI wheel |
-| `cc_swaper-X.Y.Z.tar.gz` | Source distribution |
-| `CcsMenuBar-vX.Y.Z-macos-local.zip` | Ad-hoc-signed local macOS menu bar app |
-| `install.sh` | Version-pinned standalone installer |
-| `SHA256SUMS` | SHA-256 hashes for those four assets |
+```bash
+ccshift list --json | ssh laptop ccshift import-usage - --hold 600
+```
 
-Verify from the release directory with `shasum -a 256 -c SHA256SUMS`. The app
-is ad-hoc signed for local use; public distribution may require a Developer ID
-signature and notarization. Checksums establish consistency with the release
-manifest; they are not a separate publisher signature.
+<details>
+<summary>How it works — matching, holds & when a hold ends</summary>
 
-Claude Code references: [configuration directories](https://code.claude.com/docs/en/env-vars), [authentication](https://code.claude.com/docs/en/authentication), [sessions](https://code.claude.com/docs/en/sessions), and [`/usage`](https://code.claude.com/docs/en/commands).
+The input is `ccshift list --json` output. Each row with `usageStatus: "ok"` is matched to a local account by email and organization, and adopted when it is newer than the reading already stored. Its age comes from `usageAgeSeconds`, so the two machines' clocks never have to agree; a script that delays the hand-over should add the delay to that field. `--hold SECONDS` keeps every collector on the receiving machine (`list`, `status`, `auto`, the dashboard, the menu bar) from fetching those accounts for that long, and the held reading stays trusted for switch decisions meanwhile. A hold never runs past the reading's earliest window reset (per-model windows included), nor past an hour after the reading was taken. Renew it with each hand-over, or lift it early with `--hold 0`; when it lapses, the machine goes back to fetching for itself.
+
+</details>
+
+### JSON output for scripting
+
+Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+
+```bash
+ccshift list --json                   # all accounts with usage/quota
+ccshift status --json                 # current active account
+ccshift switch --strategy best --json # switch, then report the result
+ccshift switch 2 --json
+```
+
+<details>
+<summary>Example output & schema notes</summary>
+
+```json
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 2,
+  "accounts": [
+    { "number": 2, "email": "you@example.com", "active": true, "usageStatus": "ok",
+      "usage": { "fiveHour": { "pct": 25.0, "resetsAt": "2026-06-22T23:29:59Z" },
+                 "sevenDay": { "pct": 16.0, "resetsAt": "2026-06-26T17:59:59Z" } } }
+  ]
+}
+```
+
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+
+Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `ccshift disable` carries an additive `"disabled": true` on its row (absent otherwise).
+
+A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `ccshift add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
+
+An account row also carries an additive `alias` field once one is set with `ccshift alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+
+Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
+
+</details>
+
+`ccshift auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+
+### Add an account from a raw token or API key
+
+If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
+or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+flow first — useful on headless servers or when receiving a token from another
+machine — register it directly. The token type is auto-detected:
+
+```bash
+ccshift add-token sk-ant-oat01-...             # OAuth setup-token
+ccshift add-token sk-ant-api03-...             # managed API key
+ccshift add-token sk-ant-oat01-... --slot 3
+ccshift add-token - --slot 3                   # read token from stdin
+ccshift add-token --email user@example.com     # optional label override
+```
+
+`--email` is optional; omitted values use `setup-token-{slot}@token.local`
+(or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+
+**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
+(the kind Claude Code uses after `/login` with a key) rather than an OAuth
+setup-token. It switches like any other account; since API keys have no subscription
+quota, they show no usage and the usage-aware `switch` strategies never skip them as
+rate-limited.
+
+## Uninstall
+
+Remove all data, then uninstall the tool:
+
+```bash
+ccshift menubar --uninstall-service   # macOS, only if you ran --install-service
+ccshift purge
+uv tool uninstall ccshift
+```
+
+For the native menu bar app, turn off *Launch at login* in its Settings, quit
+it, and delete `~/Applications/CcsMenuBar.app`.
+
+## Requirements
+
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- Claude Code installed and logged in
+- For the native menu bar app: macOS 14+ and Xcode with Swift 6.2 (the CLI does
+  not need them)
+
+## License
+
+MIT. ccshift is derived from [realiti4/claude-swap](https://github.com/realiti4/claude-swap),
+Copyright (c) 2026 Onur Cetinkol; see [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
