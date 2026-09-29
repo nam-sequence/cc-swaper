@@ -101,13 +101,13 @@ import os, subprocess, sys
 roots = sys.argv[1:]
 
 def table(*flags):
-    result = subprocess.run(["ps", *flags, "-axww", "-o", "pid=,ppid=,command="],
+    result = subprocess.run(["ps", *flags, "-axww", "-o", "pid=,ppid=,stat=,command="],
                             capture_output=True, text=True)
     rows = {}
     for row in result.stdout.splitlines():
-        parts = row.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            rows[int(parts[0])] = (int(parts[1]), parts[2])
+        parts = row.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[3], parts[2])
     # A healthy listing always contains this process; fail closed otherwise.
     if result.returncode != 0 or os.getpid() not in rows:
         sys.exit(3)
@@ -122,8 +122,9 @@ while pid and pid not in skip:
 argv_needles = ["/uv/tools/cc-swaper/", "tmux -L cc-swaper"] + [root + "/" for root in roots]
 env_needles = [f"CLAUDE_CONFIG_DIR={root}/" for root in roots] + [f"CLAUDE_CONFIG_DIR={root} " for root in roots]
 for pid in sorted(argv):
-    command = argv[pid][1]
-    if pid in skip or command.startswith("ps "):
+    command, state = argv[pid][1], argv[pid][2]
+    # Zombies and processes already exiting hold nothing and cannot be signalled.
+    if pid in skip or command.startswith("ps ") or "Z" in state or "E" in state:
         continue
     executable = command.split(" ", 1)[0]
     is_claude = "/claude/versions/" in executable or os.path.basename(executable) == "claude"
