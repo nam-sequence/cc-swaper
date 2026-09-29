@@ -361,3 +361,28 @@ def error_envelope(exc: Exception) -> dict:
         "schemaVersion": SCHEMA_VERSION,
         "error": {"type": type(exc).__name__, "message": str(exc)},
     }
+
+
+def account_change_payload(result: dict, action: str) -> dict:
+    """The ``add --json`` / ``remove --json`` payload for a completed change.
+
+    ``result`` is what ``add_account`` or ``remove_account`` returned;
+    ``action`` is ``"added"``, ``"refreshed"`` (add on an already-managed
+    login) or ``"removed"``.
+    """
+    account: dict = {"number": result["number"], "email": result["email"]}
+    if result.get("alias"):
+        account["alias"] = result["alias"]
+    payload: dict = {
+        "schemaVersion": SCHEMA_VERSION,
+        "action": action,
+        "account": account,
+    }
+    if action == "removed":
+        payload["wasActive"] = bool(result.get("wasActive"))
+    return payload
+
+
+def cancelled_payload() -> dict:
+    """The payload when a change was declined at a confirmation prompt."""
+    return {"schemaVersion": SCHEMA_VERSION, "action": "cancelled"}

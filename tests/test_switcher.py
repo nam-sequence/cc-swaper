@@ -8627,6 +8627,54 @@ class TestSwitchRemoveGatesAcceptAlias:
         assert "2" not in data["accounts"]
         assert "1" in data["accounts"]
 
+    def test_remove_account_returns_what_it_removed(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        # Claude Code is signed in to account 2 (a manual /login), while the
+        # recorded active slot still says 1: wasActive follows the live login.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "account2@example.com", "accountUuid": "uuid-2"},
+        }))
+        sample_sequence_data["accounts"]["2"]["alias"] = "dev"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_delete_account_files"):
+            removed_live = switcher.remove_account("2", assume_yes=True)
+            removed_recorded = switcher.remove_account("1", assume_yes=True)
+
+        assert removed_live == {
+            "number": 2, "email": "account2@example.com", "alias": "dev", "wasActive": True,
+        }
+        assert removed_recorded == {
+            "number": 1, "email": "account1@example.com", "alias": None, "wasActive": False,
+        }
+
+    def test_remove_account_ambiguous_email_with_assume_yes_raises(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["2"]["email"] = "account1@example.com"
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-2"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with pytest.raises(ValidationError, match="pass the account number"):
+            switcher.remove_account("account1@example.com", assume_yes=True)
+        assert set(switcher._get_sequence_data()["accounts"]) == {"1", "2"}
+
+    def test_remove_account_declined_returns_none(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+        assert switcher.remove_account("2") is None
+        assert "2" in switcher._get_sequence_data()["accounts"]
+
     def test_remove_account_invalid_identifier_still_raises_validation(
         self, temp_home: Path, sample_sequence_data: dict,
     ):

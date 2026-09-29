@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -10,7 +11,7 @@ import sys
 
 from ccshift import __version__, paths, printer
 from ccshift.exceptions import ClaudeSwitchError
-from ccshift.json_output import error_envelope
+from ccshift.json_output import account_change_payload, cancelled_payload, error_envelope
 from ccshift.printer import (
     accent,
     bolded,
@@ -975,6 +976,14 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _human_output_to_stderr(json_mode: bool):
+    """In JSON mode, send a command's human-readable lines to stderr so
+    stdout carries only the JSON payload."""
+    if json_mode:
+        return contextlib.redirect_stdout(sys.stderr)
+    return contextlib.nullcontext()
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1043,6 +1052,7 @@ Commands:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
+  %(prog)s add --login [--sso] [--private]  sign in with a browser and add that account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
@@ -1110,7 +1120,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=(
             "Emit machine-readable JSON to stdout (use with 'list', 'status', "
-            "or 'switch'). See README 'JSON output for scripting'."
+            "'switch', 'add' or 'remove'). See README 'JSON output for scripting'."
         ),
     )
     parser.add_argument(
@@ -1145,7 +1155,45 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Email address for the account. Optional with 'add-token'; "
             "defaults to setup-token-{slot}@token.local (or "
             "api-key-{slot}@token.local for API keys) since these tokens "
-            "carry no real email metadata."
+            "carry no real email metadata. With 'add --login', pre-fills "
+            "the sign-in page."
+        ),
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help=(
+            "With 'add': sign in with a browser (claude auth login) in a "
+            "separate profile and add that account, instead of saving the "
+            "login Claude Code is using. The live login is not changed"
+        ),
+    )
+    parser.add_argument(
+        "--sso",
+        action="store_true",
+        help="With 'add --login': use single sign-on (SSO)",
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help=(
+            "With 'add --login': open the sign-in page in a private window, so "
+            "a browser signed in to another Claude account is not reused. Uses "
+            "the default browser when it supports this, else an installed one "
+            "that does (Safari and Arc cannot)"
+        ),
+    )
+    parser.add_argument(
+        "--browser",
+        metavar="BUNDLE_ID",
+        help="With 'add --login --private': the browser to use, e.g. com.google.Chrome",
+    )
+    parser.add_argument(
+        "--handoff-file",
+        metavar="PATH",
+        help=(
+            "With 'add --login': write the sign-in page's URL to PATH instead of "
+            "opening a browser (the menu bar app opens it in a private sign-in window)"
         ),
     )
     parser.add_argument(
@@ -1165,6 +1213,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
             "login first"
+        ),
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help=(
+            "Answer yes to confirmation prompts: removing an account, or "
+            "overwriting an occupied slot with 'add --slot' / 'add-token --slot'"
         ),
     )
     parser.add_argument(
@@ -1329,8 +1386,25 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
-    if args.json and not (args.list or args.status or args.switch or args.switch_to):
-        parser.error("--json can only be used with 'list', 'status', or 'switch'")
+    if args.json and not (
+        args.list or args.status or args.switch or args.switch_to
+        or args.add_account or args.remove_account
+    ):
+        parser.error(
+            "--json can only be used with 'list', 'status', 'switch', 'add' or 'remove'"
+        )
+
+    if args.yes and not (
+        args.remove_account or args.add_account or args.add_token is not None
+    ):
+        parser.error("--yes can only be used with 'remove', 'add' or 'add-token'")
+
+    # JSON mode has nobody to answer a confirmation prompt, so a command that
+    # can prompt must be told the answer up front.
+    if args.json and not args.yes and (
+        args.remove_account or (args.add_account and args.slot is not None)
+    ):
+        parser.error("'remove --json' and 'add --slot --json' also need --yes")
 
     if args.json and args.token_status:
         # Token status is not part of the JSON v1 schema; reject rather than
@@ -1351,8 +1425,26 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
-    if args.email is not None and args.add_token is None:
-        parser.error("--email can only be used with 'add-token'")
+    if args.login and not args.add_account:
+        parser.error("--login can only be used with 'add'")
+
+    if (args.sso or args.private) and not args.login:
+        parser.error("--sso and --private can only be used with 'add --login'")
+
+    if args.browser is not None and not args.private:
+        parser.error("--browser can only be used with 'add --login --private'")
+
+    if args.handoff_file is not None and not args.login:
+        parser.error("--handoff-file can only be used with 'add --login'")
+
+    if args.handoff_file is not None and args.private:
+        parser.error("--handoff-file and --private cannot be combined")
+
+    if args.handoff_file is not None and not os.path.isabs(args.handoff_file):
+        parser.error("--handoff-file must be an absolute path")
+
+    if args.email is not None and args.add_token is None and not args.login:
+        parser.error("--email can only be used with 'add-token' or 'add --login'")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
@@ -1408,15 +1500,50 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            with _human_output_to_stderr(args.json):
+                if args.login:
+                    from ccshift.login import login_and_add
+
+                    added = login_and_add(
+                        switcher,
+                        sso=args.sso,
+                        email=args.email,
+                        alias=args.alias,
+                        slot=args.slot,
+                        assume_yes=args.yes,
+                        json_mode=args.json,
+                        private=args.private,
+                        browser=args.browser,
+                        handoff_file=args.handoff_file,
+                    )
+                else:
+                    added = switcher.add_account(
+                        slot=args.slot, alias=args.alias, assume_yes=args.yes
+                    )
+            if args.json:
+                payload = (
+                    cancelled_payload() if added is None
+                    else account_change_payload(
+                        added, "added" if added["created"] else "refreshed"
+                    )
+                )
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                assume_yes=args.yes,
             )
         elif args.remove_account:
-            switcher.remove_account(args.remove_account)
+            with _human_output_to_stderr(args.json):
+                removed = switcher.remove_account(
+                    args.remove_account, assume_yes=args.yes
+                )
+            if args.json:
+                payload = (
+                    cancelled_payload() if removed is None
+                    else account_change_payload(removed, "removed")
+                )
         elif args.disable_account is not None:
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:

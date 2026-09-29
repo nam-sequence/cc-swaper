@@ -670,7 +670,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="sk-ant-oat01-abc", email=None, slot=None
+            token="sk-ant-oat01-abc", email=None, slot=None, assume_yes=False
         )
 
     def test_email_without_add_token_errors(self, capsys):
@@ -694,7 +694,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="mytoken", email="u@example.com", slot=None
+            token="mytoken", email="u@example.com", slot=None, assume_yes=False
         )
 
     def test_add_token_with_slot(self, temp_home: Path, capsys):
@@ -710,7 +710,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="tok", email="u@example.com", slot=3
+            token="tok", email="u@example.com", slot=3, assume_yes=False
         )
 
     def test_add_token_in_help(self):
@@ -984,6 +984,59 @@ class TestJsonOutputCli:
                 cli.main()
         assert excinfo.value.code == 2
         assert "--token-status cannot be combined with --json" in capsys.readouterr().err
+
+    def test_yes_rejected_without_a_command_that_prompts(self, capsys):
+        with patch.object(sys, "argv", ["ccshift", "--list", "--yes"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--yes can only be used with" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ["ccshift", "remove", "2", "--json"],
+        ["ccshift", "add", "--slot", "2", "--json"],
+    ])
+    def test_json_commands_that_can_prompt_need_yes(self, argv, capsys):
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "also need --yes" in capsys.readouterr().err
+
+    def test_remove_json_passes_yes_and_serializes_the_result(self, capsys):
+        def fake_remove(identifier, assume_yes=False):
+            print("Removed Account-2 (b@example.com)")  # human line
+            return {"number": 2, "email": "b@example.com", "wasActive": True}
+
+        with patch("ccshift.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["ccshift", "remove", "2", "--yes", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.remove_account.side_effect = fake_remove
+            cli.main()
+
+        switcher_cls.return_value.remove_account.assert_called_once_with("2", assume_yes=True)
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == {
+            "schemaVersion": 1,
+            "action": "removed",
+            "account": {"number": 2, "email": "b@example.com"},
+            "wasActive": True,
+        }
+        assert "Removed Account-2" in captured.err
+
+    def test_add_json_reports_a_declined_prompt_as_cancelled(self, capsys):
+        with patch("ccshift.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["ccshift", "add", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.add_account.return_value = None
+            cli.main()
+
+        switcher_cls.return_value.add_account.assert_called_once_with(
+            slot=None, alias=None, assume_yes=False,
+        )
+        assert json.loads(capsys.readouterr().out) == {
+            "schemaVersion": 1, "action": "cancelled",
+        }
 
     def test_list_json_serialized_to_stdout(self, capsys):
         payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
@@ -1515,6 +1568,33 @@ class TestAliasCommand:
 
         data = ClaudeAccountSwitcher()._get_sequence_data()
         assert data["accounts"]["1"]["alias"] == "dev"
+
+    def test_add_json_reports_added_then_refreshed(
+        self, temp_home, mock_claude_config, capsys
+    ):
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(ClaudeAccountSwitcher, "_write_account_credentials"):
+            with patch.object(sys, "argv", ["ccshift", "add", "--alias", "dev", "--json"]):
+                cli.main()
+            first = capsys.readouterr()
+            with patch.object(sys, "argv", ["ccshift", "add", "--json"]):
+                cli.main()
+            second = capsys.readouterr()
+
+        added = json.loads(first.out)  # stdout is only the JSON payload
+        assert added["schemaVersion"] == 1
+        assert added["action"] == "added"
+        assert added["account"]["number"] == 1
+        assert added["account"]["alias"] == "dev"
+        assert "Added" in first.err  # the human line moved to stderr
+
+        refreshed = json.loads(second.out)
+        assert refreshed["action"] == "refreshed"
+        assert refreshed["account"]["number"] == 1
+        assert refreshed["account"]["email"] == added["account"]["email"]
 
     def test_alias_flag_without_add_errors(self, temp_home, capsys):
         with patch("os.geteuid", return_value=1000, create=True), \

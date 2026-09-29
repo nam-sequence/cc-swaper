@@ -69,7 +69,16 @@ ccshift add
 
 ### Add more accounts
 
-Log in with another account, then:
+Sign in to the other account with your browser, without changing the account Claude Code is using:
+
+```bash
+ccshift add --login                        # Claude sign-in page
+ccshift add --login --sso --email me@company.com  # single sign-on, email pre-filled
+```
+
+This runs Claude Code's own `claude auth login` in a separate, temporary profile, saves that account, then deletes the temporary profile. If your browser is already signed in to a different Claude account, add `--private` to open the sign-in page in a private window: the default browser when it supports one from the command line (Chrome, Brave, Edge, Firefox, Vivaldi, Opera), otherwise the first installed browser that does, or pick one with `--browser com.google.Chrome`. Safari and Arc cannot open a private window for another app; the menu bar app's own private sign-in window works with any browser.
+
+Or log in with the other account in Claude Code, then:
 
 ```bash
 ccshift add
@@ -212,7 +221,8 @@ ccshift list --token-status       # Add source-labelled OAuth token diagnostics
 ccshift status                    # Show current account
 ccshift add --slot 3              # Add account to a specific slot (prompts before overwrite)
 ccshift add --alias dev           # Add account and give it a short alias
-ccshift remove 2                  # Remove an account
+ccshift add --login [--sso] [--private]  # Sign in with the browser and add that account
+ccshift remove 2                  # Remove an account (asks first; --yes skips the prompt)
 ccshift disable 2                 # Hold an account out of auto-rotation (keeps its login)
 ccshift enable 2                  # Return a disabled account to rotation
 ccshift alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
@@ -356,13 +366,15 @@ The input is `ccshift list --json` output. Each row with `usageStatus: "ok"` is 
 
 ### JSON output for scripting
 
-Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+Add `--json` to `list`, `status`, `switch`, `add` or `remove` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
 
 ```bash
 ccshift list --json                   # all accounts with usage/quota
 ccshift status --json                 # current active account
 ccshift switch --strategy best --json # switch, then report the result
 ccshift switch 2 --json
+ccshift add --json                    # save the current login, then report it
+ccshift remove 2 --yes --json         # remove without prompting, then report it
 ```
 
 <details>
@@ -380,7 +392,7 @@ ccshift switch 2 --json
 }
 ```
 
-Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`. `add` and `remove` report `{"action": "added"|"refreshed"|"removed", "account": {"number", "email", "alias"?}}` (`refreshed` means the login was already managed and its stored credentials were updated; `remove` adds `wasActive`, true when Claude Code is signed in to the removed account). A declined prompt reports `{"action": "cancelled"}`. JSON mode cannot answer a confirmation prompt, so `remove --json` and `add --slot N --json` also need `--yes`.
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `ccshift disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
