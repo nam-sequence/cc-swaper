@@ -305,10 +305,14 @@ struct AccountChangeReport: Decodable, Equatable, Sendable {
     }
 
     let schemaVersion: Int
-    /// "added", "refreshed", "removed" or "cancelled".
+    /// "added", "refreshed", "removed", "disabled", "enabled" or "cancelled".
     let action: String
     let account: ChangedAccount?
     let wasActive: Bool?
+    /// enable/disable: false when the account already was in that state.
+    let changed: Bool?
+    /// disable: no account is left for automatic switching.
+    let rotationEmpty: Bool?
 }
 
 /// What the Add Account sheet knows about the current Claude Code login.
@@ -381,7 +385,7 @@ enum CLIError: LocalizedError, Equatable {
         case .accountListChanged:
             "The account list changed since it was shown. Check the refreshed list and try again."
         case .accountCommandsUnsupported:
-            "This ccshift version cannot add or remove accounts for the menu bar app. Run ccshift upgrade, then try again."
+            "This ccshift version is too old for this action in the menu bar app. Run ccshift upgrade, then try again."
         }
     }
 }

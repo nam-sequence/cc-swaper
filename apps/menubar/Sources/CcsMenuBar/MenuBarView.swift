@@ -125,6 +125,14 @@ struct MenuBarView: View {
                     .contextMenu {
                         Button("Switch to This Account") { model.switchTo(row.account) }
                             .disabled(row.isActive || model.switchingAccountID != nil || model.isChangingAccounts)
+                        Toggle(
+                            "Use for Automatic Switching",
+                            isOn: Binding(
+                                get: { !row.account.disabled },
+                                set: { model.setAccountDisabled(row.account, !$0) }
+                            )
+                        )
+                        .disabled(model.isChangingAccounts || model.isSigningIn || model.switchingAccountID != nil)
                         Divider()
                         // One modal at a time: the Add Account sheet would
                         // hold back the removal confirmation.

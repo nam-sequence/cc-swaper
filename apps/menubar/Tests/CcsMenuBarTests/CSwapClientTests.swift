@@ -367,6 +367,40 @@ final class CSwapClientTests: XCTestCase {
         )
     }
 
+    func testEnableAndDisableNameTheAccountByEmail() throws {
+        let folder = try tempFolder()
+        let argsPath = folder.appendingPathComponent("args")
+        let script = #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__ARGS__'
+        case "$1" in
+          disable) printf '%s\n' '{"schemaVersion":1,"action":"disabled","account":{"number":2,"email":"b@example.test","alias":"work"},"changed":true,"rotationEmpty":true}' ;;
+          enable) printf '%s\n' '{"schemaVersion":1,"action":"enabled","account":{"number":2,"email":"b@example.test"},"changed":false,"rotationEmpty":false}' ;;
+        esac
+        """#
+        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+
+        let disabled = try client.setAccountDisabled(account(2, "b@example.test"), disabled: true, emailIsShared: false)
+        XCTAssertEqual(disabled.action, "disabled")
+        XCTAssertEqual(disabled.changed, true)
+        XCTAssertEqual(disabled.rotationEmpty, true)
+        let enabled = try client.setAccountDisabled(account(2, "b@example.test"), disabled: false, emailIsShared: false)
+        XCTAssertEqual(enabled.changed, false)
+        let calls = try String(contentsOf: argsPath, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(calls, ["disable b@example.test --json", "enable b@example.test --json"])
+    }
+
+    func testOlderCcshiftWithoutEnableDisableJSONAsksForAnUpgrade() throws {
+        let client = try CSwapClient(executableURL: fakeCLI("""
+        #!/bin/sh
+        echo "ccshift: error: --json can only be used with 'list', 'status', 'switch', 'add' or 'remove'" >&2
+        exit 2
+        """))
+        XCTAssertThrowsError(try client.setAccountDisabled(account(2, "b@example.test"), disabled: true, emailIsShared: false)) { error in
+            XCTAssertEqual(error as? CLIError, .accountCommandsUnsupported)
+        }
+    }
+
     func testBrowserSignInPassesItsOptionsAsSingleTokens() throws {
         let folder = try tempFolder()
         let argsPath = folder.appendingPathComponent("args")
