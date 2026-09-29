@@ -2,406 +2,334 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// The menu bar popover, modeled on a macOS 26 Control Center module: a bold
+/// header with a trailing control, a section of icon-badged rows, one quick
+/// toggle, and menu items with shortcut hints. It draws no background of its
+/// own, so the system menu window material shows through.
 struct MenuBarView: View {
     @ObservedObject var model: MenuBarModel
+    /// Off only for snapshot rendering, so a fixture is not refreshed on appear.
+    var refreshOnAppear = true
+
+    @State private var listContentHeight: CGFloat?
+
+    @Environment(\.openSettings) private var openSettings
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
             header
-            Divider().padding(.vertical, 10)
+            CCSeparator()
+            accountsSection
+            CCSeparator()
+            autoSwitchRow
+            CCSeparator()
+            menuItems
+        }
+        .frame(width: CCMetrics.popoverWidth)
+        .task {
+            if refreshOnAppear && model.rows.isEmpty && !model.isRefreshing { model.refresh() }
+        }
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Claude Accounts")
+                    .font(.headline)
+                Text(model.activeSummary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(model.activeSummary)
+            }
+            Spacer(minLength: 8)
+            Button(action: { model.refresh() }) {
+                CCRefreshGlyph(isRefreshing: model.isRefreshing)
+            }
+            .buttonStyle(CCCircleButtonStyle())
+            .disabled(model.isRefreshing)
+            .help("Refresh account usage")
+            .accessibilityLabel("Refresh")
+            .accessibilityValue(model.isRefreshing ? "Refreshing" : "")
+        }
+        .padding(.horizontal, CCMetrics.contentInset)
+        .padding(.top, 14)
+        .padding(.bottom, 11)
+    }
+
+    // MARK: Accounts
+
+    private var footerCaption: String {
+        if let lastUpdated = model.lastUpdated {
+            return "Updated \(lastUpdated.formatted(date: .omitted, time: .shortened))"
+        }
+        return model.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "ccshift not connected"
+    }
+
+    /// The load error is already the body of the empty state; every other
+    /// message (switch failures, CLI warnings, a missing executable) is shown here.
+    private var displayedAlert: String? {
+        guard let message = model.alertMessage else { return nil }
+        let isShownAsEmptyState = model.rows.isEmpty && !model.isRefreshing && model.executablePath != nil
+        return isShownAsEmptyState ? nil : message
+    }
+
+    private var accountsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            CCSectionHeader(title: "Accounts", trailing: footerCaption)
+                .padding(.top, 9)
+                .padding(.bottom, 3)
 
             if model.rows.isEmpty {
                 emptyState
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(model.rows) { row in
-                            AccountCard(
-                                row: row,
-                                isSwitching: model.switchingAccountID == row.account.id,
-                                switchAction: { model.switchTo(row.account) }
-                            )
-                        }
-                    }
-                    .padding(.vertical, 1)
-                }
-                .frame(maxHeight: 420)
+                accountList
             }
 
-            if let alertMessage = model.alertMessage {
-                Label(alertMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 10)
+            if let alert = displayedAlert {
+                CCNotice(text: alert, symbol: "exclamationmark.triangle.fill", tint: .orange, emphasis: .primary)
+                    .padding(.horizontal, CCMetrics.contentInset)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
             }
-
-            Divider().padding(.vertical, 10)
-            settings
-            Divider().padding(.vertical, 10)
-            footer
         }
-        .padding(14)
-        .frame(width: 360)
-        .task {
-            if model.rows.isEmpty && !model.isRefreshing { model.refresh() }
-        }
+        .padding(.bottom, 2)
     }
 
-    private var header: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "person.crop.circle.fill")
-                .font(.system(size: 23))
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Claude accounts")
-                    .font(.headline)
-                Text(model.activeSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 4)
-            Button(action: { model.refresh() }) {
-                if model.isRefreshing {
-                    ProgressView().controlSize(.small)
-                        .frame(width: 17, height: 17)
-                } else {
-                    Image(systemName: "arrow.clockwise")
-                }
-            }
-            .buttonStyle(.borderless)
-            .disabled(model.isRefreshing)
-            .help("Refresh account usage")
-        }
+    /// Widest meter title ("5h", "Sonnet") across all accounts, so meters align.
+    private var usageLabelWidth: CGFloat {
+        let titles = ["5h", "7d"] + model.rows.flatMap { ($0.account.visibleUsage?.scoped ?? []).map(\.displayTitle) }
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.preferredFont(forTextStyle: .subheadline)]
+        let widest = titles.map { ($0 as NSString).size(withAttributes: attributes).width }.max() ?? 0
+        return min(ceil(widest), 72)
     }
 
-    private var settings: some View {
-        DisclosureGroup("Settings") {
-            VStack(alignment: .leading, spacing: 9) {
-                Toggle(
-                    "Launch at login",
-                    isOn: Binding(
-                        get: { model.launchAtLoginRequested },
-                        set: { model.setLaunchAtLoginEnabled($0) }
+    /// A `ScrollView` reports its ideal height before wrapped text has laid out,
+    /// which clips the last row. The content is measured at its real width and
+    /// the list is sized to it, capped at `maxListHeight`.
+    private var accountList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(model.rows) { row in
+                    AccountRowView(
+                        row: row,
+                        isSwitching: model.switchingAccountID == row.account.id,
+                        usageLabelWidth: usageLabelWidth,
+                        switchAction: { model.switchTo(row.account) }
                     )
-                )
-                .disabled(model.launchAtLoginStatus == .notFound)
-
-                if model.launchAtLoginStatus == .requiresApproval || model.launchAtLoginError != nil {
-                    Button("Open Login Items Settings", action: model.openLoginItemsSettings)
-                        .buttonStyle(.link)
-                        .font(.caption)
-                }
-                if let message = model.launchAtLoginMessage {
-                    Text(message)
-                        .font(.caption2)
-                        .foregroundStyle(model.launchAtLoginError == nil ? Color.secondary : Color.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Divider()
-
-                Toggle(
-                    "Automatic account switching",
-                    isOn: Binding(
-                        get: { model.autoSwitchEnabled },
-                        set: { model.setAutoSwitchEnabled($0) }
-                    )
-                )
-                Text("When enabled, ccshift checks usage every minute and chooses whether to switch.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let paused = model.autoSwitchAvailabilityMessage {
-                    Label(paused, systemImage: "pause.circle")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                HStack(spacing: 8) {
-                    Text("Threshold")
-                        .font(.caption)
-                    Slider(
-                        value: Binding(
-                            get: { model.autoSwitchThreshold },
-                            set: { model.setAutoSwitchThreshold($0) }
-                        ),
-                        in: 50...99.9,
-                        step: 1
-                    )
-                    Text("\(model.autoSwitchThreshold, specifier: "%.1f")%")
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 36, alignment: .trailing)
-                }
-                Toggle(
-                    "Dry run (never switch)",
-                    isOn: Binding(
-                        get: { model.autoSwitchDryRun },
-                        set: { model.setAutoSwitchDryRun($0) }
-                    )
-                )
-                .disabled(!model.autoSwitchEnabled)
-
-                if model.autoSwitchIsRunning {
-                    Label("Checking account usage…", systemImage: "arrow.clockwise")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if let result = model.autoSwitchLastResult {
-                    Text(result)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(.top, 8)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: AccountListHeightKey.self, value: proxy.size.height)
+                }
+            }
         }
-        .font(.subheadline.weight(.medium))
+        .onPreferenceChange(AccountListHeightKey.self) { listContentHeight = $0 }
+        .frame(height: listContentHeight.map { min($0, CCMetrics.maxListHeight) })
+        .frame(maxHeight: CCMetrics.maxListHeight)
+        .scrollBounceBehavior(.basedOnSize)
+        // Like Control Center lists: no scroller, even with "Always" scroll
+        // bars or a mouse attached, where the legacy scroller would take a
+        // 15pt gutter out of the rows. The soft edge shows there is more.
+        .scrollIndicators(.never)
+        .ccSoftScrollEdges()
     }
 
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(spacing: 6) {
             if model.isRefreshing {
-                ProgressView("Loading accounts and usage…")
-                    .controlSize(.small)
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading accounts and usage…")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
             } else if model.executablePath == nil {
-                Text("Connect ccshift")
-                    .font(.headline)
-                Text("Install ccshift (uv tool install git+https://github.com/nam-sequence/cc-swaper) or choose the installed ccshift command.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                emptyStateText(
+                    symbol: "terminal",
+                    title: "Connect ccshift",
+                    message: "Install ccshift (uv tool install git+https://github.com/nam-sequence/cc-swaper) or choose the installed ccshift command."
+                )
                 Button("Choose ccshift executable…", action: model.chooseExecutable)
-                    .padding(.top, 3)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .padding(.top, 4)
             } else if let error = model.alertMessage {
-                Text("Could not load accounts")
-                    .font(.headline)
-                Text(error)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                emptyStateText(symbol: "exclamationmark.triangle", title: "Could not load accounts", message: error)
                 Button("Try again") { model.refresh() }
-                    .padding(.top, 3)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .padding(.top, 4)
             } else {
-                Text("No accounts configured")
-                    .font(.headline)
-                Text("Run ccshift add to register an account, then refresh this menu.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                emptyStateText(
+                    symbol: "person.crop.circle.badge.plus",
+                    title: "No accounts configured",
+                    message: "Run ccshift add to register an account, then refresh this menu."
+                )
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, CCMetrics.contentInset)
+        .padding(.vertical, 16)
     }
 
-    private var footer: some View {
-        HStack(spacing: 14) {
-            if let lastUpdated = model.lastUpdated {
-                Text("Updated \(lastUpdated.formatted(date: .omitted, time: .shortened))")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-            } else {
-                Text(model.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "ccshift not connected")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+    @ViewBuilder
+    private func emptyStateText(symbol: String, title: String, message: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 22, weight: .regular))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+        Text(title)
+            .font(.headline)
+        Text(message)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: Automatic switching
+
+    private var autoSwitchRow: some View {
+        HStack(alignment: .top, spacing: CCMetrics.badgeSpacing) {
+            CCBadge(symbol: "arrow.triangle.2.circlepath", isOn: model.autoSwitchEnabled)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .center, spacing: 8) {
+                    // The switch below carries the accessibility label; reading
+                    // the visible title too would announce the name twice.
+                    Text("Automatic Switching")
+                        .font(.body)
+                        .accessibilityHidden(true)
+                    Spacer(minLength: 8)
+                    Toggle(
+                        "Automatic Switching",
+                        isOn: Binding(
+                            get: { model.autoSwitchEnabled },
+                            set: { model.setAutoSwitchEnabled($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+                .frame(minHeight: CCMetrics.badgeSize)
+                autoSwitchStatus
             }
-            Spacer(minLength: 0)
-            Button("Choose CLI…", action: model.chooseExecutable)
-                .buttonStyle(.link)
-                .font(.caption)
-            Button("Quit") {
+        }
+        .padding(.horizontal, CCMetrics.contentInset)
+        .padding(.vertical, 8)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.25), value: model.autoSwitchEnabled)
+    }
+
+    @ViewBuilder
+    private var autoSwitchStatus: some View {
+        if let paused = model.autoSwitchAvailabilityMessage {
+            CCNotice(text: paused, symbol: "pause.circle", tint: .orange)
+        } else if model.autoSwitchIsRunning {
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Checking account usage…")
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+        } else if model.autoSwitchEnabled, let result = model.autoSwitchLastResult {
+            Text(result)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(result)
+        }
+    }
+
+    // MARK: Menu items
+
+    private var menuItems: some View {
+        VStack(spacing: 0) {
+            CCMenuRow(title: "ccshift Settings…", shortcut: KeyboardShortcut(",", modifiers: .command)) {
+                openSettingsWindow()
+            }
+            CCMenuRow(title: "Quit ccshift", shortcut: KeyboardShortcut("q", modifiers: .command)) {
                 model.shutdown()
                 NSApp.terminate(nil)
             }
-                .buttonStyle(.link)
-                .font(.caption)
         }
+        .padding(.vertical, 5)
+    }
+
+    /// An accessory app is never frontmost by itself, so a plain
+    /// `openSettings()` can leave the window behind other apps. Order matters:
+    /// close the popover, activate the app, open the scene, then raise it.
+    ///
+    /// `NSApp.activate()` is cooperative and, per its header, not guaranteed to
+    /// activate the app at all. `activate(ignoringOtherApps:)` activates
+    /// regardless and is available on every supported system.
+    private func openSettingsWindow() {
+        dismiss()
+        NSApp.activate(ignoringOtherApps: true)
+        openSettings()
+        SettingsWindowPresenter.raiseWhenReady()
     }
 }
 
-private struct AccountCard: View {
-    let row: AccountRow
-    let isSwitching: Bool
-    let switchAction: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(row.account.displayName)
-                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    if row.isActive {
-                        Text("ACTIVE")
-                                .font(.system(size: 9, weight: .bold, design: .rounded))
-                                .foregroundStyle(.green)
-                        }
-                    }
-                    if row.account.disabled {
-                        Text("Not in auto-switch")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .help("Disabled with ccshift disable. You can still switch to it here.")
-                    }
-                    if let organization = row.account.organizationName, !organization.isEmpty {
-                        Text(organization)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } else if row.account.displayName != row.account.email {
-                        Text(row.account.email)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-                Spacer(minLength: 4)
-                if row.isStale {
-                    Label("Stale", systemImage: "clock.arrow.circlepath")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .labelStyle(.titleAndIcon)
-                }
-                if row.isActive {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .accessibilityLabel("Active account")
-                } else if isSwitching {
-                    ProgressView().controlSize(.small)
-                        .accessibilityLabel("Switching account")
-                } else {
-                    Button("Switch", action: switchAction)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-            }
-
-            if let usage = row.account.visibleUsage {
-                UsageWindowView(title: "5-hour", window: usage.fiveHour, isLoading: row.isLoading, isStale: row.isStale)
-                UsageWindowView(title: "7-day", window: usage.sevenDay, isLoading: row.isLoading, isStale: row.isStale)
-                ForEach(Array((usage.scoped ?? []).enumerated()), id: \.offset) { _, scoped in
-                    UsageWindowView(
-                        title: scoped.label ?? scoped.name ?? scoped.model ?? "Other",
-                        window: scoped.window,
-                        isLoading: row.isLoading,
-                        isStale: row.isStale
-                    )
-                }
-                if let age = row.isStale
-                    ? (row.account.lastGoodAgeSeconds ?? row.account.usageAgeSeconds)
-                    : (row.account.usageAgeSeconds ?? row.account.lastGoodAgeSeconds) {
-                    Text("\(row.isStale ? "Last good usage" : "Usage data") · \(ageText(age)) ago")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                } else {
-                    Text("Usage age unavailable")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                if let message = row.message {
-                    Label(message, systemImage: "exclamationmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else if row.isLoading {
-                ProgressView("Loading usage…")
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else if let message = row.message {
-                Label(message, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("Usage unavailable")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(11)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(row.isActive ? Color.accentColor.opacity(0.45) : .clear, lineWidth: 1)
-        }
-    }
-
-    private func ageText(_ seconds: Double) -> String {
-        let duration = max(0, Int(seconds))
-        if duration < 60 { return "\(duration)s" }
-        if duration < 3_600 { return "\(duration / 60)m" }
-        return "\(duration / 3_600)h"
+private struct AccountListHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
-private struct UsageWindowView: View {
-    let title: String
-    let window: UsageWindow?
-    let isLoading: Bool
-    var isStale = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 47, alignment: .leading)
-
-            if let percent = window?.pct {
-                ProgressView(value: min(max(percent, 0), 100), total: 100)
-                    .tint(isStale ? .secondary : color(for: percent))
-                Text("\(Int(percent.rounded()))%")
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(width: 34, alignment: .trailing)
-                if let reset = window?.resetLabel() {
-                    Text(reset)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .frame(maxWidth: 104, alignment: .trailing)
-                        .help(window?.resetTooltip ?? reset)
-                } else {
-                    Text("Reset unavailable")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .frame(maxWidth: 104, alignment: .trailing)
+/// Brings the SwiftUI Settings window to the front once `openSettings()` has
+/// created it. If the window cannot be found this does nothing; activation and
+/// `openSettings()` have already done the required work.
+@MainActor
+enum SettingsWindowPresenter {
+    static func raiseWhenReady() {
+        Task { @MainActor in
+            for _ in 0..<20 {
+                if let window = NSApp.windows.first(where: isSettingsWindow) {
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKeyAndOrderFront(nil)
+                    // Without this the window can open behind another app's
+                    // windows while the app is still becoming active.
+                    window.orderFrontRegardless()
+                    return
                 }
-            } else if isLoading {
-                ProgressView().controlSize(.mini)
-                    .frame(maxWidth: .infinity)
-                Text("—")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 34, alignment: .trailing)
-            } else {
-                ProgressView(value: 0)
-                Text("—")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 34, alignment: .trailing)
-                Text("Unavailable")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .frame(maxWidth: 104, alignment: .trailing)
+                try? await Task.sleep(for: .milliseconds(25))
             }
         }
-        .accessibilityElement(children: .combine)
     }
 
-    private func color(for percent: Double) -> Color {
-        if percent >= 90 { return .orange }
-        return .accentColor
+    private static func isSettingsWindow(_ window: NSWindow) -> Bool {
+        window.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true
     }
-
 }
 
 #Preview("Menu bar · loaded") {
-    MenuBarView(model: .preview)
+    MenuBarView(model: .preview, refreshOnAppear: false)
+}
+
+#Preview("Menu bar · switching, auto-switch on") {
+    var state = MenuBarModel.PreviewState()
+    state.switchingAccountID = "account:2"
+    state.autoSwitchEnabled = true
+    state.autoSwitchLastResult = "Stayed on main: no other account has room. Threshold: 90.0%"
+    return MenuBarView(model: .preview(state), refreshOnAppear: false)
+}
+
+#Preview("Menu bar · not connected") {
+    var state = MenuBarModel.PreviewState()
+    state.accounts = []
+    state.executablePath = nil
+    state.lastUpdated = nil
+    state.alertMessage = CLIError.executableNotFound.localizedDescription
+    return MenuBarView(model: .preview(state), refreshOnAppear: false)
 }

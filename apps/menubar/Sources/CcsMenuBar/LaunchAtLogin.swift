@@ -5,7 +5,6 @@ enum LaunchAtLoginStatus: Equatable, Sendable {
     case notRegistered
     case enabled
     case requiresApproval
-    case notFound
 }
 @MainActor
 protocol LaunchAtLoginManaging: AnyObject {
@@ -23,12 +22,19 @@ final class SystemLaunchAtLoginManager: LaunchAtLoginManaging {
     }
 
     func status() -> LaunchAtLoginStatus {
-        switch service.status {
-        case .notRegistered: .notRegistered
+        Self.status(for: service.status)
+    }
+
+    /// An app that was never registered reports `.notFound` (there is no
+    /// Background Task Management record yet), so it is treated as off, not
+    /// as unavailable. If the bundle really cannot be registered, `register()`
+    /// throws and the error is shown instead.
+    nonisolated static func status(for status: SMAppService.Status) -> LaunchAtLoginStatus {
+        switch status {
         case .enabled: .enabled
         case .requiresApproval: .requiresApproval
-        case .notFound: .notFound
-        @unknown default: .notFound
+        case .notRegistered, .notFound: .notRegistered
+        @unknown default: .notRegistered
         }
     }
 

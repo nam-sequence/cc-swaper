@@ -81,7 +81,6 @@ final class MenuBarModel: ObservableObject {
         return switch launchAtLoginStatus {
         case .notRegistered, .enabled: nil
         case .requiresApproval: "Allow ccshift in System Settings → General → Login Items."
-        case .notFound: "Launch at login is unavailable for this app bundle."
         }
     }
 
@@ -324,21 +323,78 @@ private enum LoadResult<Value: Sendable>: Sendable {
     case failure(String)
 }
 
-extension MenuBarModel {
-    private static func previewReset(hours: Double) -> String {
-        ISO8601DateFormatter().string(from: Date().addingTimeInterval(hours * 3_600))
+/// Launch-at-login stand-in for previews and snapshots; never touches ServiceManagement.
+@MainActor
+final class PreviewLaunchAtLoginManager: LaunchAtLoginManaging {
+    private var current: LaunchAtLoginStatus
+
+    init(status: LaunchAtLoginStatus = .notRegistered) {
+        current = status
     }
 
-    static var preview: MenuBarModel {
-        let defaults = UserDefaults(suiteName: "com.namsequence.cccshifter.menubar.preview")!
-        defaults.set(false, forKey: "ccsAutoSwitchEnabled")
-        let model = MenuBarModel(defaults: defaults, executableURL: nil)
-        model.accounts = [
+    func status() -> LaunchAtLoginStatus { current }
+
+    func setEnabled(_ enabled: Bool) throws -> LaunchAtLoginStatus {
+        current = enabled ? .enabled : .notRegistered
+        return current
+    }
+
+    func openLoginItemsSettings() {}
+}
+
+// MARK: - Preview and snapshot fixtures
+
+extension ScopedUsage {
+    init(label: String, pct: Double?, resetsAt: String?) {
+        self.name = nil
+        self.label = label
+        self.model = nil
+        self.pct = pct
+        self.resetsAt = resetsAt
+        self.countdown = nil
+        self.clock = nil
+    }
+}
+
+extension MenuBarModel {
+    /// Everything a fixture can pin. `MenuBarModel.preview(_:)` assigns these
+    /// directly, so no CLI process, timer, defaults write or ServiceManagement
+    /// call ever runs.
+    @MainActor
+    struct PreviewState {
+        var accounts: [Account] = MenuBarModel.previewAccounts
+        var isRefreshing = false
+        var rosterReadFailed = false
+        var switchingAccountID: String?
+        var lastUpdated: Date? = Date()
+        var alertMessage: String?
+        var executablePath: String? = "/Users/example/.local/bin/ccshift"
+        var autoSwitchEnabled = false
+        var autoSwitchThreshold = 90.0
+        var autoSwitchDryRun = false
+        var autoSwitchIsRunning = false
+        var autoSwitchLastResult: String?
+        var launchAtLoginStatus: LaunchAtLoginStatus = .notRegistered
+        var launchAtLoginError: String?
+    }
+
+    private static func previewReset(hours: Double) -> String {
+        // The extra 30 s keeps "2h 12m" stable while a snapshot is rendered.
+        ISO8601DateFormatter().string(from: Date().addingTimeInterval(hours * 3_600 + 30))
+    }
+
+    /// Active, stale with a row message, and disabled with a scoped window.
+    static var previewAccounts: [Account] {
+        [
             Account(
                 id: "account:1",
                 number: 1, email: "nam@example.com", organizationName: "Max",
                 alias: "main", active: true, disabled: false, usageStatus: "ok",
-                usage: AccountUsage(fiveHour: UsageWindow(pct: 17, resetsAt: previewReset(hours: 2.2)), sevenDay: UsageWindow(pct: 32, resetsAt: previewReset(hours: 75)), scoped: []),
+                usage: AccountUsage(
+                    fiveHour: UsageWindow(pct: 17, resetsAt: previewReset(hours: 2.2)),
+                    sevenDay: UsageWindow(pct: 32, resetsAt: previewReset(hours: 75)),
+                    scoped: []
+                ),
                 usageAgeSeconds: 18, lastGoodUsage: nil, lastGoodAgeSeconds: nil
             ),
             Account(
@@ -347,11 +403,80 @@ extension MenuBarModel {
                 alias: "work", active: false, disabled: false, usageStatus: "unavailable",
                 usage: nil,
                 usageAgeSeconds: 9_300,
-                lastGoodUsage: AccountUsage(fiveHour: UsageWindow(pct: 74, resetsAt: previewReset(hours: 0.8)), sevenDay: UsageWindow(pct: 61, resetsAt: previewReset(hours: 130)), scoped: []),
+                lastGoodUsage: AccountUsage(
+                    fiveHour: UsageWindow(pct: 74, resetsAt: previewReset(hours: 0.8)),
+                    sevenDay: UsageWindow(pct: 61, resetsAt: previewReset(hours: 130)),
+                    scoped: []
+                ),
                 lastGoodAgeSeconds: 9_300
             ),
+            Account(
+                id: "account:3",
+                number: 3, email: "research@example.com", organizationName: nil,
+                alias: "research", active: false, disabled: true, usageStatus: "ok",
+                usage: AccountUsage(
+                    fiveHour: UsageWindow(pct: 93, resetsAt: previewReset(hours: 1.4)),
+                    sevenDay: UsageWindow(pct: 48, resetsAt: previewReset(hours: 52)),
+                    scoped: [ScopedUsage(label: "Sonnet", pct: 12, resetsAt: previewReset(hours: 52))]
+                ),
+                usageAgeSeconds: 42, lastGoodUsage: nil, lastGoodAgeSeconds: nil
+            ),
         ]
-        model.lastUpdated = Date()
+    }
+
+    /// An account whose only content is its status message (no usage at all).
+    static var previewMessageOnlyAccount: Account {
+        Account(
+            id: "account:4",
+            number: 4, email: "personal@example.com", organizationName: nil,
+            alias: nil, active: false, disabled: false, usageStatus: "token_expired",
+            usage: nil, usageAgeSeconds: nil, lastGoodUsage: nil, lastGoodAgeSeconds: nil
+        )
+    }
+
+    /// Enough accounts to exercise the scrolling cap.
+    static var previewManyAccounts: [Account] {
+        var accounts = previewAccounts + [previewMessageOnlyAccount]
+        for number in 5...8 {
+            accounts.append(
+                Account(
+                    id: "account:\(number)",
+                    number: number, email: "seat\(number)@example.com", organizationName: "Team",
+                    alias: "seat-\(number)", active: false, disabled: false, usageStatus: "ok",
+                    usage: AccountUsage(
+                        fiveHour: UsageWindow(pct: Double(number * 9), resetsAt: previewReset(hours: 3.1)),
+                        sevenDay: UsageWindow(pct: Double(number * 6), resetsAt: previewReset(hours: 90)),
+                        scoped: []
+                    ),
+                    usageAgeSeconds: 30, lastGoodUsage: nil, lastGoodAgeSeconds: nil
+                )
+            )
+        }
+        return accounts
+    }
+
+    static func preview(_ state: PreviewState) -> MenuBarModel {
+        let suite = "com.namsequence.ccshift.menubar.preview.\(UUID().uuidString)"
+        let model = MenuBarModel(
+            defaults: UserDefaults(suiteName: suite)!,
+            executableURL: nil,
+            launchAtLoginManager: PreviewLaunchAtLoginManager(status: state.launchAtLoginStatus)
+        )
+        model.accounts = state.accounts
+        model.isRefreshing = state.isRefreshing
+        model.rosterReadFailed = state.rosterReadFailed
+        model.switchingAccountID = state.switchingAccountID
+        model.lastUpdated = state.lastUpdated
+        model.alertMessage = state.alertMessage
+        model.executablePath = state.executablePath
+        model.autoSwitchEnabled = state.autoSwitchEnabled
+        model.autoSwitchThreshold = state.autoSwitchThreshold
+        model.autoSwitchDryRun = state.autoSwitchDryRun
+        model.autoSwitchIsRunning = state.autoSwitchIsRunning
+        model.autoSwitchLastResult = state.autoSwitchLastResult
+        model.launchAtLoginError = state.launchAtLoginError
         return model
     }
+
+    static var preview: MenuBarModel { preview(PreviewState()) }
 }

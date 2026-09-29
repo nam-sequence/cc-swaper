@@ -42,6 +42,13 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertTrue(model.launchAtLoginError?.contains("System Settings") == true)
     }
 
+    func testNeverRegisteredAppIsShownAsOffNotUnavailable() {
+        XCTAssertEqual(SystemLaunchAtLoginManager.status(for: .notFound), .notRegistered)
+        XCTAssertEqual(SystemLaunchAtLoginManager.status(for: .notRegistered), .notRegistered)
+        XCTAssertEqual(SystemLaunchAtLoginManager.status(for: .enabled), .enabled)
+        XCTAssertEqual(SystemLaunchAtLoginManager.status(for: .requiresApproval), .requiresApproval)
+    }
+
     func testAutoSwitchIsOptInSerialAndPassesThresholdAndDryRunToFakeCLI() async throws {
         let folder = try makeFolder()
         let countPath = folder.appendingPathComponent("ticks")

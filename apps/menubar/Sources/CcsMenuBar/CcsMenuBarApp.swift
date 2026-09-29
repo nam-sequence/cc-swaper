@@ -17,12 +17,29 @@ struct CcsMenuBarApp: App {
             MenuBarView(model: model)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "person.crop.circle")
+                Image(systemName: "shift")
                 Text(model.menuTitle)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(model: model)
+        }
+        .commands {
+            // The app menu's default Quit (⌘Q with the Settings window key)
+            // calls `terminate:` directly. Route it through `shutdown()` first,
+            // exactly like the Quit row in the popover, so an in-flight
+            // automatic check is stopped instead of outliving the app.
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit ccshift") {
+                    model.shutdown()
+                    NSApp.terminate(nil)
+                }
+                .keyboardShortcut("q", modifiers: .command)
+            }
+        }
     }
 }
