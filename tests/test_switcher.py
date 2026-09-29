@@ -8867,6 +8867,24 @@ class TestDisableEnableAccount:
         assert "disabled" not in data["accounts"]["2"]
         assert "Enabled Account-2" in capsys.readouterr().out
 
+    def test_disable_and_enable_report_what_changed(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_alias("2", "dev")
+
+        assert s.set_account_disabled("2", True) == {
+            "number": 2, "email": "b@example.com", "alias": "dev",
+            "changed": True, "rotationEmpty": False,
+        }
+        again = s.set_account_disabled("2", True)
+        assert again["changed"] is False
+        # Disabling the last account in rotation says so.
+        assert s.set_account_disabled("1", True)["rotationEmpty"] is True
+        enabled = s.set_account_disabled("1", False)
+        assert enabled["changed"] is True
+        assert enabled["rotationEmpty"] is False
+
     def test_disable_by_email(self, temp_home):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")

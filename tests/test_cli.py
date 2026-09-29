@@ -1038,6 +1038,30 @@ class TestJsonOutputCli:
             "schemaVersion": 1, "action": "cancelled",
         }
 
+    @pytest.mark.parametrize("verb, disabled", [("disable", True), ("enable", False)])
+    def test_disable_and_enable_json(self, verb, disabled, capsys):
+        def fake_toggle(identifier, flag):
+            print(f"{verb.capitalize()}d Account-2 (b@example.com).")  # human line
+            return {"number": 2, "email": "b@example.com", "alias": None,
+                    "changed": True, "rotationEmpty": False}
+
+        with patch("ccshift.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["ccshift", verb, "b@example.com", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.set_account_disabled.side_effect = fake_toggle
+            cli.main()
+
+        switcher_cls.return_value.set_account_disabled.assert_called_once_with("b@example.com", disabled)
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == {
+            "schemaVersion": 1,
+            "action": "disabled" if disabled else "enabled",
+            "account": {"number": 2, "email": "b@example.com"},
+            "changed": True,
+            "rotationEmpty": False,
+        }
+        assert "Account-2" in captured.err
+
     def test_list_json_serialized_to_stdout(self, capsys):
         payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
         with patch("ccshift.cli.ClaudeAccountSwitcher") as switcher_cls, \

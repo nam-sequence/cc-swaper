@@ -1120,7 +1120,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=(
             "Emit machine-readable JSON to stdout (use with 'list', 'status', "
-            "'switch', 'add' or 'remove'). See README 'JSON output for scripting'."
+            "'switch', 'add', 'remove', 'disable' or 'enable'). See README "
+            "'JSON output for scripting'."
         ),
     )
     parser.add_argument(
@@ -1389,9 +1390,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.json and not (
         args.list or args.status or args.switch or args.switch_to
         or args.add_account or args.remove_account
+        or args.disable_account is not None or args.enable_account is not None
     ):
         parser.error(
-            "--json can only be used with 'list', 'status', 'switch', 'add' or 'remove'"
+            "--json can only be used with 'list', 'status', 'switch', 'add', "
+            "'remove', 'disable' or 'enable'"
         )
 
     if args.yes and not (
@@ -1544,10 +1547,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                     cancelled_payload() if removed is None
                     else account_change_payload(removed, "removed")
                 )
-        elif args.disable_account is not None:
-            switcher.set_account_disabled(args.disable_account, True)
-        elif args.enable_account is not None:
-            switcher.set_account_disabled(args.enable_account, False)
+        elif args.disable_account is not None or args.enable_account is not None:
+            disable = args.disable_account is not None
+            with _human_output_to_stderr(args.json):
+                toggled = switcher.set_account_disabled(
+                    args.disable_account if disable else args.enable_account, disable
+                )
+            if args.json:
+                payload = account_change_payload(toggled, "disabled" if disable else "enabled")
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
