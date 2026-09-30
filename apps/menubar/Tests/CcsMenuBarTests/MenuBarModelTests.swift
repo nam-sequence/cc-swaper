@@ -459,6 +459,20 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertNil(model.accountChangeNotice)
     }
 
+    /// AuthenticationServices ends the private window's session on one of its
+    /// own queues, also when the window is closed after ccshift added the
+    /// account. A main-actor completion handler trapped there and quit the app.
+    func testThePrivateWindowsCompletionHandlerCanBeCalledFromAnyQueue() async {
+        let ended = expectation(description: "the session's end reaches the main actor")
+        // Made on the main actor and called from another queue, like the real one.
+        nonisolated(unsafe) let completion = SystemSignInWindowPresenter.completionHandler {
+            XCTAssertTrue(Thread.isMainThread)
+            ended.fulfill()
+        }
+        DispatchQueue.global(qos: .userInitiated).async { completion(nil, nil) }
+        await fulfillment(of: [ended], timeout: 2)
+    }
+
     func testAHandedOffAddressOutsideClaudeIsNotOpened() async throws {
         let presenter = FakeSignInPresenter()
         let model = MenuBarModel(

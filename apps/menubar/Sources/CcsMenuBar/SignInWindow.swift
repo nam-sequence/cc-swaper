@@ -49,13 +49,15 @@ final class SystemSignInWindowPresenter: NSObject, SignInWindowPresenting,
         dismiss()
         // No callback scheme: Claude Code's own localhost listener receives the
         // redirect, and the window is closed when `ccshift add --login` ends.
-        let session = ASWebAuthenticationSession(url: url, callbackURLScheme: nil) { [weak self] _, _ in
-            Task { @MainActor in
+        let session = ASWebAuthenticationSession(
+            url: url,
+            callbackURLScheme: nil,
+            completionHandler: Self.completionHandler { [weak self] in
                 guard let self, self.session != nil else { return }  // dismissed by ccshift
                 self.session = nil
                 onClose()
             }
-        }
+        )
         session.prefersEphemeralWebBrowserSession = true
         session.presentationContextProvider = self
         self.session = session
@@ -70,6 +72,19 @@ final class SystemSignInWindowPresenter: NSObject, SignInWindowPresenting,
         guard let session else { return }
         self.session = nil
         session.cancel()
+    }
+
+    /// AuthenticationServices calls the completion handler on its own XPC
+    /// queue, also when `dismiss()` closes the window after ccshift has added
+    /// the account. A closure written inside this main-actor class would be
+    /// main-actor isolated, and Swift stops the app when one runs off the main
+    /// thread; this one is nonisolated and only hops to the main actor.
+    nonisolated static func completionHandler(
+        _ ended: @escaping @MainActor @Sendable () -> Void
+    ) -> ASWebAuthenticationSession.CompletionHandler {
+        { _, _ in
+            Task { @MainActor in ended() }
+        }
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
