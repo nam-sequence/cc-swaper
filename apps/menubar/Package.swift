@@ -2,13 +2,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "CcsMenuBar",
+    name: "CcshiftMenuBar",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "CcsMenuBar", targets: ["CcsMenuBar"]),
+        .executable(name: "CcshiftMenuBar", targets: ["CcshiftMenuBar"]),
     ],
     targets: [
-        .executableTarget(name: "CcsMenuBar"),
-        .testTarget(name: "CcsMenuBarTests", dependencies: ["CcsMenuBar"]),
+        .executableTarget(name: "CcshiftMenuBar"),
+        .testTarget(name: "CcshiftMenuBarTests", dependencies: ["CcshiftMenuBar"]),
     ]
 )

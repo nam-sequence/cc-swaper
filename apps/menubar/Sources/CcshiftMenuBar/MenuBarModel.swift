@@ -57,7 +57,7 @@ final class MenuBarModel: ObservableObject {
     private var updateCheckTask: Task<Void, Never>?
     static let updateCheckInterval: TimeInterval = 24 * 60 * 60
     private let autoSwitchInterval: TimeInterval
-    private var client: CSwapClient?
+    private var client: CcshiftClient?
     private var refreshGeneration = 0
     private var autoSwitchTask: Task<Void, Never>?
     private var autoSwitchCancellation: ProcessCancellation?
@@ -80,15 +80,15 @@ final class MenuBarModel: ObservableObject {
         self.releaseFetcher = releaseFetcher ?? GitHubReleaseFetcher()
         self.updateNotifier = updateNotifier
         self.appVersion = appVersion
-        self.autoCheckForUpdates = defaults.object(forKey: "ccsAutoCheckForUpdates") as? Bool ?? true
-        self.skippedUpdateVersion = defaults.string(forKey: "ccsSkippedUpdateVersion")
-        self.lastUpdateCheck = defaults.object(forKey: "ccsLastUpdateCheck") as? Date
+        self.autoCheckForUpdates = defaults.object(forKey: "ccshiftAutoCheckForUpdates") as? Bool ?? true
+        self.skippedUpdateVersion = defaults.string(forKey: "ccshiftSkippedUpdateVersion")
+        self.lastUpdateCheck = defaults.object(forKey: "ccshiftLastUpdateCheck") as? Date
         self.launchAtLoginManager = launchAtLoginManager ?? SystemLaunchAtLoginManager()
         self.signInPresenter = signInPresenter ?? SystemSignInWindowPresenter()
         self.autoSwitchInterval = max(0.1, autoSwitchInterval)
-        self.autoSwitchEnabled = defaults.object(forKey: "ccsAutoSwitchEnabled") as? Bool ?? false
-        self.autoSwitchThreshold = defaults.object(forKey: "ccsAutoSwitchThreshold") as? Double ?? 90
-        self.autoSwitchDryRun = defaults.object(forKey: "ccsAutoSwitchDryRun") as? Bool ?? false
+        self.autoSwitchEnabled = defaults.object(forKey: "ccshiftAutoSwitchEnabled") as? Bool ?? false
+        self.autoSwitchThreshold = defaults.object(forKey: "ccshiftAutoSwitchThreshold") as? Double ?? 90
+        self.autoSwitchDryRun = defaults.object(forKey: "ccshiftAutoSwitchDryRun") as? Bool ?? false
         self.launchAtLoginStatus = self.launchAtLoginManager.status()
         configure(executableURL: executableURL)
         if autoSwitchEnabled {
@@ -144,7 +144,7 @@ final class MenuBarModel: ObservableObject {
 
     func configure(executableURL: URL?) {
         if let executableURL,
-           let client = try? CSwapClient(executableURL: executableURL) {
+           let client = try? CcshiftClient(executableURL: executableURL) {
             self.client = client
             self.executablePath = client.executableURL.path
         } else {
@@ -164,7 +164,7 @@ final class MenuBarModel: ObservableObject {
         panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory())
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let valid = CLIResolver.validExecutable(url.path),
-              let newClient = try? CSwapClient(executableURL: valid) else {
+              let newClient = try? CcshiftClient(executableURL: valid) else {
             alertMessage = CLIError.invalidExecutablePath.localizedDescription
             return
         }
@@ -500,9 +500,11 @@ final class MenuBarModel: ObservableObject {
 
     // MARK: Updates
 
-    /// The app's model, with automatic update checks. Tests and previews build
-    /// the model directly, so they never reach GitHub.
+    /// The app's model, with the settings saved under the app's old name and
+    /// automatic update checks. Tests and previews build the model directly,
+    /// so they never read those settings or reach GitHub.
     static func makeForApp() -> MenuBarModel {
+        LegacySettings.importOnce()
         SystemUpdateNotifier.shared.install()
         let model = MenuBarModel(updateNotifier: SystemUpdateNotifier.shared)
         model.startAutomaticUpdateChecks()
@@ -554,10 +556,10 @@ final class MenuBarModel: ObservableObject {
             availableUpdate = update
             let now = Date()
             lastUpdateCheck = now
-            defaults.set(now, forKey: "ccsLastUpdateCheck")
+            defaults.set(now, forKey: "ccshiftLastUpdateCheck")
             if let update, update.version != skippedUpdateVersion,
-               defaults.string(forKey: "ccsNotifiedUpdateVersion") != update.version {
-                defaults.set(update.version, forKey: "ccsNotifiedUpdateVersion")
+               defaults.string(forKey: "ccshiftNotifiedUpdateVersion") != update.version {
+                defaults.set(update.version, forKey: "ccshiftNotifiedUpdateVersion")
                 if !userInitiated { updateNotifier?.notify(update) }
             }
         } catch {
@@ -568,13 +570,13 @@ final class MenuBarModel: ObservableObject {
 
     func setAutoCheckForUpdates(_ enabled: Bool) {
         autoCheckForUpdates = enabled
-        defaults.set(enabled, forKey: "ccsAutoCheckForUpdates")
+        defaults.set(enabled, forKey: "ccshiftAutoCheckForUpdates")
     }
 
     func skipAvailableUpdate() {
         guard let availableUpdate else { return }
         skippedUpdateVersion = availableUpdate.version
-        defaults.set(availableUpdate.version, forKey: "ccsSkippedUpdateVersion")
+        defaults.set(availableUpdate.version, forKey: "ccshiftSkippedUpdateVersion")
     }
 
     func downloadUpdate() {
@@ -599,7 +601,7 @@ final class MenuBarModel: ObservableObject {
     func setAutoSwitchEnabled(_ enabled: Bool) {
         guard autoSwitchEnabled != enabled else { return }
         autoSwitchEnabled = enabled
-        defaults.set(enabled, forKey: "ccsAutoSwitchEnabled")
+        defaults.set(enabled, forKey: "ccshiftAutoSwitchEnabled")
         if enabled {
             startAutoSwitchLoop()
         } else {
@@ -610,12 +612,12 @@ final class MenuBarModel: ObservableObject {
     func setAutoSwitchThreshold(_ threshold: Double) {
         let bounded = min(max(threshold, 50), 99.9)
         autoSwitchThreshold = bounded
-        defaults.set(bounded, forKey: "ccsAutoSwitchThreshold")
+        defaults.set(bounded, forKey: "ccshiftAutoSwitchThreshold")
     }
 
     func setAutoSwitchDryRun(_ dryRun: Bool) {
         autoSwitchDryRun = dryRun
-        defaults.set(dryRun, forKey: "ccsAutoSwitchDryRun")
+        defaults.set(dryRun, forKey: "ccshiftAutoSwitchDryRun")
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) {

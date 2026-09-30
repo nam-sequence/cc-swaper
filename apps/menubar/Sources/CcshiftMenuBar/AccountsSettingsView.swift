@@ -208,7 +208,7 @@ struct AddAccountSheet: View {
     @State private var alias = ""
     @State private var useSSO = false
     @State private var browsers: PrivateBrowsers
-    @AppStorage("ccsSignInOpener") private var storedOpener = SignInOpener.privateWindow.storageValue
+    @AppStorage("ccshiftSignInOpener") private var storedOpener = SignInOpener.privateWindow.storageValue
 
     init(model: MenuBarModel, method: Method = .signIn, browsers: PrivateBrowsers = .detect()) {
         self.model = model

@@ -74,7 +74,7 @@ struct ReleaseInfo: Decodable, Equatable, Sendable {
     /// An update when this release is newer than `installed`.
     func update(over installed: String) -> AvailableUpdate? {
         guard !draft, !prerelease, AppVersion.isNewer(tagName, than: installed) else { return nil }
-        let zip = assets.first { $0.name.hasPrefix("CcsMenuBar-") && $0.name.hasSuffix("-macos.zip") }
+        let zip = assets.first { $0.name.hasPrefix("ccshift-") && $0.name.hasSuffix("-macos.zip") }
         return AvailableUpdate(
             version: AppVersion.components(tagName).map(String.init).joined(separator: "."),
             releaseURL: htmlURL,

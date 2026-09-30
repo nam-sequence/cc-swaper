@@ -1,12 +1,12 @@
 import Darwin
 import Foundation
 import XCTest
-@testable import CcsMenuBar
+@testable import CcshiftMenuBar
 
-final class CSwapClientTests: XCTestCase {
+final class CcshiftClientTests: XCTestCase {
     func testDashboardAndSwitchSupportUnmanagedSourceAndAlreadyActiveNoOp() throws {
         let executable = try fakeCLI(engineScript)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
 
         let dashboard = try client.dashboard()
         XCTAssertEqual(dashboard.activeAccountNumber, 1)
@@ -34,7 +34,7 @@ final class CSwapClientTests: XCTestCase {
         printf '%s\\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"No accounts are managed yet"}}'
         exit 1
         """)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
 
         XCTAssertThrowsError(try client.dashboard()) { error in
             XCTAssertEqual(error as? CLIError, .commandRejected("No accounts are managed yet"))
@@ -47,7 +47,7 @@ final class CSwapClientTests: XCTestCase {
         #!/bin/sh
         printf '%s\\n' '{"schemaVersion":9,"accounts":[]}'
         """)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
 
         XCTAssertThrowsError(try client.dashboard()) { error in
             XCTAssertEqual(error as? CLIError, .unsupportedSchema(9))
@@ -66,7 +66,7 @@ final class CSwapClientTests: XCTestCase {
         wait "$child"
         """#
         let executable = try fakeCLI(script, replacements: ["__PROCESS_GROUP_FILE__": groupPath.path])
-        let client = try CSwapClient(executableURL: executable, timeout: 0.5)
+        let client = try CcshiftClient(executableURL: executable, timeout: 0.5)
 
         let started = Date()
         XCTAssertThrowsError(try client.dashboard()) { error in
@@ -84,7 +84,7 @@ final class CSwapClientTests: XCTestCase {
         let second = try fakeCLI(switchReply(2))
         let launcher = folder.appendingPathComponent("ccshift")
         try FileManager.default.createSymbolicLink(at: launcher, withDestinationURL: first)
-        let client = try CSwapClient(executableURL: launcher)
+        let client = try CcshiftClient(executableURL: launcher)
 
         let stableLauncher = launcher.deletingLastPathComponent()
             .resolvingSymlinksInPath()
@@ -114,7 +114,7 @@ final class CSwapClientTests: XCTestCase {
             attributes: [.posixPermissions: 0o777]
         )
         let pathCandidate = try writeFakeExecutable(at: unsafeBin.appendingPathComponent("ccshift"), permissions: 0o700)
-        let defaults = UserDefaults(suiteName: "ccs-menubar-resolver-\(UUID().uuidString)")!
+        let defaults = UserDefaults(suiteName: "ccshift-menubar-resolver-\(UUID().uuidString)")!
         let resolved = CLIResolver.executable(
             environment: ["PATH": unsafeBin.path],
             defaults: defaults,
@@ -208,7 +208,7 @@ final class CSwapClientTests: XCTestCase {
             throw XCTSkip("No root-owned sticky /private/tmp directory is available.")
         }
 
-        let child = stickyDirectory.appendingPathComponent("ccs-menubar-sticky-test-\(UUID().uuidString)", isDirectory: true)
+        let child = stickyDirectory.appendingPathComponent("ccshift-menubar-sticky-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: child,
             withIntermediateDirectories: false,
@@ -220,13 +220,13 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testDefaultTimeoutCoversAFullUpstreamUsageFetch() throws {
-        let client = try CSwapClient(executableURL: fakeCLI(engineScript))
+        let client = try CcshiftClient(executableURL: fakeCLI(engineScript))
         XCTAssertGreaterThanOrEqual(client.timeout, 45)
     }
 
     func testAutoSwitchOnceParsesJSONLinesAndExitCodes() throws {
         let executable = try fakeCLI(autoScript)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
         let outcome = try client.autoSwitchOnce(threshold: 84, dryRun: true, cancellation: ProcessCancellation())
         XCTAssertEqual(outcome.eventKind, "switch")
         XCTAssertTrue(outcome.dryRun)
@@ -266,7 +266,7 @@ final class CSwapClientTests: XCTestCase {
         printf '%s\n' '{"schemaVersion":1,"event":"no-switch","ts":"2026-09-29T00:00:00Z","reason":"active-api-key","detail":"API-key accounts have no quota to watch"}'
         exit 2
         """#)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
         let outcome = try client.autoSwitchOnce(threshold: 90, dryRun: false, cancellation: ProcessCancellation())
         XCTAssertEqual(outcome.eventKind, "no-switch")
         XCTAssertEqual(outcome.summary, "active-api-key: API-key accounts have no quota to watch.")
@@ -278,7 +278,7 @@ final class CSwapClientTests: XCTestCase {
         printf '%s\n' 'ccshift: error: unrecognized arguments: accounts' >&2
         exit 2
         """#)
-        let client = try CSwapClient(executableURL: executable)
+        let client = try CcshiftClient(executableURL: executable)
         XCTAssertThrowsError(
             try client.autoSwitchOnce(threshold: 90, dryRun: false, cancellation: ProcessCancellation())
         ) { error in
@@ -300,7 +300,7 @@ final class CSwapClientTests: XCTestCase {
           remove) printf '%s\n' '{"schemaVersion":1,"action":"removed","account":{"number":2,"email":"b@example.test"},"wasActive":true}' ;;
         esac
         """#
-        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+        let client = try CcshiftClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
 
         let login = try XCTUnwrap(client.currentLogin())
         XCTAssertEqual(login.email, "new@example.test")
@@ -335,7 +335,7 @@ final class CSwapClientTests: XCTestCase {
           remove) printf '%s\n' '{"schemaVersion":1,"action":"removed","account":{"number":2,"email":"same@example.test"},"wasActive":false}' ;;
         esac
         """#
-        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+        let client = try CcshiftClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
 
         _ = try client.removeAccount(account(2, "same@example.test", organization: "B"), emailIsShared: true)
         // Slot 2 now holds a different organization's account: nothing is removed.
@@ -349,7 +349,7 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testOtherUsageErrorsAreNotMistakenForAnOldCcshift() throws {
-        let client = try CSwapClient(executableURL: fakeCLI("""
+        let client = try CcshiftClient(executableURL: fakeCLI("""
         #!/bin/sh
         echo "ccshift: error: argument --alias: expected one argument" >&2
         exit 2
@@ -378,7 +378,7 @@ final class CSwapClientTests: XCTestCase {
           enable) printf '%s\n' '{"schemaVersion":1,"action":"enabled","account":{"number":2,"email":"b@example.test"},"changed":false,"rotationEmpty":false}' ;;
         esac
         """#
-        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+        let client = try CcshiftClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
 
         let disabled = try client.setAccountDisabled(account(2, "b@example.test"), disabled: true, emailIsShared: false)
         XCTAssertEqual(disabled.action, "disabled")
@@ -391,7 +391,7 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testOlderCcshiftWithoutEnableDisableJSONAsksForAnUpgrade() throws {
-        let client = try CSwapClient(executableURL: fakeCLI("""
+        let client = try CcshiftClient(executableURL: fakeCLI("""
         #!/bin/sh
         echo "ccshift: error: --json can only be used with 'list', 'status', 'switch', 'add' or 'remove'" >&2
         exit 2
@@ -409,7 +409,7 @@ final class CSwapClientTests: XCTestCase {
         printf '%s\n' "$*" >> '__ARGS__'
         printf '%s\n' '{"schemaVersion":1,"action":"refreshed","account":{"number":1,"email":"a@example.test"}}'
         """#
-        let client = try CSwapClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
+        let client = try CcshiftClient(executableURL: fakeCLI(script, replacements: ["__ARGS__": argsPath.path]))
 
         let report = try client.signInAndAddAccount(
             email: "a@example.test", sso: true, alias: "work", cancellation: ProcessCancellation()
@@ -429,7 +429,7 @@ final class CSwapClientTests: XCTestCase {
             "add --login --json --handoff-file=/tmp/ccshift-signin/url",
             "add --login --json --private --browser=com.google.Chrome",
         ])
-        XCTAssertGreaterThanOrEqual(CSwapClient.signInTimeout, 15 * 60)
+        XCTAssertGreaterThanOrEqual(CcshiftClient.signInTimeout, 15 * 60)
     }
 
     func testOnlyClaudeSignInPagesAreOpenedFromAHandoff() {
@@ -448,7 +448,7 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testSignedOutClaudeCodeIsReportedAsNoLogin() throws {
-        let client = try CSwapClient(executableURL: fakeCLI("""
+        let client = try CcshiftClient(executableURL: fakeCLI("""
         #!/bin/sh
         printf '%s\n' '{"schemaVersion":1,"active":null}'
         """))
@@ -456,7 +456,7 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testOlderCcshiftWithoutAccountJSONAsksForAnUpgrade() throws {
-        let client = try CSwapClient(executableURL: fakeCLI("""
+        let client = try CcshiftClient(executableURL: fakeCLI("""
         #!/bin/sh
         echo "ccshift: error: --json can only be used with 'list', 'status', or 'switch'" >&2
         exit 2
@@ -470,7 +470,7 @@ final class CSwapClientTests: XCTestCase {
     }
 
     func testAccountCommandErrorEnvelopeSurfacesTheReason() throws {
-        let client = try CSwapClient(executableURL: fakeCLI("""
+        let client = try CcshiftClient(executableURL: fakeCLI("""
         #!/bin/sh
         printf '%s\n' '{"schemaVersion":1,"error":{"type":"ConfigError","message":"No active Claude account found. Please log in first."}}'
         exit 1
@@ -512,7 +512,7 @@ final class CSwapClientTests: XCTestCase {
 
     private func tempFolder() throws -> URL {
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ccs-menubar-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ccshift-menubar-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: folder,
             withIntermediateDirectories: false,

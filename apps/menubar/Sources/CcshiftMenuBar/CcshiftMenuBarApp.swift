@@ -8,7 +8,7 @@ private final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate 
 }
 
 @main
-struct CcsMenuBarApp: App {
+struct CcshiftMenuBarApp: App {
     @NSApplicationDelegateAdaptor(MenuBarApplicationDelegate.self) private var delegate
     @StateObject private var model = MenuBarModel.makeForApp()
 

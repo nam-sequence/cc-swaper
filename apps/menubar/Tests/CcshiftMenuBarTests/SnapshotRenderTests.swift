@@ -1,12 +1,12 @@
 import AppKit
 import SwiftUI
 import XCTest
-@testable import CcsMenuBar
+@testable import CcshiftMenuBar
 
 /// Renders the popover and Settings panes to PNGs so the design can be
-/// reviewed without launching the app. Skipped unless `CCS_SNAPSHOT_DIR` is set:
+/// reviewed without launching the app. Skipped unless `CCSHIFT_SNAPSHOT_DIR` is set:
 ///
-///     CCS_SNAPSHOT_DIR=/tmp/snaps swift test --filter SnapshotRenderTests
+///     CCSHIFT_SNAPSHOT_DIR=/tmp/snaps swift test --filter SnapshotRenderTests
 ///
 /// Views are hosted in an offscreen borderless window with a forced light or
 /// dark appearance and drawn with `cacheDisplay`, which (unlike `ImageRenderer`)
@@ -34,8 +34,8 @@ final class SnapshotRenderTests: XCTestCase {
     private var outputDirectory: URL!
 
     override func setUp() async throws {
-        guard let path = ProcessInfo.processInfo.environment["CCS_SNAPSHOT_DIR"], !path.isEmpty else {
-            throw XCTSkip("Set CCS_SNAPSHOT_DIR to render UI snapshots.")
+        guard let path = ProcessInfo.processInfo.environment["CCSHIFT_SNAPSHOT_DIR"], !path.isEmpty else {
+            throw XCTSkip("Set CCSHIFT_SNAPSHOT_DIR to render UI snapshots.")
         }
         outputDirectory = URL(fileURLWithPath: path, isDirectory: true)
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)

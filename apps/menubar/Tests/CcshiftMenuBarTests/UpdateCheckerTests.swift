@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import CcsMenuBar
+@testable import CcshiftMenuBar
 
 final class UpdateCheckerTests: XCTestCase {
     func testVersionsCompareNumericallyIgnoringTheTagPrefix() {
@@ -24,7 +24,7 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertEqual(update.releaseURL.absoluteString, "https://github.com/nam-sequence/ccshift/releases/tag/v1.2.0")
         XCTAssertEqual(
             update.downloadURL?.absoluteString,
-            "https://github.com/nam-sequence/ccshift/releases/download/v1.2.0/CcsMenuBar-1.2.0-macos.zip"
+            "https://github.com/nam-sequence/ccshift/releases/download/v1.2.0/ccshift-1.2.0-macos.zip"
         )
         XCTAssertNil(release.update(over: "1.2.0"))
         XCTAssertNil(release.update(over: "1.3.0"))
@@ -44,7 +44,7 @@ final class UpdateCheckerTests: XCTestCase {
       "prerelease": false,
       "assets": [
         {"name": "ccshift-1.2.0-py3-none-any.whl", "browser_download_url": "https://github.com/nam-sequence/ccshift/releases/download/v1.2.0/ccshift-1.2.0-py3-none-any.whl"},
-        {"name": "CcsMenuBar-1.2.0-macos.zip", "browser_download_url": "https://github.com/nam-sequence/ccshift/releases/download/v1.2.0/CcsMenuBar-1.2.0-macos.zip"}
+        {"name": "ccshift-1.2.0-macos.zip", "browser_download_url": "https://github.com/nam-sequence/ccshift/releases/download/v1.2.0/ccshift-1.2.0-macos.zip"}
       ]
     }
     """
@@ -92,7 +92,7 @@ final class UpdateReminderTests: XCTestCase {
 
     func testAnOlderCommandLineToolIsPointedOut() async throws {
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ccs-update-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ccshift-update-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
         let executable = folder.appendingPathComponent("ccshift")
@@ -120,7 +120,7 @@ final class UpdateReminderTests: XCTestCase {
         appVersion: String = "1.1.0",
         executableURL: URL? = nil
     ) -> MenuBarModel {
-        let suite = "ccs-update-tests.\(UUID().uuidString)"
+        let suite = "ccshift-update-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return MenuBarModel(
