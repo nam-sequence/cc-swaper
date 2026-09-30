@@ -18,7 +18,7 @@ private final class LockedBuffer: @unchecked Sendable {
     }
 }
 
-struct CSwapClient: Sendable {
+struct CcshiftClient: Sendable {
     let executableURL: URL
     var timeout: TimeInterval = 55
 
@@ -514,7 +514,7 @@ enum CLIResolver {
            let url = validExecutable(configured) {
             return url
         }
-        if let bundled = info["CSwapExecutablePath"] as? String,
+        if let bundled = info["CcshiftExecutablePath"] as? String,
            let url = validExecutable(bundled) {
             return url
         }

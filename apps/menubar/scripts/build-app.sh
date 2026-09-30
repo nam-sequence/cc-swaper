@@ -4,9 +4,9 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 package_dir="$(cd "$script_dir/.." && pwd -P)"
 project_dir="$(cd "$script_dir/../../.." && pwd -P)"
-requested_output="${CC_SWAPER_APP_OUTPUT:-$package_dir/dist/CcsMenuBar.app}"
-if [[ "$requested_output" != /* || "$(basename "$requested_output")" != "CcsMenuBar.app" ]]; then
-  printf 'CC_SWAPER_APP_OUTPUT must be an absolute path ending in CcsMenuBar.app.\n' >&2
+requested_output="${CCSHIFT_APP_OUTPUT:-$package_dir/dist/ccshift.app}"
+if [[ "$requested_output" != /* || "$(basename "$requested_output")" != "ccshift.app" ]]; then
+  printf 'CCSHIFT_APP_OUTPUT must be an absolute path ending in ccshift.app.\n' >&2
   exit 1
 fi
 output_parent="$(dirname "$requested_output")"
@@ -16,16 +16,16 @@ if [[ -L "$output_parent" ]]; then
 fi
 mkdir -p "$output_parent"
 dist_dir="$(cd "$output_parent" && pwd -P)"
-app_path="$dist_dir/CcsMenuBar.app"
+app_path="$dist_dir/ccshift.app"
 build_path=""
 staging=""
-bundle_id="com.namsequence.ccswaper.menubar"
-app_version="${CC_SWAPER_APP_VERSION:-$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$project_dir/pyproject.toml" | head -n 1)}"
+bundle_id="com.namsequence.ccshift.menubar"
+app_version="${CCSHIFT_APP_VERSION:-$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$project_dir/pyproject.toml" | head -n 1)}"
 if [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  printf 'CC_SWAPER_APP_VERSION must use MAJOR.MINOR.PATCH.\n' >&2
+  printf 'CCSHIFT_APP_VERSION must use MAJOR.MINOR.PATCH.\n' >&2
   exit 1
 fi
-build_path="$(mktemp -d "${TMPDIR:-/tmp}/ccs-menubar-build.XXXXXX")"
+build_path="$(mktemp -d "${TMPDIR:-/tmp}/ccshift-menubar-build.XXXXXX")"
 
 cleanup() {
   if [[ -n "$staging" && -d "$staging" ]]; then rm -rf "$staging"; fi
@@ -46,13 +46,13 @@ if [[ -e "$app_path" ]]; then
 fi
 
 trap cleanup EXIT
-swift build --configuration release --product CcsMenuBar \
+swift build --configuration release --product CcshiftMenuBar \
   --package-path "$package_dir" --build-path "$build_path"
 
-staging=$(mktemp -d "$dist_dir/.CcsMenuBar.app.XXXXXX")
+staging=$(mktemp -d "$dist_dir/.ccshift.app.XXXXXX")
 mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
-cp "$build_path/release/CcsMenuBar" "$staging/Contents/MacOS/CcsMenuBar"
-chmod 755 "$staging/Contents/MacOS/CcsMenuBar"
+cp "$build_path/release/CcshiftMenuBar" "$staging/Contents/MacOS/ccshift"
+chmod 755 "$staging/Contents/MacOS/ccshift"
 
 # The Icon Composer icon compiles to Assets.car (Liquid Glass on macOS 26) plus
 # an AppIcon.icns fallback for macOS 14 and 15. actool ships with Xcode only;
@@ -76,9 +76,9 @@ cat > "$staging/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>CcsMenuBar</string>
+  <key>CFBundleExecutable</key><string>ccshift</string>
   ${icon_plist_keys}
-  <key>CFBundleIdentifier</key><string>com.namsequence.ccswaper.menubar</string>
+  <key>CFBundleIdentifier</key><string>${bundle_id}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>ccshift</string>
   <key>CFBundleDisplayName</key><string>ccshift</string>

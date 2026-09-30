@@ -183,7 +183,7 @@ struct UpdatesSection: View {
                         .foregroundStyle(.orange)
                 }
             } else if model.availableUpdate != nil {
-                Text("Unzip the download and replace CcsMenuBar.app in Applications with it.")
+                Text("Unzip the download and replace ccshift.app in Applications with it.")
             } else if let lastCheck = model.lastUpdateCheck {
                 Text("Last checked \(lastCheck.formatted(date: .abbreviated, time: .shortened)).")
             }

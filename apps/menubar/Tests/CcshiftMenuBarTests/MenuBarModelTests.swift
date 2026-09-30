@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import CcsMenuBar
+@testable import CcshiftMenuBar
 
 @MainActor
 final class MenuBarModelTests: XCTestCase {
@@ -40,6 +40,42 @@ final class MenuBarModelTests: XCTestCase {
         model.setLaunchAtLoginEnabled(true)
         XCTAssertFalse(model.launchAtLoginRequested)
         XCTAssertTrue(model.launchAtLoginError?.contains("System Settings") == true)
+    }
+
+    func testSettingsSavedUnderTheOldAppNameAreCarriedOverOnce() {
+        let defaults = isolatedDefaults()
+        defaults.set(false, forKey: "ccshiftAutoCheckForUpdates")
+        let lastCheck = Date(timeIntervalSince1970: 1_790_000_000)
+        LegacySettings.importOnce(into: defaults, from: [
+            "ccsAutoSwitchEnabled": true,
+            "ccsAutoSwitchThreshold": 95.0,
+            "ccsAutoSwitchDryRun": true,
+            "ccsAutoCheckForUpdates": true,
+            "ccsLastUpdateCheck": lastCheck,
+            "ccsSkippedUpdateVersion": "1.1.0",
+            "ccsNotifiedUpdateVersion": "1.2.0",
+            "ccsSignInOpener": "default",
+            "ccshiftExecutablePath": "/opt/homebrew/bin/ccshift",
+            "NSWindow Frame com_apple_SwiftUI_Settings_window": "1320 731 480 215 0 0 2560 1410 ",
+        ])
+
+        let model = MenuBarModel(defaults: defaults, executableURL: nil, launchAtLoginManager: FakeLaunchAtLoginManager())
+        XCTAssertTrue(model.autoSwitchEnabled)
+        XCTAssertEqual(model.autoSwitchThreshold, 95)
+        XCTAssertTrue(model.autoSwitchDryRun)
+        XCTAssertFalse(model.autoCheckForUpdates, "a setting already made under the new name is kept")
+        XCTAssertEqual(model.lastUpdateCheck, lastCheck)
+        XCTAssertEqual(model.skippedUpdateVersion, "1.1.0")
+        XCTAssertEqual(defaults.string(forKey: "ccshiftNotifiedUpdateVersion"), "1.2.0")
+        XCTAssertEqual(defaults.string(forKey: "ccshiftSignInOpener"), "default")
+        XCTAssertEqual(defaults.string(forKey: "ccshiftExecutablePath"), "/opt/homebrew/bin/ccshift")
+        XCTAssertNotNil(defaults.string(forKey: "NSWindow Frame com_apple_SwiftUI_Settings_window"))
+        XCTAssertNil(defaults.object(forKey: "ccsAutoSwitchEnabled"))
+        model.setAutoSwitchEnabled(false)
+
+        // Once only: a later launch does not turn automatic switching back on.
+        LegacySettings.importOnce(into: defaults, from: ["ccsAutoSwitchEnabled": true])
+        XCTAssertFalse(defaults.bool(forKey: "ccshiftAutoSwitchEnabled"))
     }
 
     func testNeverRegisteredAppIsShownAsOffNotUnavailable() {
@@ -91,7 +127,7 @@ final class MenuBarModelTests: XCTestCase {
 
         model.setAutoSwitchEnabled(false)
         XCTAssertFalse(model.autoSwitchEnabled)
-        XCTAssertFalse(defaults.bool(forKey: "ccsAutoSwitchEnabled"))
+        XCTAssertFalse(defaults.bool(forKey: "ccshiftAutoSwitchEnabled"))
         let didStop = await waitUntil(timeout: 3) { !model.autoSwitchIsRunning }
         XCTAssertTrue(didStop)
     }
@@ -106,7 +142,7 @@ final class MenuBarModelTests: XCTestCase {
             "__AUTO_ARGS__": folder.appendingPathComponent("args").path,
         ])
         let defaults = isolatedDefaults()
-        defaults.set(true, forKey: "ccsAutoSwitchEnabled")
+        defaults.set(true, forKey: "ccshiftAutoSwitchEnabled")
         let model = MenuBarModel(
             defaults: defaults,
             executableURL: executable,
@@ -130,7 +166,7 @@ final class MenuBarModelTests: XCTestCase {
         fi
         """#, replacements: [:])
         let defaults = isolatedDefaults()
-        defaults.set(true, forKey: "ccsAutoSwitchEnabled")
+        defaults.set(true, forKey: "ccshiftAutoSwitchEnabled")
         let model = MenuBarModel(
             defaults: defaults,
             executableURL: executable,
@@ -192,7 +228,7 @@ final class MenuBarModelTests: XCTestCase {
         fi
         """#, replacements: ["__STAGE__": stage.path])
         let defaults = isolatedDefaults()
-        defaults.set(true, forKey: "ccsAutoSwitchEnabled")
+        defaults.set(true, forKey: "ccshiftAutoSwitchEnabled")
         let model = MenuBarModel(
             defaults: defaults,
             executableURL: executable,
@@ -373,6 +409,10 @@ final class MenuBarModelTests: XCTestCase {
         let failed = await waitUntil { model.accountChangeError == "Nope." && !model.isChangingAccounts }
         XCTAssertTrue(failed)
         XCTAssertEqual(model.alertMessage, "Nope.")
+        // Still there once the list has been read again.
+        let reread = await waitUntil { !model.isRefreshing }
+        XCTAssertTrue(reread)
+        XCTAssertEqual(model.alertMessage, "Nope.")
     }
 
     func testBrowserSignInAddsTheAccountWithoutTouchingTheBusyFlag() async throws {
@@ -459,6 +499,20 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertNil(model.accountChangeNotice)
     }
 
+    /// AuthenticationServices ends the private window's session on one of its
+    /// own queues, also when the window is closed after ccshift added the
+    /// account. A main-actor completion handler trapped there and quit the app.
+    func testThePrivateWindowsCompletionHandlerCanBeCalledFromAnyQueue() async {
+        let ended = expectation(description: "the session's end reaches the main actor")
+        // Made on the main actor and called from another queue, like the real one.
+        nonisolated(unsafe) let completion = SystemSignInWindowPresenter.completionHandler {
+            XCTAssertTrue(Thread.isMainThread)
+            ended.fulfill()
+        }
+        DispatchQueue.global(qos: .userInitiated).async { completion(nil, nil) }
+        await fulfillment(of: [ended], timeout: 2)
+    }
+
     func testAHandedOffAddressOutsideClaudeIsNotOpened() async throws {
         let presenter = FakeSignInPresenter()
         let model = MenuBarModel(
@@ -525,7 +579,7 @@ final class MenuBarModelTests: XCTestCase {
     }
 
     private func isolatedDefaults() -> UserDefaults {
-        let suite = "ccs-menubar-tests.\(UUID().uuidString)"
+        let suite = "ccshift-menubar-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return defaults
@@ -533,7 +587,7 @@ final class MenuBarModelTests: XCTestCase {
 
     private func makeFolder() throws -> URL {
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ccs-menubar-model-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ccshift-menubar-model-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: folder,
             withIntermediateDirectories: false,
@@ -549,7 +603,7 @@ final class MenuBarModelTests: XCTestCase {
         for (placeholder, value) in replacements {
             contents = contents.replacingOccurrences(of: placeholder, with: value)
         }
-        let executable = folder.appendingPathComponent("ccs-fake")
+        let executable = folder.appendingPathComponent("ccshift-fake")
         try Data(contents.utf8).write(to: executable, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         return executable

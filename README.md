@@ -279,8 +279,12 @@ account's 5-hour and 7-day usage, switches with a click, and can run
 ```bash
 swift test --package-path apps/menubar
 bash apps/menubar/scripts/build-app.sh
-ditto apps/menubar/dist/CcsMenuBar.app ~/Applications/CcsMenuBar.app
+ditto apps/menubar/dist/ccshift.app ~/Applications/ccshift.app
 ```
+
+Up to 1.2 the app was called `CcsMenuBar.app`. After installing `ccshift.app`,
+quit the old app and delete `~/Applications/CcsMenuBar.app`; the new app picks
+up its settings on first launch, but *Launch at login* has to be turned on again.
 
 Run only one automatic switcher at a time: the native app's auto-switch,
 `ccshift auto`, or the Python status item below.
@@ -441,7 +445,7 @@ uv tool uninstall ccshift
 ```
 
 For the native menu bar app, turn off *Launch at login* in its Settings, quit
-it, and delete `~/Applications/CcsMenuBar.app`.
+it, and delete `~/Applications/ccshift.app`.
 
 ## Requirements
 
