@@ -472,7 +472,8 @@ final class MenuBarModel: ObservableObject {
             case let .failure(message):
                 self.accountChangeError = message
                 self.alertMessage = message
-                self.refresh(keepingAlert: true)
+                // Still shown once the list is read again, like a failed switch.
+                self.refresh(afterSwitchWarning: message, keepingAlert: true)
             }
         }
     }

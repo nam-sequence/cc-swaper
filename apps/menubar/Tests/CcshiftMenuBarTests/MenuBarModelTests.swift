@@ -409,6 +409,10 @@ final class MenuBarModelTests: XCTestCase {
         let failed = await waitUntil { model.accountChangeError == "Nope." && !model.isChangingAccounts }
         XCTAssertTrue(failed)
         XCTAssertEqual(model.alertMessage, "Nope.")
+        // Still there once the list has been read again.
+        let reread = await waitUntil { !model.isRefreshing }
+        XCTAssertTrue(reread)
+        XCTAssertEqual(model.alertMessage, "Nope.")
     }
 
     func testBrowserSignInAddsTheAccountWithoutTouchingTheBusyFlag() async throws {
