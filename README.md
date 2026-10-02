@@ -236,6 +236,8 @@ ccshift auto                      # Auto-switch when nearing rate limits (see ab
 ccshift config                    # Show or edit settings (see Configuration below)
 ccshift list                      # Show all accounts with 5h/7d usage and reset times
 ccshift list --token-status       # Add source-labelled OAuth token diagnostics
+ccshift list --refresh            # Fetch every account's usage now, ignoring poll plans
+ccshift list --cached             # Read the local store only, never fetch (cheap to repeat)
 ccshift status                    # Show current account
 ccshift add --slot 3              # Add account to a specific slot (prompts before overwrite)
 ccshift add --alias dev           # Add account and give it a short alias

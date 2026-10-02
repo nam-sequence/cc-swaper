@@ -40,10 +40,26 @@ struct CcshiftClient: Sendable {
     /// no fetching, cheap enough to repaint a live view every few seconds, and
     /// it already carries the readings Claude Code feeds in from its status
     /// line. The plain form may fetch accounts whose poll is due.
-    func dashboard(cached: Bool = false) throws -> DashboardSnapshot {
-        let list: EngineAccountList = try decodeVersionOne(
-            run(arguments: cached ? ["list", "--json", "--cached"] : ["list", "--json"])
-        )
+    ///
+    /// `force` is the refresh button (`list --json --refresh`, ccshift 1.4.1 or
+    /// later): fetch every account now instead of only those whose poll is
+    /// due. A 429 backoff still holds an account back, and one measured in the
+    /// last few seconds is not fetched again.
+    func dashboard(cached: Bool = false, force: Bool = false) throws -> DashboardSnapshot {
+        var arguments = ["list", "--json"]
+        if cached {
+            arguments.append("--cached")
+        } else if force {
+            arguments.append("--refresh")
+        }
+        var result = try run(arguments: arguments)
+        // A tool without --refresh answers with a usage error (exit 2, nothing
+        // on stdout): do the ordinary refresh instead of failing the click.
+        if force, !cached, result.terminationStatus == 2,
+           result.standardError.contains("unrecognized arguments") {
+            result = try run(arguments: ["list", "--json"])
+        }
+        let list: EngineAccountList = try decodeVersionOne(result)
         let activeNumber = list.activeAccountNumber ?? list.accounts.first(where: \.active)?.number
         let accounts = list.accounts.map { row -> Account in
             var account = row.account

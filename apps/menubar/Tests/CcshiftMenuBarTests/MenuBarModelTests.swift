@@ -231,6 +231,35 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertNil(model.menuBarUsage)
     }
 
+    func testOnlyTheRefreshButtonForcesAFetch() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": callsPath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        func calls() -> [String] {
+            let text = (try? String(contentsOf: callsPath, encoding: .utf8)) ?? ""
+            return text.split(separator: "\n").map(String.init)
+        }
+
+        model.refresh()
+        let first = await waitUntil { calls().count == 1 && !model.isRefreshing }
+        XCTAssertTrue(first)
+        model.refresh(force: true)
+        let second = await waitUntil { calls().count == 2 && !model.isRefreshing }
+        XCTAssertTrue(second)
+        // Opening the menu is an ordinary refresh, never a forced one.
+        model.popoverVisibilityChanged(true)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(calls(), ["list --json", "list --json --refresh"])
+    }
+
     func testCachedReadsAreQuietAndNeverTouchTheSpinnerOrAlerts() async throws {
         let folder = try makeFolder()
         let callsPath = folder.appendingPathComponent("calls")
