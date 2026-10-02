@@ -138,6 +138,22 @@ ccshift auto --strategy consume-first   # burn the soonest-resetting account fir
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `ccshift config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `ccshift list` (e.g. a line reading `Fable: 100%`).
 
+#### Live usage from Claude Code (recommended)
+
+Polling the usage endpoint is budgeted, so a polled reading is minutes old — and after a 429 it can be over an hour old, which is how a busy account can run into its limit before ccshift notices. Claude Code already knows the live numbers (every API response carries them) and hands them to your status line. One command wires that in, plus a hook that switches the moment a session actually hits a limit:
+
+```bash
+ccshift hooks install      # wraps your statusLine command, adds a StopFailure hook (backs up settings.json)
+ccshift hooks status
+ccshift hooks uninstall    # restores your original statusLine command
+```
+
+- The status line keeps rendering exactly as before; ccshift only reads the `rate_limits` it is given. Each reading is matched to an account by its window reset times (never credited to "whichever is active", because a running session can still hold the account you just left), and a stale re-send from an idle session is ignored.
+- If you have no `statusLine` configured, only the hook is installed — adding a status line would take Claude Code's footer hints away. Add any one-line command and re-run `ccshift hooks install`.
+- With a live feed the active account is judged on a reading seconds old instead of minutes; the endpoint is still polled as the ground truth for usage the feed can't see (other clients, other machines).
+- Without it, an aging reading is advanced by the burn rate learned from the readings before it, and an active account stuck behind a 429 near its threshold is no longer trusted as frozen — it counts as unknown, which fails over to an account with fresh data.
+- The hook fires only for `rate_limit` stops, debounced across simultaneous agents, and ignores a report that arrives right after ccshift's own switch (it is about the account you just left).
+
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
 ```bash

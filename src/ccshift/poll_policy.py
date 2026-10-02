@@ -136,6 +136,12 @@ RECENT_429_WINDOW_S = 3600.0
 # shared state to configure.
 POST_429_BACKOFF_MULT = 1.5
 POST_429_MAX_INTERVAL_S = 1800.0
+# The ACTIVE account is the one being consumed, so a polled reading of it is
+# the one that goes wrong fastest: left on the wide ceiling above, a single
+# 429 slowed its cadence to half-hour polls for the best part of two hours
+# while agents burned it down. Its retreat is bounded tighter — still well
+# under the request budget (six requests/hour), still growing from the floor.
+ACTIVE_POST_429_MAX_INTERVAL_S = 600.0
 
 # The engine escalates to a full candidate refresh when the active account is
 # within this margin of the threshold (decision policy, but the urgent-mode
@@ -249,7 +255,10 @@ def plan_after_fetch(
         # contended token each retreat until their combined rate fits the
         # budget. Floored at POST_429_MIN_INTERVAL_S for the first 429.
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
-        interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
+        ceiling_429 = (
+            ACTIVE_POST_429_MAX_INTERVAL_S if is_active else POST_429_MAX_INTERVAL_S
+        )
+        interval = min(ceiling_429, max(interval, increased))
 
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:

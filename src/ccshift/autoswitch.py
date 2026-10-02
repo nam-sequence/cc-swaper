@@ -103,6 +103,21 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
+# A reading of the ACTIVE account that neither a poll nor a live feed has
+# renewed for this long, while the endpoint is refusing it (429, errors), is a
+# lower bound frozen at the moment the block began — not the account's state.
+# Past this age it stops counting as a measurement once it sits in the band
+# where an unseen burst can matter, so the unknown-usage failover takes over
+# instead of the engine sleeping through the limit on a number it still
+# "trusts". Outside the band the frozen reading is still the better evidence.
+ACTIVE_BLIND_S = 600.0
+
+# A rate-limit hook fires in the session that hit the wall, which may still be
+# holding the account we JUST left (Claude Code re-reads its credential on a
+# cache). Within this window of our own switch the signal is about the old
+# account and must not trigger another move.
+LIMIT_HIT_GRACE_S = 45.0
+
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
 # sooner than the account we are leaving. Five minutes is comfortably longer
@@ -647,6 +662,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        limit_hit: bool = False,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -662,6 +678,11 @@ class AutoSwitchEngine:
         switcher.set_poll_policy_inputs(settings.threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
+        # One-shot: a session just reported hitting its rate limit (Claude
+        # Code's StopFailure hook). The first tick treats the active account
+        # as exhausted without waiting for a reading to say so.
+        self._limit_hit = limit_hit
+        self._blind_warned = False
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
@@ -934,8 +955,27 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        limit_hit = self._limit_hit
+        self._limit_hit = False
+        if limit_hit:
+            last_switch = state.get("lastSwitchAt")
+            if (
+                isinstance(last_switch, (int, float))
+                and self.clock() - last_switch < LIMIT_HIT_GRACE_S
+            ):
+                self._emit(
+                    NoSwitchEvent(
+                        reason="limit-hit-grace",
+                        detail="the limit report predates the switch we just made",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current,
+            quarantined,
+            threshold=settings.threshold,
+            force_escalate=limit_hit,
         )
         self._emit(
             PollEvent(
@@ -971,6 +1011,12 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+
+        if limit_hit and self.switcher.account_kind_for(current) != "api_key":
+            # The session that hit the wall is better evidence than any
+            # reading we hold: the PollEvent above reports what was measured,
+            # the decision below runs on what just happened.
+            headroom = {**headroom, current: 0.0}
 
         active_headroom = headroom.get(current)
         if active_headroom is not None:
@@ -1958,6 +2004,7 @@ class AutoSwitchEngine:
         quarantined: set[str] = frozenset(),
         *,
         threshold: float | None = None,
+        force_escalate: bool = False,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -2013,8 +2060,8 @@ class AutoSwitchEngine:
         # carry their own bounded plan and become due normally.
         stale_candidate_plan = (
             active_pre is not None
-            and active_pre.age_s is not None
-            and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
+            and active_pre.poll_age_s is not None
+            and active_pre.poll_age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
@@ -2025,7 +2072,7 @@ class AutoSwitchEngine:
         )
         if (
             active_pre is None
-            or active_pre.age_s is None
+            or active_pre.poll_age_s is None
             or stale_candidate_plan
             or overslept_plan
             or (
@@ -2034,7 +2081,7 @@ class AutoSwitchEngine:
             )
             or (
                 active_pre.next_poll_at is None
-                and active_pre.age_s >= poll_policy.MIN_INTERVAL_S
+                and active_pre.poll_age_s >= poll_policy.MIN_INTERVAL_S
             )
         ):
             plan.add(current)
@@ -2049,18 +2096,24 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # decides on the same value even if apply_threshold() lands mid-tick.
+        if threshold is None:
+            threshold = self.settings.threshold
+        usage = self._blind_active_to_unknown(
+            current,
+            entries,
+            {num: entry.decision_value() for num, entry in entries.items()},
+            threshold,
+        )
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
-        # The caller's tick-snapshotted threshold, so one tick fetches and
-        # decides on the same value even if apply_threshold() lands mid-tick.
-        if threshold is None:
-            threshold = self.settings.threshold
         escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            force_escalate
+            or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
                 and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
@@ -2091,10 +2144,52 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._blind_active_to_unknown(
+                current,
+                entries,
+                {num: entry.decision_value() for num, entry in entries.items()},
+                threshold,
+            )
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _blind_active_to_unknown(
+        self,
+        current: str,
+        entries: dict,
+        usage: dict[str, dict | str | None],
+        threshold: float,
+    ) -> dict[str, dict | str | None]:
+        """Stop trusting a frozen reading of the active account (see
+        ``ACTIVE_BLIND_S``): unknown usage takes the failover path, which
+        escalates to fresh candidate data and moves after ``unhealthy_ticks``.
+        """
+        entry = entries.get(current)
+        value = usage.get(current)
+        pct = binding_pct(value, self._models) if isinstance(value, dict) else None
+        if (
+            entry is None
+            or pct is None
+            or entry.age_s is None
+            or entry.age_s <= ACTIVE_BLIND_S
+            or not (entry.last_error or entry.consecutive_failures)
+            or pct < threshold - ESCALATION_MARGIN_PCT
+        ):
+            self._blind_warned = False
+            return usage
+        if not self._blind_warned:
+            # Once per episode: the tick repeats every minute.
+            self._blind_warned = True
+            _logger.warning(
+                "Active account %s: no usable reading for %.0f min (%s) at "
+                "~%.0f%% - treating usage as unknown",
+                current,
+                entry.age_s / 60,
+                entry.last_error or "fetch failing",
+                pct,
+            )
+        return {**usage, current: None}
 
     def _perform(
         self,
