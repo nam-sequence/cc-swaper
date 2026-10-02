@@ -51,12 +51,12 @@ struct MenuBarView: View {
                     .help(model.activeSummary)
             }
             Spacer(minLength: 8)
-            Button(action: { model.refresh() }) {
+            Button(action: { model.refresh(force: true) }) {
                 CCRefreshGlyph(isRefreshing: model.isRefreshing)
             }
             .buttonStyle(CCCircleButtonStyle())
             .disabled(model.isRefreshing)
-            .help("Refresh account usage")
+            .help("Fetch every account's usage now")
             .accessibilityLabel("Refresh")
             .accessibilityValue(model.isRefreshing ? "Refreshing" : "")
         }

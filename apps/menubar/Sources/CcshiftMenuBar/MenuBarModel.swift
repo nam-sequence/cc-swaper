@@ -210,7 +210,10 @@ final class MenuBarModel: ObservableObject {
 
     /// `keepingAlert` is for background retries: the current error stays on
     /// screen until the retry finishes instead of flickering away.
-    func refresh(afterSwitchWarning: String? = nil, keepingAlert: Bool = false) {
+    /// `force` is the refresh button: fetch every account now. Everything else
+    /// (opening the menu, after a switch, retries) takes the ordinary refresh,
+    /// which fetches only what the poll plans say is due.
+    func refresh(afterSwitchWarning: String? = nil, keepingAlert: Bool = false, force: Bool = false) {
         launchAtLoginStatus = launchAtLoginManager.status()
         if launchAtLoginStatus == .enabled { launchAtLoginError = nil }
         guard let client else {
@@ -224,7 +227,7 @@ final class MenuBarModel: ObservableObject {
         if !keepingAlert { alertMessage = nil }
 
         Task { [weak self] in
-            let result = await Self.load { try client.dashboard() }
+            let result = await Self.load { try client.dashboard(force: force) }
             guard let self, self.refreshGeneration == generation else { return }
             switch result {
             case let .success(snapshot):

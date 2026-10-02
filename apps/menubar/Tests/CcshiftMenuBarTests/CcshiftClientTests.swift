@@ -43,6 +43,38 @@ final class CcshiftClientTests: XCTestCase {
         XCTAssertThrowsError(try client.dashboard(), "the plain form must not take the cached path")
     }
 
+    func testTheRefreshButtonAsksToFetchEverythingAndAnOlderToolStillAnswers() throws {
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccshift-args-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: log) }
+        let reply = #"{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"a@example.test","organizationName":"","alias":null,"active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":41},"sevenDay":{"pct":9}}}]}"#
+        let current = try fakeCLI("""
+        #!/bin/sh
+        printf '%s\\n' "$*" >> '\(log.path)'
+        printf '%s\\n' '\(reply)'
+        """)
+        _ = try CcshiftClient(executableURL: current).dashboard(force: true)
+        _ = try CcshiftClient(executableURL: current).dashboard()
+        XCTAssertEqual(
+            try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init),
+            ["list --json --refresh", "list --json"],
+            "only the button fetches everything"
+        )
+
+        // A tool from before --refresh rejects the flag as a usage error; the
+        // click then does the ordinary refresh instead of failing.
+        let older = try fakeCLI("""
+        #!/bin/sh
+        if [ "$3" = "--refresh" ]; then
+          echo 'ccshift: error: unrecognized arguments: --refresh' >&2
+          exit 2
+        fi
+        printf '%s\\n' '\(reply)'
+        """)
+        let snapshot = try CcshiftClient(executableURL: older).dashboard(force: true)
+        XCTAssertEqual(snapshot.accounts.first?.visibleUsage?.fiveHour?.pct, 41)
+    }
+
     func testNonzeroJSONErrorEnvelopeSurfacesTheUpstreamReason() throws {
         let executable = try fakeCLI("""
         #!/bin/sh

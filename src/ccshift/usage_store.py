@@ -60,6 +60,10 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # in flight. A crashed collector waiting 90s remains below the provider-safe
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
+# A forced refresh (the person pressed refresh) skips the poll plan but not a
+# reading this young: nothing a fetch returns would differ, and it keeps a
+# hammered button from spending the endpoint's request budget.
+FORCE_MIN_AGE_S = 15.0
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 
 
@@ -1075,6 +1079,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        force: bool = False,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1091,6 +1096,12 @@ class UsageStore:
           *and* poll-due (past ``nextPollAt``, or no plan yet). When
           ``repair_overslept`` is set, a structurally obsolete reset-parked
           plan is also due; that predicate is re-checked under this lock.
+        - ``force=True`` (a person pressed refresh): every account that passes
+          the checks above is fetched, whatever its plan or freshness — except
+          one measured within ``FORCE_MIN_AGE_S``, which is as current as a
+          fetch can make it, so a hammered button costs the endpoint nothing.
+          A failure backoff, a live lease, a hold and a dead token still win:
+          a Retry-After is never defeated, not even by a click.
         - ``respect_plans=False`` (the auto engine's deliberate schedule):
           poll-due *or* stale — a due entry may be re-fetched inside the
           serve TTL (that is how the bounded urgent cadence beats the TTL),
@@ -1114,7 +1125,7 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row, now, respect_plans, repair_overslept, force
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1427,7 +1438,11 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    force: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
@@ -1446,6 +1461,8 @@ def _row_eligible(
     ):
         return False
     fetched_at = _num_or_none(row.get("fetchedAt"))
+    if force:
+        return fetched_at is None or (now - fetched_at) > FORCE_MIN_AGE_S
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
     poll_due = next_poll_at is not None and now >= next_poll_at

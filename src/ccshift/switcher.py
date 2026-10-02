@@ -5037,8 +5037,13 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
+
+        ``force`` (a person pressed refresh) fetches every account regardless
+        of its poll plan; see :meth:`UsageStore.reserve` for what still holds
+        it back.
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
         strategies, dashboards) makes every account a candidate but respects
@@ -5106,6 +5111,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                force=force,
             )
         else:
             claims = store.reserve(
@@ -5614,8 +5620,12 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        force: bool = False,
     ) -> dict | None:
         """List all managed accounts.
+
+        ``force`` fetches every account now, ignoring poll plans (a backoff or
+        a dead token still holds one back).
 
         In ``json_output`` mode, returns the schema-v1 payload (printing nothing)
         for the CLI to serialize; otherwise prints the human view and returns None.
@@ -5638,7 +5648,7 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(accounts_info, fetch=fetch, force=force)
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)
