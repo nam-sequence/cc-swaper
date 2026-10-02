@@ -681,6 +681,14 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--limit-hit",
+        action="store_true",
+        help=(
+            "A session just reported hitting its rate limit (the StopFailure "
+            "hook): treat the active account as exhausted on the first tick"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -718,6 +726,7 @@ Defaults live in settings.json in the backup root; flags override them.
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            **({"limit_hit": True} if args.limit_hit else {}),
         )
 
         if args.once:
@@ -986,9 +995,17 @@ def _human_output_to_stderr(json_mode: bool):
 
 def main() -> None:
     """Main entry point for the CLI."""
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("statusline-feed", "limit-hit", "hooks"):
+        # Claude Code integration: runs inside a status line / hook, so it
+        # must stay quiet and fast — no theme probe (an OSC query on a
+        # terminal that is not ours), no TLS setup (nothing here uses the
+        # network).
+        from ccshift import claude_hooks
+
+        sys.exit(claude_hooks.dispatch(argv))
     force_utf8_output()
     _use_native_tls()
-    argv = sys.argv[1:]
     try:
         from ccshift.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1069,6 +1086,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s hooks [install|uninstall]  live usage feed + rate-limit hook for Claude Code
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts

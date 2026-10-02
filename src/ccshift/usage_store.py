@@ -36,7 +36,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ccshift.locking import FileLock
-from ccshift import oauth
+from ccshift import live_usage, oauth
 from ccshift.poll_policy import (
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
@@ -314,9 +314,41 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # Live (statusLine-fed) overlay, see ``live_usage``. ``last_good`` and
+    # ``age_s`` above already reflect it; these expose what they were made
+    # from. ``polled_good``/``polled_age_s`` are the endpoint's own reading and
+    # its age — the poll planner must compare *polled* readings with each
+    # other, and the engine's nomination of the active account must key on
+    # the poll's age, or a feed would hide a stale poll from both.
+    polled_good: dict | None = None
+    polled_age_s: float | None = None
+    # When a live reading last advanced this slot (None: never / not applied).
+    live_at: float | None = None
+    # Learned burn rate per window, ``{"five_hour": {"rate": %/s, "at": ts}}``.
+    burn: dict | None = None
+    # The store clock when this snapshot was taken, so ``decision_value``
+    # can project an aging reading without a clock of its own.
+    as_of: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
+
+    @property
+    def polled_usage(self) -> dict | None:
+        """The endpoint's own last reading, ignoring any live overlay — what
+        the poll planner compares consecutive polls of (see ``poll_age_s``)."""
+        return self.polled_good if self.as_of is not None else self.last_good
+
+    @property
+    def poll_age_s(self) -> float | None:
+        """Age of the endpoint's own reading, ignoring any live overlay.
+
+        What poll scheduling must key on: a feed that keeps ``age_s`` small
+        says nothing about whether the endpoint is being polled on schedule.
+        Entries built outside the store (no snapshot clock) have no overlay,
+        so ``age_s`` is already the poll's age.
+        """
+        return self.polled_age_s if self.as_of is not None else self.age_s
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
@@ -404,6 +436,14 @@ class UsageEntry:
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
+            # An aging reading is advanced by the burn rate learned from the
+            # readings before it: "frozen at 27% for 40 minutes" is a lower
+            # bound, not the account's state, and an account in heavy use
+            # does not stand still while its poll is blocked.
+            if self.as_of is not None:
+                return live_usage.project_usage(
+                    self.last_good, self.burn, self.age_s, self.as_of
+                )
             return self.last_good
         return None
 
@@ -908,7 +948,22 @@ class UsageStore:
             if not isinstance(fetched_at, (int, float)):
                 fetched_at = None
             last_good = row.get("lastGood")
+            polled_good = last_good if isinstance(last_good, dict) else None
             age_s = (now - fetched_at) if fetched_at is not None else None
+            polled_age_s = age_s
+            # Overlay the statusLine-fed windows on the polled reading. The
+            # merged reading is as old as its freshest component.
+            live = row.get("live")
+            live = live if isinstance(live, dict) else None
+            live_at = _num_or_none(live.get("changedAt")) if live else None
+            merged, used_live = live_usage.merge_live(polled_good, live)
+            if used_live and live_at is not None:
+                last_good = merged
+                newest = max(live_at, fetched_at if fetched_at is not None else live_at)
+                age_s = max(0.0, now - newest)
+            else:
+                live_at = None
+            burn = row.get("burn")
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
@@ -966,6 +1021,11 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                polled_good=polled_good,
+                polled_age_s=polled_age_s,
+                live_at=live_at,
+                burn=burn if isinstance(burn, dict) else None,
+                as_of=now,
             )
         return out
 
@@ -1101,6 +1161,21 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
+                # Learn the burn rate from the reading this one replaces,
+                # live overlay included: the pair the planner compares
+                # (polled vs polled) would miss what the feed already saw.
+                live = row.get("live") if isinstance(row.get("live"), dict) else None
+                prev_view, _ = live_usage.merge_live(row.get("lastGood"), live)
+                new_view, _ = live_usage.merge_live(rec.usage, live)
+                prev_at = _num_or_none(row.get("fetchedAt"))
+                live_at = _num_or_none(live.get("changedAt")) if live else None
+                if live_at is not None and (prev_at is None or live_at > prev_at):
+                    prev_at = live_at
+                burn = live_usage.update_burn(
+                    row.get("burn"), prev_view, prev_at, new_view, now
+                )
+                if burn is not None:
+                    row["burn"] = burn
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
@@ -1229,6 +1304,81 @@ class UsageStore:
 
         self._mutate(identities, readings.keys(), apply)
         return adopted
+
+    def feed_live(
+        self,
+        reading: dict[str, dict],
+        identities: dict[str, Identity],
+    ) -> str | None:
+        """Record a statusLine-fed reading on the account it belongs to.
+
+        ``reading`` is :func:`live_usage.parse_statusline` output. The slot is
+        found by matching the reading's window resets against what the store
+        already holds (:func:`live_usage.match_account`); an unattributable
+        reading is dropped. Returns the slot it was recorded on, or ``None``
+        when it was dropped or taught the store nothing new — a re-sent
+        reading from an idle session is the common case and must not turn
+        into a disk write, nor look like fresh information.
+
+        Only the ``live`` overlay and the learned burn rate are written; the
+        polled ``lastGood``, the fetch state and the poll plan are exactly
+        as they were, so the planner keeps seeing the polls it plans from.
+        """
+        if not reading or not identities:
+            return None
+        now = self.clock()
+        with self._lock():
+            rows = self._read_rows()
+            polled: dict[str, dict | None] = {}
+            lives: dict[str, dict | None] = {}
+            for num, identity in identities.items():
+                row = rows.get(num)
+                if not self._matches(row, identity):
+                    continue
+                assert isinstance(row, dict)
+                good = row.get("lastGood")
+                polled[num] = good if isinstance(good, dict) else None
+                live = row.get("live")
+                lives[num] = live if isinstance(live, dict) else None
+            slot = live_usage.match_account(reading, polled, lives, now)
+            if slot is None:
+                return None
+            row = rows[slot]
+            live = lives[slot] or {}
+            before_view, _ = live_usage.merge_live(polled[slot], live)
+            before_at = max(
+                _num_or_none(row.get("fetchedAt")) or 0.0,
+                _num_or_none(live.get("changedAt")) or 0.0,
+            ) or None
+            updated = dict(live)
+            for key in live_usage.WINDOW_KEYS:
+                incoming = reading.get(key)
+                if incoming is None:
+                    continue
+                kept = live_usage.accept_window(
+                    live.get(key) if isinstance(live.get(key), dict) else None,
+                    (polled[slot] or {}).get(key),
+                    incoming,
+                )
+                if kept is not None:
+                    updated[key] = kept
+            # What counts as news is what the READER would see change: a
+            # reading that restates the polled value, or an idle session
+            # re-sending what is already on file, adds nothing.
+            after_view, _ = live_usage.merge_live(polled[slot], updated)
+            if live_usage.view_signature(after_view) == live_usage.view_signature(
+                before_view
+            ):
+                return None
+            updated["changedAt"] = now
+            row["live"] = updated
+            burn = live_usage.update_burn(
+                row.get("burn"), before_view, before_at, after_view, now
+            )
+            if burn is not None:
+                row["burn"] = burn
+            self._write_rows(rows)
+            return slot
 
     def set_poll_plan(
         self,

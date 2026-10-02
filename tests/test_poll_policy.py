@@ -169,6 +169,32 @@ class TestPost429Aimd:
         )
         assert interval == poll_policy.POST_429_MAX_INTERVAL_S
 
+    def test_the_active_account_retreats_less_far_than_a_candidate(self):
+        # The active account is the one being consumed: a single 429 must not
+        # park its cadence at half-hour polls (it did, for ~2 hours).
+        assert (
+            poll_policy.ACTIVE_POST_429_MAX_INTERVAL_S
+            < poll_policy.POST_429_MAX_INTERVAL_S
+        )
+        prev = None
+        for _ in range(12):
+            _, prev = _plan(
+                recent_429=True,
+                is_active=True,
+                prev_interval_s=prev,
+                prev_usage=_usage(10),
+                new_usage=_usage(10),
+            )
+        assert prev == poll_policy.ACTIVE_POST_429_MAX_INTERVAL_S
+        _, candidate = _plan(
+            recent_429=True,
+            is_active=False,
+            prev_interval_s=poll_policy.ACTIVE_POST_429_MAX_INTERVAL_S,
+            prev_usage=_usage(10),
+            new_usage=_usage(10),
+        )
+        assert candidate > poll_policy.ACTIVE_POST_429_MAX_INTERVAL_S
+
     def test_no_429_uses_normal_ceiling(self):
         # Without recent 429s the wider ceiling never applies (normal cadence).
         _, interval = _plan(
