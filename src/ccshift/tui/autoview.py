@@ -85,6 +85,7 @@ class AutoScreen(Screen):
         # adjust mode was entered (wake/log only on a net change).
         self._adjusting = False
         self._configured_threshold: float | None = None
+        self._configured_ticks: dict[str, float] | None = None
         self._entry_threshold: float | None = None
 
     def compose(self) -> ComposeResult:
@@ -107,7 +108,9 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_ticks = self.app.ticks_for(self._settings)
         self.app.threshold_pct = self._settings.threshold
+        self.app.threshold_ticks = self._configured_ticks
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -121,6 +124,7 @@ class AutoScreen(Screen):
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
             self.app.threshold_pct = self._configured_threshold
+            self.app.threshold_ticks = self._configured_ticks
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -182,10 +186,17 @@ class AutoScreen(Screen):
     def _set_threshold(self, value: float) -> None:
         if value == self._settings.threshold:
             return
-        self._settings = replace(self._settings, threshold=value)
+        # A session adjustment is one number for both windows.
+        self._settings = replace(
+            self._settings,
+            threshold=value,
+            five_hour_threshold=None,
+            seven_day_threshold=None,
+        )
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = value
+        self.app.threshold_ticks = None
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -193,11 +204,20 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        limits = self._settings.window_thresholds()
+        shown = (
+            f"{pct_label(self._settings.threshold)}%"
+            if limits.is_uniform(self._settings.threshold)
+            else f"5h {pct_label(limits.five_hour)}% · 7d {pct_label(limits.seven_day)}%"
+        )
         text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
+            f"threshold {shown}",
             style=palette.accent if self._adjusting else "",
         )
-        if self._settings.threshold != self._configured_threshold:
+        if (
+            self._settings.threshold != self._configured_threshold
+            or self.app.threshold_ticks != self._configured_ticks
+        ):
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:

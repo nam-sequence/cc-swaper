@@ -61,7 +61,8 @@ final class MenuBarModelTests: XCTestCase {
 
         let model = MenuBarModel(defaults: defaults, executableURL: nil, launchAtLoginManager: FakeLaunchAtLoginManager())
         XCTAssertTrue(model.autoSwitchEnabled)
-        XCTAssertEqual(model.autoSwitchThreshold, 95)
+        XCTAssertEqual(model.autoSwitchThreshold5h, 95, "the one threshold of older versions seeds both windows")
+        XCTAssertEqual(model.autoSwitchThreshold7d, 95)
         XCTAssertTrue(model.autoSwitchDryRun)
         XCTAssertFalse(model.autoCheckForUpdates, "a setting already made under the new name is kept")
         XCTAssertEqual(model.lastUpdateCheck, lastCheck)
@@ -351,6 +352,56 @@ final class MenuBarModelTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(300))
         XCTAssertFalse(FileManager.default.fileExists(atPath: callsPath.path))
         model.shutdown()
+    }
+
+    func testTheTwoWindowsKeepTheirOwnSwitchPointsAndReachTheTool() async throws {
+        let folder = try makeFolder()
+        let countPath = folder.appendingPathComponent("ticks")
+        let argsPath = folder.appendingPathComponent("args")
+        let executable = try fakeCLI(autoSwitchScript(), replacements: [
+            "__TICK_COUNT__": countPath.path,
+            "__TICK_LOCK__": folder.appendingPathComponent("lock").path,
+            "__OVERLAP__": folder.appendingPathComponent("overlap").path,
+            "__AUTO_ARGS__": argsPath.path,
+        ])
+        let defaults = isolatedDefaults()
+        defaults.set(88.0, forKey: "ccshiftAutoSwitchThreshold")
+        let model = MenuBarModel(
+            defaults: defaults,
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager(),
+            autoSwitchInterval: 0.05
+        )
+        XCTAssertEqual(model.autoSwitchThreshold5h, 88)
+        XCTAssertEqual(model.autoSwitchThreshold7d, 88)
+
+        model.setAutoSwitchThreshold5h(80)
+        model.setAutoSwitchThreshold7d(96.6)
+        XCTAssertEqual(defaults.double(forKey: "ccshiftAutoSwitchThreshold5h"), 80)
+        XCTAssertEqual(defaults.double(forKey: "ccshiftAutoSwitchThreshold7d"), 96.6)
+        model.setAutoSwitchThreshold5h(10)
+        XCTAssertEqual(model.autoSwitchThreshold5h, 50, "bounded like the command line")
+
+        model.setAutoSwitchThreshold5h(80)
+        model.refresh()
+        _ = await waitUntil { !model.accounts.isEmpty }
+        model.setAutoSwitchEnabled(true)
+        let ran = await waitUntil(timeout: 4) { FileManager.default.fileExists(atPath: argsPath.path) }
+        XCTAssertTrue(ran)
+        let arguments = try String(contentsOf: argsPath, encoding: .utf8)
+        XCTAssertTrue(arguments.contains("--threshold-5h 80.0 --threshold-7d 96.6"), arguments)
+        let reported = await waitUntil { model.autoSwitchLastResult?.contains("Threshold: 5h 80.0% · 7d 96.6%") == true }
+        XCTAssertTrue(reported, model.autoSwitchLastResult ?? "nil")
+
+        // A new launch remembers them.
+        let relaunched = MenuBarModel(
+            defaults: defaults,
+            executableURL: nil,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        XCTAssertEqual(relaunched.autoSwitchThreshold5h, 80)
+        XCTAssertEqual(relaunched.autoSwitchThreshold7d, 96.6)
+        model.setAutoSwitchEnabled(false)
     }
 
     func testAutoSwitchRetriesAFailedRosterReadAndTicksWhenAccountsAppear() async throws {

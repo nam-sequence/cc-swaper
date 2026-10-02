@@ -21,7 +21,10 @@ final class MenuBarModel: ObservableObject {
     @Published var alertMessage: String?
     @Published private(set) var executablePath: String?
     @Published private(set) var autoSwitchEnabled: Bool
-    @Published private(set) var autoSwitchThreshold: Double
+    /// Where automatic switching moves off an account, per window: at this
+    /// share of the 5-hour limit, and of the 7-day limit.
+    @Published private(set) var autoSwitchThreshold5h: Double
+    @Published private(set) var autoSwitchThreshold7d: Double
     @Published private(set) var autoSwitchDryRun: Bool
     @Published private(set) var autoSwitchIsRunning = false
     @Published private(set) var autoSwitchLastResult: String?
@@ -101,7 +104,11 @@ final class MenuBarModel: ObservableObject {
         self.signInPresenter = signInPresenter ?? SystemSignInWindowPresenter()
         self.autoSwitchInterval = max(0.1, autoSwitchInterval)
         self.autoSwitchEnabled = defaults.object(forKey: "ccshiftAutoSwitchEnabled") as? Bool ?? false
-        self.autoSwitchThreshold = defaults.object(forKey: "ccshiftAutoSwitchThreshold") as? Double ?? 90
+        // One threshold served both windows before they were split: it seeds
+        // whichever of the two has not been set yet.
+        let sharedThreshold = defaults.object(forKey: "ccshiftAutoSwitchThreshold") as? Double ?? 90
+        self.autoSwitchThreshold5h = defaults.object(forKey: "ccshiftAutoSwitchThreshold5h") as? Double ?? sharedThreshold
+        self.autoSwitchThreshold7d = defaults.object(forKey: "ccshiftAutoSwitchThreshold7d") as? Double ?? sharedThreshold
         self.autoSwitchDryRun = defaults.object(forKey: "ccshiftAutoSwitchDryRun") as? Bool ?? false
         self.showUsageInMenuBar = defaults.object(forKey: "ccshiftShowUsageInMenuBar") as? Bool ?? true
         self.launchAtLoginStatus = self.launchAtLoginManager.status()
@@ -708,10 +715,22 @@ final class MenuBarModel: ObservableObject {
         }
     }
 
+    /// One switch point for both windows.
     func setAutoSwitchThreshold(_ threshold: Double) {
+        setAutoSwitchThreshold5h(threshold)
+        setAutoSwitchThreshold7d(threshold)
+    }
+
+    func setAutoSwitchThreshold5h(_ threshold: Double) {
         let bounded = min(max(threshold, 50), 99.9)
-        autoSwitchThreshold = bounded
-        defaults.set(bounded, forKey: "ccshiftAutoSwitchThreshold")
+        autoSwitchThreshold5h = bounded
+        defaults.set(bounded, forKey: "ccshiftAutoSwitchThreshold5h")
+    }
+
+    func setAutoSwitchThreshold7d(_ threshold: Double) {
+        let bounded = min(max(threshold, 50), 99.9)
+        autoSwitchThreshold7d = bounded
+        defaults.set(bounded, forKey: "ccshiftAutoSwitchThreshold7d")
     }
 
     func setAutoSwitchDryRun(_ dryRun: Bool) {
@@ -797,11 +816,13 @@ final class MenuBarModel: ObservableObject {
         autoSwitchIsRunning = true
         let cancellation = ProcessCancellation()
         autoSwitchCancellation = cancellation
-        let threshold = autoSwitchThreshold
+        let threshold5h = autoSwitchThreshold5h
+        let threshold7d = autoSwitchThreshold7d
         let dryRun = autoSwitchDryRun
         let result = await Self.load {
             try client.autoSwitchOnce(
-                threshold: threshold,
+                threshold5h: threshold5h,
+                threshold7d: threshold7d,
                 dryRun: dryRun,
                 cancellation: cancellation
             )
@@ -812,7 +833,7 @@ final class MenuBarModel: ObservableObject {
         guard autoSwitchEnabled, !cancellation.isCancelled else { return }
         switch result {
         case let .success(outcome):
-            autoSwitchLastResult = "\(outcome.summary) Threshold: \(outcome.threshold)%"
+            autoSwitchLastResult = "\(outcome.summary) Threshold: \(outcome.thresholdText)"
             if outcome.eventKind == "switch" && !outcome.dryRun { refresh() }
         case let .failure(message):
             autoSwitchLastResult = message
@@ -884,7 +905,8 @@ extension MenuBarModel {
         var alertMessage: String?
         var executablePath: String? = "/Users/example/.local/bin/ccshift"
         var autoSwitchEnabled = false
-        var autoSwitchThreshold = 90.0
+        var autoSwitchThreshold5h = 90.0
+        var autoSwitchThreshold7d = 90.0
         var autoSwitchDryRun = false
         var autoSwitchIsRunning = false
         var autoSwitchLastResult: String?
@@ -998,7 +1020,8 @@ extension MenuBarModel {
         model.alertMessage = state.alertMessage
         model.executablePath = state.executablePath
         model.autoSwitchEnabled = state.autoSwitchEnabled
-        model.autoSwitchThreshold = state.autoSwitchThreshold
+        model.autoSwitchThreshold5h = state.autoSwitchThreshold5h
+        model.autoSwitchThreshold7d = state.autoSwitchThreshold7d
         model.autoSwitchDryRun = state.autoSwitchDryRun
         model.autoSwitchIsRunning = state.autoSwitchIsRunning
         model.autoSwitchLastResult = state.autoSwitchLastResult

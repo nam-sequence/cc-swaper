@@ -50,8 +50,17 @@ struct DashboardSnapshot: Sendable {
 struct AutoSwitchOutcome: Equatable, Sendable {
     let eventKind: String?
     let summary: String
-    let threshold: Double
+    /// Where the check switches, per window: the 5-hour and the 7-day limit.
+    let threshold5h: Double
+    let threshold7d: Double
     let dryRun: Bool
+
+    /// "90%" when both windows share a switch point, else "5h 80% · 7d 95%".
+    var thresholdText: String {
+        threshold5h == threshold7d
+            ? "\(threshold5h)%"
+            : "5h \(threshold5h)% · 7d \(threshold7d)%"
+    }
 }
 
 struct ManualSwitchOutcome: Sendable {

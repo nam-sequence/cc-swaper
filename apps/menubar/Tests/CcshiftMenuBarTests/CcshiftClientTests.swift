@@ -248,6 +248,38 @@ final class CcshiftClientTests: XCTestCase {
         XCTAssertEqual(outcome.summary, "Would switch to two@example.test.")
     }
 
+    func testEachWindowGetsItsOwnSwitchPointWhenTheyDiffer() throws {
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccshift-args-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: log) }
+        let executable = try fakeCLI("""
+        #!/bin/sh
+        printf '%s\\n' "$*" >> '\(log.path)'
+        printf '%s\\n' '{"schemaVersion":1,"event":"no-switch","reason":"below-threshold","detail":"5h 70% < 80%"}'
+        exit 2
+        """)
+        let client = try CcshiftClient(executableURL: executable)
+
+        let split = try client.autoSwitchOnce(
+            threshold5h: 80, threshold7d: 95, dryRun: false, cancellation: ProcessCancellation()
+        )
+        XCTAssertEqual(split.thresholdText, "5h 80.0% · 7d 95.0%")
+        let same = try client.autoSwitchOnce(
+            threshold5h: 90, threshold7d: 90, dryRun: false, cancellation: ProcessCancellation()
+        )
+        XCTAssertEqual(same.thresholdText, "90.0%")
+
+        let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines[0], "auto --once --json --threshold-5h 80.0 --threshold-7d 95.0")
+        XCTAssertEqual(lines[1], "auto --once --json --threshold 90.0", "equal values keep the form every ccshift understands")
+        XCTAssertThrowsError(try client.autoSwitchOnce(
+            threshold5h: 49, threshold7d: 95, dryRun: false, cancellation: ProcessCancellation()
+        ))
+        XCTAssertThrowsError(try client.autoSwitchOnce(
+            threshold5h: 80, threshold7d: 100, dryRun: false, cancellation: ProcessCancellation()
+        ))
+    }
+
     func testResetLabelIsRecomputedFromResetsAtLikeCcshift() throws {
         let json = #"{"pct":40,"resetsAt":"2026-09-29T23:29:59.123456+00:00","countdown":"21h 51m","clock":"Sep 30 06:29"}"#
         let window = try JSONDecoder().decode(UsageWindow.self, from: Data(json.utf8))

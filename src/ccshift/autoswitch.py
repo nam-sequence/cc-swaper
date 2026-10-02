@@ -53,6 +53,7 @@ from ccshift.poll_policy import (
 )
 from ccshift.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from ccshift.switcher import ClaudeAccountSwitcher
+from ccshift.thresholds import normalize_usage
 from ccshift.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -329,6 +330,9 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Window label ("5h", "7d") → its own switch point, present only when the
+    # two differ. ``threshold`` stays the base value. Additive field.
+    thresholds: dict[str, float] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -340,7 +344,16 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.thresholds:
+            fields["thresholds"] = self.thresholds
         return fields
+
+    def _switch_point(self) -> str:
+        if self.thresholds:
+            return " · ".join(
+                f"{label} {pct_label(pct)}%" for label, pct in self.thresholds.items()
+            )
+        return f"{pct_label(self.threshold)}%"
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
@@ -357,7 +370,12 @@ class PollEvent(AutoSwitchEvent):
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        if h is not None:
+        wins = self.windows.get(str(num))
+        if self.thresholds and wins:
+            # Separate switch points: the one binding number would hide which
+            # window is near ITS limit, so name each window.
+            used = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+        elif h is not None:
             used = f"{100 - h:.0f}% used"
         else:
             err = self.fetch_errors.get(str(num))
@@ -370,7 +388,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"(switch at {self._switch_point()}){tail}"
         )
 
 
@@ -675,7 +693,9 @@ class AutoSwitchEngine:
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(
+            settings.threshold, self._models, settings.window_thresholds()
+        )
         self.on_event = on_event
         self.dry_run = dry_run
         # One-shot: a session just reported hitting its rate limit (Claude
@@ -977,10 +997,16 @@ class AutoSwitchEngine:
             threshold=settings.threshold,
             force_escalate=limit_hit,
         )
+        # `usage` is in the engine's unit (see thresholds.py); what is SHOWN
+        # is always the account's real percentages.
+        shown = {num: entry.decision_value() for num, entry in entries.items()}
+        window_limits = settings.window_thresholds()
         self._emit(
             PollEvent(
                 active=active_ref,
-                headroom=headroom,
+                # Real headroom (100 - the highest real percentage), not the
+                # engine's unit: this is what a reader of the event sees.
+                headroom=_headroom_by_account(shown, self._models),
                 threshold=settings.threshold,
                 fetch_errors={
                     num: entry.last_error
@@ -989,11 +1015,16 @@ class AutoSwitchEngine:
                 },
                 windows={
                     num: pcts
-                    for num, value in usage.items()
+                    for num, value in shown.items()
                     if (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                thresholds=(
+                    {}
+                    if window_limits.is_uniform(settings.threshold)
+                    else {"5h": window_limits.five_hour, "7d": window_limits.seven_day}
+                ),
             )
         )
 
@@ -1030,9 +1061,8 @@ class AutoSwitchEngine:
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=self._below_detail(
+                                shown.get(current), utilization
                             ),
                         )
                     )
@@ -1130,9 +1160,8 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                    detail=self._below_detail(
+                        shown.get(current), 100.0 - active_headroom
                     ),
                 )
             )
@@ -1247,7 +1276,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._decision_usage(entries)
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
@@ -2101,10 +2130,7 @@ class AutoSwitchEngine:
         if threshold is None:
             threshold = self.settings.threshold
         usage = self._blind_active_to_unknown(
-            current,
-            entries,
-            {num: entry.decision_value() for num, entry in entries.items()},
-            threshold,
+            current, entries, self._decision_usage(entries), threshold
         )
 
         active_value = usage.get(current)
@@ -2145,14 +2171,44 @@ class AutoSwitchEngine:
                 fetch=escalation_fetch
             )
             usage = self._blind_active_to_unknown(
-                current,
-                entries,
-                {num: entry.decision_value() for num, entry in entries.items()},
-                threshold,
+                current, entries, self._decision_usage(entries), threshold
             )
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _decision_usage(self, entries: dict) -> dict[str, dict | str | None]:
+        """Decision-grade usage per account, in the engine's unit: each gating
+        window re-expressed so its own threshold sits on ``settings.threshold``
+        (identity when the thresholds are equal)."""
+        limits = self.settings.window_thresholds()
+        base = self.settings.threshold
+        return {
+            num: normalize_usage(entry.decision_value(), limits, base)
+            for num, entry in entries.items()
+        }
+
+    def _below_detail(self, shown: object, utilization: float) -> str:
+        """``"X% < Y%"`` for a below-threshold hold, in real percentages.
+
+        With one threshold that is the binding utilization against it. With
+        separate ones the binding number alone would be ambiguous, so the
+        window nearest ITS limit is named.
+        """
+        settings = self.settings
+        limits = settings.window_thresholds()
+        if limits.is_uniform(settings.threshold) or not isinstance(shown, dict):
+            return f"{pct_label(utilization)}% < {pct_label(settings.threshold)}%"
+        from ccshift.thresholds import remap_pct
+
+        label, pct = max(
+            (
+                (name, value)
+                for name, value, _ in oauth.relevant_windows(shown, self._models)
+            ),
+            key=lambda w: remap_pct(w[1], limits.for_label(w[0]), settings.threshold),
+        )
+        return f"{label} {pct_label(pct)}% < {pct_label(limits.for_label(label))}%"
 
     def _blind_active_to_unknown(
         self,
@@ -2375,8 +2431,16 @@ class AutoSwitchEngine:
         cadence mid-run. Threshold only — the model axes (and their derived
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
-        self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        # A session override is one number for both windows.
+        self.settings = replace(
+            self.settings,
+            threshold=threshold,
+            five_hour_threshold=None,
+            seven_day_threshold=None,
+        )
+        self.switcher.set_poll_policy_inputs(
+            threshold, self._models, self.settings.window_thresholds()
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

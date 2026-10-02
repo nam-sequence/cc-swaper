@@ -210,7 +210,8 @@ final class SnapshotRenderTests: XCTestCase {
     func testSettingsAutomaticSwitchingOnWithStatus() throws {
         var state = MenuBarModel.PreviewState()
         state.autoSwitchEnabled = true
-        state.autoSwitchThreshold = 85
+        state.autoSwitchThreshold5h = 80
+        state.autoSwitchThreshold7d = 95
         state.autoSwitchDryRun = true
         state.autoSwitchIsRunning = true
         state.autoSwitchLastResult = "Would switch main to work (dry run). Threshold: 85.0%"

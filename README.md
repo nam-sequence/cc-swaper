@@ -119,6 +119,7 @@ Let ccshift watch your usage and switch for you. When the active account's 5-hou
 ```bash
 ccshift auto                     # foreground loop, polls every 60s
 ccshift auto --threshold 80      # switch earlier
+ccshift auto --threshold-5h 80 --threshold-7d 95   # each window its own limit
 ccshift auto --model Fable       # also switch when the Fable weekly limit is hit
 ccshift auto --once              # single check-and-switch, for cron/scripts
 ccshift auto --dry-run           # log what it would do, never switch
@@ -129,6 +130,7 @@ ccshift auto --strategy consume-first   # burn the soonest-resetting account fir
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
+- **Separate limits for the 5-hour and 7-day windows.** `--threshold` sets both; `--threshold-5h` and `--threshold-7d` (or `ccshift config set autoswitch.fiveHourThreshold 80` / `autoswitch.sevenDayThreshold 95`) give either window its own, and the one left unset follows `autoswitch.threshold`. It switches when *either* window reaches its own limit, and a target must be under *both* of its own. Per-model weekly windows (`--model`) follow the 7-day limit. A `--threshold` flag sets both and outranks per-window values in `settings.json`; a per-window flag outranks it in turn. Hold messages and `auto --json` events report real percentages (`5h 70% < 80%`), with a `thresholds` field when the limits differ.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `ccshift config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.

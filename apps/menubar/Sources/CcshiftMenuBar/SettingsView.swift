@@ -241,34 +241,16 @@ struct AutomaticSwitchingSettingsPane: View {
             }
 
             Section {
-                LabeledContent("Threshold") {
-                    HStack(spacing: 10) {
-                        // Continuous, snapped to whole points in the binding: a
-                        // `step:` slider draws one tick mark per step (about 50
-                        // here), which native Settings sliders never do.
-                        Slider(
-                            value: Binding(
-                                get: { model.autoSwitchThreshold },
-                                set: { newValue in
-                                    let snapped = min(max(newValue.rounded(), 50), 99.9)
-                                    if snapped != model.autoSwitchThreshold {
-                                        model.setAutoSwitchThreshold(snapped)
-                                    }
-                                }
-                            ),
-                            in: 50...99.9
-                        ) {
-                            Text("Threshold")
-                        }
-                        .labelsHidden()
-                        .frame(minWidth: 150)
-                        .accessibilityValue("\(model.autoSwitchThreshold, specifier: "%.1f") percent")
-                        Text("\(model.autoSwitchThreshold, specifier: "%.1f")%")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .frame(width: 48, alignment: .trailing)
-                    }
-                }
+                ThresholdRow(
+                    title: "5-Hour Limit",
+                    value: model.autoSwitchThreshold5h,
+                    set: model.setAutoSwitchThreshold5h
+                )
+                ThresholdRow(
+                    title: "7-Day Limit",
+                    value: model.autoSwitchThreshold7d,
+                    set: model.setAutoSwitchThreshold7d
+                )
 
                 Toggle(
                     isOn: Binding(
@@ -285,6 +267,8 @@ struct AutomaticSwitchingSettingsPane: View {
                         .foregroundStyle(model.autoSwitchEnabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
                 }
                 .disabled(!model.autoSwitchEnabled)
+            } footer: {
+                Text("Moves to another account when either window reaches its own limit. The 7-day limit also covers per-model weekly limits.")
             }
 
             if model.autoSwitchIsRunning || model.autoSwitchLastResult != nil {
@@ -326,4 +310,41 @@ struct AutomaticSwitchingSettingsPane: View {
     var state = MenuBarModel.PreviewState()
     state.settingsTab = .automaticSwitching
     return SettingsView(model: .preview(state))
+}
+
+
+/// One window's switch point: a slider snapped to whole points, with its value.
+private struct ThresholdRow: View {
+    let title: String
+    let value: Double
+    let set: (Double) -> Void
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 10) {
+                // Continuous, snapped to whole points in the binding: a
+                // `step:` slider draws one tick mark per step (about 50
+                // here), which native Settings sliders never do.
+                Slider(
+                    value: Binding(
+                        get: { value },
+                        set: { newValue in
+                            let snapped = min(max(newValue.rounded(), 50), 99.9)
+                            if snapped != value { set(snapped) }
+                        }
+                    ),
+                    in: 50...99.9
+                ) {
+                    Text(title)
+                }
+                .labelsHidden()
+                .frame(minWidth: 150)
+                .accessibilityValue("\(value, specifier: "%.1f") percent")
+                Text("\(value, specifier: "%.1f")%")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
+            }
+        }
+    }
 }

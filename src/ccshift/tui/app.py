@@ -72,16 +72,27 @@ class CcshiftApp(App):
         self._last_refresh_error = ""
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
+        # With separate 5h/7d switch points each bar gets its own tick
+        # (threshold_ticks); None while both windows share threshold_pct.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            loaded = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = loaded.threshold
+            self.threshold_ticks: dict[str, float] | None = self.ticks_for(loaded)
         except Exception:
             self.threshold_pct = None
+            self.threshold_ticks = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
             self._theme_name = "auto"
+
+    @staticmethod
+    def ticks_for(settings) -> dict[str, float] | None:
+        """Per-window bar ticks for ``settings``, or None when they coincide."""
+        limits = settings.window_thresholds()
+        if limits.is_uniform(settings.threshold):
+            return None
+        return {"5h": limits.five_hour, "7d": limits.seven_day}
 
     def on_mount(self) -> None:
         self.register_theme(CCSHIFT_DARK)
