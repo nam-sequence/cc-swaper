@@ -160,11 +160,26 @@ def usage_rows(
     return rows
 
 
+def _tick_for(threshold: "float | dict[str, float] | None", label: str) -> float | None:
+    """The bar tick for one window row.
+
+    A plain number marks every row (one shared switch point). A mapping gives
+    each window its own: "5h" its five-hour point, the weekly rows ("7d" and
+    the per-model ones) the seven-day point, and the spend row none — spend is
+    not a window the engine switches on.
+    """
+    if not isinstance(threshold, dict):
+        return threshold
+    if label == "$$":
+        return None
+    return threshold.get("5h") if label == "5h" else threshold.get("7d")
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
     *,
-    threshold: float | None = None,
+    threshold: "float | dict[str, float] | None" = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
@@ -233,7 +248,7 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=_tick_for(threshold, label),
                 palette=palette,
             )
         )
@@ -339,7 +354,9 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now,
+                        acc, width,
+                        threshold=app.threshold_ticks or app.threshold_pct,
+                        now=now,
                         palette=palette,
                     )
                 )

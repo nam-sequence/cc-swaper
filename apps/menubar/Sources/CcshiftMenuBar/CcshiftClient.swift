@@ -179,13 +179,36 @@ struct CcshiftClient: Sendable {
         return report
     }
 
+    /// One switch point for both windows.
     func autoSwitchOnce(
         threshold: Double,
         dryRun: Bool,
         cancellation: ProcessCancellation
     ) throws -> AutoSwitchOutcome {
-        guard (50...99.9).contains(threshold) else { throw CLIError.invalidThreshold }
-        var arguments = ["auto", "--once", "--json", "--threshold", "\(threshold)"]
+        try autoSwitchOnce(
+            threshold5h: threshold, threshold7d: threshold,
+            dryRun: dryRun, cancellation: cancellation
+        )
+    }
+
+    /// A switch point per window. Equal values go out as the single
+    /// `--threshold`, which every ccshift understands; only differing ones need
+    /// `--threshold-5h` / `--threshold-7d` (ccshift 1.4.0 or later).
+    func autoSwitchOnce(
+        threshold5h: Double,
+        threshold7d: Double,
+        dryRun: Bool,
+        cancellation: ProcessCancellation
+    ) throws -> AutoSwitchOutcome {
+        guard (50...99.9).contains(threshold5h), (50...99.9).contains(threshold7d) else {
+            throw CLIError.invalidThreshold
+        }
+        var arguments = ["auto", "--once", "--json"]
+        if threshold5h == threshold7d {
+            arguments += ["--threshold", "\(threshold5h)"]
+        } else {
+            arguments += ["--threshold-5h", "\(threshold5h)", "--threshold-7d", "\(threshold7d)"]
+        }
         if dryRun { arguments.append("--dry-run") }
         let result = try run(arguments: arguments, cancellation: cancellation)
         let lines = String(decoding: result.output, as: UTF8.self)
@@ -227,7 +250,8 @@ struct CcshiftClient: Sendable {
         return AutoSwitchOutcome(
             eventKind: meaningful?["event"] as? String,
             summary: describeAutoEvent(meaningful, exitCode: result.terminationStatus),
-            threshold: threshold,
+            threshold5h: threshold5h,
+            threshold7d: threshold7d,
             dryRun: dryRun
         )
     }

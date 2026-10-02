@@ -86,6 +86,7 @@ from ccshift.paths import (
 from ccshift.process_detection import get_running_instances
 from ccshift import poll_policy
 from ccshift.settings import load_settings, parse_model_names, settings_path
+from ccshift.thresholds import WindowThresholds, normalize_usage
 from ccshift.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -333,6 +334,8 @@ class ClaudeAccountSwitcher:
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        self._poll_limits_override: WindowThresholds | None = None
+        self._poll_limits_cache: tuple[float | None, WindowThresholds] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1790,12 +1793,17 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        models: tuple[str, ...],
+        window_thresholds: WindowThresholds | None = None,
     ) -> None:
         """Pin the threshold/models poll planning keys on (set by a hosted
         auto engine so cadence follows its effective, CLI-merged settings
-        instead of the settings file)."""
+        instead of the settings file). ``window_thresholds`` gives each window
+        its own switch point; None means both follow ``threshold``."""
         self._poll_inputs_override = (threshold, models)
+        self._poll_limits_override = window_thresholds
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1803,6 +1811,7 @@ class ClaudeAccountSwitcher:
         session threshold override would keep steering cadence after the
         engine it belonged to is gone."""
         self._poll_inputs_override = None
+        self._poll_limits_override = None
 
     def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
         """Threshold + configured model names for poll planning: the hosting
@@ -1821,6 +1830,25 @@ class ClaudeAccountSwitcher:
         inputs = (loaded.threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _poll_window_thresholds(self) -> WindowThresholds:
+        """Each window's switch point for poll planning, from the same source
+        as :meth:`_poll_policy_inputs`: the hosting engine's pin, else the
+        settings file."""
+        if self._poll_inputs_override is not None:
+            pinned = self._poll_limits_override
+            threshold = self._poll_inputs_override[0]
+            return pinned or WindowThresholds(threshold, threshold)
+        path = settings_path(self.backup_dir)
+        try:
+            mtime: float | None = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._poll_limits_cache is not None and self._poll_limits_cache[0] == mtime:
+            return self._poll_limits_cache[1]
+        limits = load_settings(self.backup_dir).window_thresholds()
+        self._poll_limits_cache = (mtime, limits)
+        return limits
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -5258,6 +5286,7 @@ class ClaudeAccountSwitcher:
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
+        limits = self._poll_window_thresholds()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5266,8 +5295,11 @@ class ClaudeAccountSwitcher:
             recent_429 = before is not None and before.recent_429(now)
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
-                prev_usage=before.polled_usage if before else None,
-                new_usage=rec.usage,
+                # The planner reasons in the engine's unit (thresholds.py).
+                prev_usage=normalize_usage(
+                    before.polled_usage if before else None, limits, threshold
+                ),
+                new_usage=normalize_usage(rec.usage, limits, threshold),
                 is_active=bool(info_by_num[num][4]),
                 threshold=threshold,
                 models=models,

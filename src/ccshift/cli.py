@@ -576,6 +576,18 @@ Examples:
         sys.exit(130)
 
 
+def _threshold_text(settings) -> str:
+    """"90%" when both windows share a switch point, else "5h 80% · 7d 95%"."""
+    from ccshift.autoswitch import pct_label
+
+    limits = settings.window_thresholds()
+    if limits.is_uniform(settings.threshold):
+        return f"{settings.threshold:.0f}%"
+    return (
+        f"5h {pct_label(limits.five_hour)}% · 7d {pct_label(limits.seven_day)}%"
+    )
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `ccshift auto [--once] [--json] [...]`.
 
@@ -607,6 +619,7 @@ Exit codes with --once:
 Examples:
   ccshift auto                       # foreground loop, switch at 90%% used
   ccshift auto --threshold 80        # switch earlier
+  ccshift auto --threshold-5h 80 --threshold-7d 95   # each window its own limit
   ccshift auto --model Fable         # also switch when the Fable weekly limit is hit
   ccshift auto --json                # one JSON event per line (for scripts)
   ccshift auto --once; echo $?       # single tick, outcome in exit code
@@ -636,8 +649,26 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when either of the active account's 5h/7d windows reaches "
+            "this utilization (50-99.9; default 90). Sets both windows; "
+            "--threshold-5h / --threshold-7d give one its own"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-5h",
+        dest="threshold_5h",
+        type=float,
+        metavar="PCT",
+        help="Switch when the 5-hour window reaches this utilization (50-99.9)",
+    )
+    parser.add_argument(
+        "--threshold-7d",
+        dest="threshold_7d",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Switch when the 7-day window (and any per-model weekly window) "
+            "reaches this utilization (50-99.9)"
         ),
     )
     parser.add_argument(
@@ -737,7 +768,7 @@ Defaults live in settings.json in the backup root; flags override them.
         if not args.json:
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: threshold {_threshold_text(settings)}, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )

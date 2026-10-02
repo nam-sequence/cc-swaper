@@ -22,6 +22,7 @@ from pathlib import Path
 
 from ccshift.exceptions import ConfigError
 from ccshift.fsutil import replace_with_retry
+from ccshift.thresholds import WindowThresholds
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -34,7 +35,11 @@ class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``ccshift auto``).
 
     ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
-    at or above it the engine looks for a better account. 90 rather than 95
+    at or above it the engine looks for a better account. It is the default
+    for BOTH windows; ``five_hour_threshold`` / ``seven_day_threshold`` give
+    either window its own switch point (None = follow ``threshold``), and the
+    engine switches when EITHER window reaches its own. Per-model weekly
+    windows follow the 7-day one. 90 rather than 95
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
     subagent turns burning past the mark before a swap lands. A proactive
     candidate must itself sit below the threshold (never land somewhere that
@@ -44,6 +49,8 @@ class AutoSwitchSettings:
     """
 
     threshold: float = 90.0
+    five_hour_threshold: float | None = None
+    seven_day_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -57,6 +64,21 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+
+    def window_thresholds(self) -> WindowThresholds:
+        """The switch point of each window, defaults resolved."""
+        return WindowThresholds(
+            five_hour=(
+                self.threshold
+                if self.five_hour_threshold is None
+                else self.five_hour_threshold
+            ),
+            seven_day=(
+                self.threshold
+                if self.seven_day_threshold is None
+                else self.seven_day_threshold
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -82,7 +104,7 @@ class SettingSpec:
     section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    kind: str  # "float" | "optfloat" (None = unset) | "int" | "bool" | "choice"
     lo: float | None = None
     hi: float | None = None
     choices: tuple[str, ...] = ()
@@ -104,7 +126,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Switch when a 5h/7d window reaches this pct (default for both windows)",
+        ),
+        SettingSpec(
+            "autoswitch", "fiveHourThreshold", "five_hour_threshold", "optfloat", 50.0, 99.9,
+            help="Switch when the 5h window reaches this pct (unset: follows threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "sevenDayThreshold", "seven_day_threshold", "optfloat", 50.0, 99.9,
+            help="Switch when the 7d window reaches this pct (unset: follows threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -180,7 +210,14 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         if spec.section != "autoswitch":
             continue
         value = getattr(settings, spec.field)
-        if spec.kind in ("float", "int"):
+        if spec.kind == "optfloat":
+            # Unset (None) stays unset; a number clamps; garbage reverts to unset.
+            kwargs[spec.field] = (
+                None
+                if isinstance(value, bool) or not isinstance(value, (int, float))
+                else num(value, spec.lo, spec.lo, spec.hi)
+            )
+        elif spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
@@ -257,7 +294,11 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     if not isinstance(section, dict):
         section = {}
     for field, json_key in _AUTOSWITCH_KEYS.items():
-        section[json_key] = getattr(settings, field)
+        value = getattr(settings, field)
+        if value is None and SETTING_SPECS[f"autoswitch.{json_key}"].kind == "optfloat":
+            section.pop(json_key, None)  # unset means "follow threshold": no null
+        else:
+            section[json_key] = value
     raw["autoswitch"] = section
     atomic_write_json(path, raw)
 
@@ -417,15 +458,27 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
-        rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
+        value = getattr(loaded[spec.section], spec.field)
+        if spec.kind == "optfloat" and value is None:
+            # Unset follows `threshold`: show the value that is in force.
+            value = loaded[spec.section].threshold
+        rows.append((spec, value, is_set))
     return rows
 
 
 def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
+    if getattr(args, "threshold", None) is not None:
+        # `--threshold N` means "switch at N" for both windows, so it also
+        # drops any per-window values from settings.json: a flag outranks the
+        # file, and a per-window flag below still outranks this one.
+        overrides["five_hour_threshold"] = None
+        overrides["seven_day_threshold"] = None
     for attr, field in (
         ("threshold", "threshold"),
+        ("threshold_5h", "five_hour_threshold"),
+        ("threshold_7d", "seven_day_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
