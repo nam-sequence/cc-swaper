@@ -1134,6 +1134,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Show source-labelled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "Read usage from the local store only, never fetching (use with "
+            "'list'): cheap enough to repaint a live view every few seconds"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help=(
@@ -1404,6 +1412,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
+    if args.cached and not args.list:
+        parser.error("--cached can only be used with 'list'")
 
     if args.json and not (
         args.list or args.status or args.switch or args.switch_to
@@ -1577,6 +1587,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
+                **({"fetch": set()} if args.cached else {}),
             )
         elif args.switch:
             from ccshift.settings import load_settings, parse_model_names

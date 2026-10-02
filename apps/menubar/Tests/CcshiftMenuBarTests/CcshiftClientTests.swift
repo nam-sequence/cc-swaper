@@ -28,6 +28,21 @@ final class CcshiftClientTests: XCTestCase {
         XCTAssertEqual(alreadyActive.to.number, 1)
     }
 
+    func testCachedDashboardAsksTheToolForTheStoreOnly() throws {
+        let executable = try fakeCLI("""
+        #!/bin/sh
+        if [ "$1 $2 $3" = "list --json --cached" ]; then
+          printf '%s\\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"a@example.test","organizationName":"","alias":null,"active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":41},"sevenDay":{"pct":9}}}]}'
+        else
+          exit 64
+        fi
+        """)
+        let client = try CcshiftClient(executableURL: executable)
+
+        XCTAssertEqual(try client.dashboard(cached: true).accounts.first?.visibleUsage?.fiveHour?.pct, 41)
+        XCTAssertThrowsError(try client.dashboard(), "the plain form must not take the cached path")
+    }
+
     func testNonzeroJSONErrorEnvelopeSurfacesTheUpstreamReason() throws {
         let executable = try fakeCLI("""
         #!/bin/sh

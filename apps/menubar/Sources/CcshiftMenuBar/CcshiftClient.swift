@@ -36,8 +36,14 @@ struct CcshiftClient: Sendable {
         self.timeout = timeout
     }
 
-    func dashboard() throws -> DashboardSnapshot {
-        let list: EngineAccountList = try decodeVersionOne(run(arguments: ["list", "--json"]))
+    /// `cached` reads the local usage store only (`list --json --cached`):
+    /// no fetching, cheap enough to repaint a live view every few seconds, and
+    /// it already carries the readings Claude Code feeds in from its status
+    /// line. The plain form may fetch accounts whose poll is due.
+    func dashboard(cached: Bool = false) throws -> DashboardSnapshot {
+        let list: EngineAccountList = try decodeVersionOne(
+            run(arguments: cached ? ["list", "--json", "--cached"] : ["list", "--json"])
+        )
         let activeNumber = list.activeAccountNumber ?? list.accounts.first(where: \.active)?.number
         let accounts = list.accounts.map { row -> Account in
             var account = row.account

@@ -74,6 +74,18 @@ struct GeneralSettingsPane: View {
                 }
             }
 
+            Section {
+                Toggle(
+                    "Show usage in the menu bar",
+                    isOn: Binding(
+                        get: { model.showUsageInMenuBar },
+                        set: { model.setShowUsageInMenuBar($0) }
+                    )
+                )
+            } footer: {
+                Text("The active account's 5-hour or 7-day usage, whichever is higher, kept current from the local usage store.")
+            }
+
             UpdatesSection(model: model)
 
             Section {

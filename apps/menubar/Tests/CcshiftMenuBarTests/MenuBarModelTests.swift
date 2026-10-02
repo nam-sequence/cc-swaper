@@ -207,6 +207,152 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(model.menuTitle, "engine-target")
     }
 
+    func testMenuBarUsageIsTheHigherWindowAndMarksALastKnownReading() async throws {
+        let folder = try makeFolder()
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": folder.appendingPathComponent("calls").path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+
+        XCTAssertNil(model.menuBarUsage, "nothing is known before the first read")
+        await model.refreshCached()
+        XCTAssertEqual(model.menuBarUsage, "54%", "the 7-day window is higher than the 5-hour one")
+
+        try Data("stale".utf8).write(to: modeFile)
+        await model.refreshCached()
+        XCTAssertEqual(model.menuBarUsage, "~61%", "a last-known reading is marked")
+
+        model.setShowUsageInMenuBar(false)
+        XCTAssertNil(model.menuBarUsage)
+    }
+
+    func testCachedReadsAreQuietAndNeverTouchTheSpinnerOrAlerts() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": callsPath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+
+        await model.refreshCached()
+        XCTAssertFalse(model.isRefreshing)
+        XCTAssertNil(model.alertMessage)
+        XCTAssertNil(model.lastUpdated, "only a full refresh claims the list was updated")
+        XCTAssertEqual(model.accounts.count, 1)
+        let calls = try String(contentsOf: callsPath, encoding: .utf8)
+        XCTAssertEqual(calls.split(separator: "\n").map(String.init), ["list --json --cached"])
+    }
+
+    func testLiveReadsRunOftenWhileOpenAndRarelyWhileClosed() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": callsPath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        func cachedCalls() -> Int {
+            let text = (try? String(contentsOf: callsPath, encoding: .utf8)) ?? ""
+            return text.split(separator: "\n").filter { $0.contains("--cached") }.count
+        }
+
+        model.startLiveUsage(openInterval: 0.05, idleInterval: 30)
+        let firstRead = await waitUntil { cachedCalls() == 1 && !model.accounts.isEmpty }
+        XCTAssertTrue(firstRead, "the menu bar has its numbers at launch, before any click")
+        try? await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(cachedCalls(), 1, "closed, the interval is the idle one")
+
+        model.popoverVisibilityChanged(true)
+        let fast = await waitUntil(timeout: 3) { cachedCalls() >= 4 }
+        XCTAssertTrue(fast, "open, the view repaints at the open interval")
+
+        model.popoverVisibilityChanged(false)
+        try? await Task.sleep(for: .milliseconds(300))
+        let settled = cachedCalls()
+        try? await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(cachedCalls(), settled, "closing the popover stops the fast reads")
+        model.shutdown()
+    }
+
+    func testOpeningThePopoverRunsOneFullRefreshOnlyWhenTheLastIsStale() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": callsPath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        func fullRefreshes() -> Int {
+            let text = (try? String(contentsOf: callsPath, encoding: .utf8)) ?? ""
+            return text.split(separator: "\n").filter { $0 == "list --json" }.count
+        }
+
+        model.popoverVisibilityChanged(true)
+        let first = await waitUntil { fullRefreshes() == 1 && !model.isRefreshing }
+        XCTAssertTrue(first)
+        model.popoverVisibilityChanged(false)
+        model.popoverVisibilityChanged(true)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(fullRefreshes(), 1, "a recent full refresh is not repeated on every open")
+    }
+
+    func testAToolWithoutCachedSupportIsLeftAloneAfterAFewFailures() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let executable = try fakeCLI(oldToolScript, replacements: ["__CALLS__": callsPath.path])
+        let model = MenuBarModel(
+            defaults: isolatedDefaults(),
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+        func calls() -> Int {
+            let text = (try? String(contentsOf: callsPath, encoding: .utf8)) ?? ""
+            return text.split(separator: "\n").count
+        }
+
+        model.startLiveUsage(openInterval: 0.02, idleInterval: 0.02)
+        let gaveUp = await waitUntil(timeout: 3) { calls() == MenuBarModel.liveFailureLimit }
+        XCTAssertTrue(gaveUp)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(calls(), MenuBarModel.liveFailureLimit, "it stops asking instead of failing every few seconds")
+        XCTAssertNil(model.alertMessage, "and never raises an alert about it")
+        model.shutdown()
+    }
+
+    func testNothingIsReadWhileClosedAndTheMenuBarShowsNoUsage() async throws {
+        let folder = try makeFolder()
+        let callsPath = folder.appendingPathComponent("calls")
+        let modeFile = folder.appendingPathComponent("mode")
+        try Data("fresh".utf8).write(to: modeFile)
+        let executable = try fakeCLI(usageScript, replacements: ["__MODE_FILE__": modeFile.path, "__CALLS__": callsPath.path])
+        let defaults = isolatedDefaults()
+        defaults.set(false, forKey: "ccshiftShowUsageInMenuBar")
+        let model = MenuBarModel(
+            defaults: defaults,
+            executableURL: executable,
+            launchAtLoginManager: FakeLaunchAtLoginManager()
+        )
+
+        model.startLiveUsage(openInterval: 0.02, idleInterval: 0.02)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: callsPath.path))
+        model.shutdown()
+    }
+
     func testAutoSwitchRetriesAFailedRosterReadAndTicksWhenAccountsAppear() async throws {
         let folder = try makeFolder()
         let stage = folder.appendingPathComponent("stage")
@@ -640,6 +786,29 @@ final class MenuBarModelTests: XCTestCase {
         else
           exit 64
         fi
+        """#
+    }
+
+    private var usageScript: String {
+        #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__CALLS__'
+        mode=$(/bin/cat '__MODE_FILE__')
+        if [ "$1" = "list" ] && [ "$mode" = "fresh" ]; then
+          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","organizationName":"Max","alias":"main","active":true,"usageStatus":"ok","usage":{"fiveHour":{"pct":12},"sevenDay":{"pct":53.6}}}]}'
+        elif [ "$1" = "list" ]; then
+          printf '%s\n' '{"schemaVersion":1,"activeAccountNumber":1,"accounts":[{"number":1,"email":"main@example.test","organizationName":"Max","alias":"main","active":true,"usageStatus":"unavailable","usage":null,"lastGoodUsage":{"fiveHour":{"pct":61},"sevenDay":{"pct":20}},"lastGoodAgeSeconds":900}]}'
+        else
+          exit 64
+        fi
+        """#
+    }
+
+    private var oldToolScript: String {
+        #"""
+        #!/bin/sh
+        printf '%s\n' "$*" >> '__CALLS__'
+        exit 64
         """#
     }
 
