@@ -28,6 +28,9 @@ struct MenuBarView: View {
             menuItems
         }
         .frame(width: CCMetrics.popoverWidth)
+        .background(
+            PopoverVisibilityProbe { visible in model.popoverVisibilityChanged(visible) }
+        )
         .task {
             if refreshOnAppear && model.rows.isEmpty && !model.isRefreshing { model.refresh() }
         }
@@ -370,4 +373,50 @@ enum SettingsWindowPresenter {
     state.lastUpdated = nil
     state.alertMessage = CLIError.executableNotFound.localizedDescription
     return MenuBarView(model: .preview(state), refreshOnAppear: false)
+}
+
+/// Reports whether the popover's window is on screen. SwiftUI's
+/// `onAppear`/`onDisappear` are not a dependable signal for a `.window`-style
+/// menu bar extra, whose content outlives each showing, so this watches the
+/// hosting window itself: ordered in/out and key-window changes.
+struct PopoverVisibilityProbe: NSViewRepresentable {
+    let onChange: @MainActor (Bool) -> Void
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ view: ProbeView, context: Context) {
+        view.onChange = onChange
+    }
+
+    final class ProbeView: NSView {
+        var onChange: (@MainActor (Bool) -> Void)?
+        private var observers: [NSObjectProtocol] = []
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            guard let window else { report(false); return }
+            let center = NotificationCenter.default
+            for name in [
+                NSWindow.didChangeOcclusionStateNotification,
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didResignKeyNotification,
+                NSWindow.willCloseNotification,
+            ] {
+                observers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] note in
+                    let closing = note.name == NSWindow.willCloseNotification
+                    MainActor.assumeIsolated { self?.report(!closing && window.isVisible && window.occlusionState.contains(.visible)) }
+                })
+            }
+            report(window.isVisible && window.occlusionState.contains(.visible))
+        }
+
+        @MainActor private func report(_ visible: Bool) { onChange?(visible) }
+
+    }
 }

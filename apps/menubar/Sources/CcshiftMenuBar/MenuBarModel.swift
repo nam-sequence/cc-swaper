@@ -47,6 +47,8 @@ final class MenuBarModel: ObservableObject {
     @Published private(set) var skippedUpdateVersion: String?
     /// The installed command line tool's version, once read.
     @Published private(set) var cliVersion: String?
+    /// Show the active account's usage next to its name in the menu bar.
+    @Published private(set) var showUsageInMenuBar: Bool
     let appVersion: String
 
     private let defaults: UserDefaults
@@ -65,6 +67,18 @@ final class MenuBarModel: ObservableObject {
     private var loginCheckGeneration = 0
     private var signInCancellation: ProcessCancellation?
     private var signInURLWatch: Task<Void, Never>?
+    private var liveTask: Task<Void, Never>?
+    private var liveReadInFlight = false
+    /// A tool older than 1.3.1 rejects `--cached`; after a few failures in a
+    /// row the live view stops asking instead of failing every few seconds.
+    private var liveFailures = 0
+    private var liveSupported = true
+    private var isPopoverVisible = false
+    private var lastFullRefresh: Date?
+    static let liveFailureLimit = 3
+    /// A full (possibly fetching) refresh on open only when the last one is
+    /// older than this; the store-only live reads cover the gap.
+    static let fullRefreshOnOpenAfter: TimeInterval = 30
 
     init(
         defaults: UserDefaults = .standard,
@@ -89,6 +103,7 @@ final class MenuBarModel: ObservableObject {
         self.autoSwitchEnabled = defaults.object(forKey: "ccshiftAutoSwitchEnabled") as? Bool ?? false
         self.autoSwitchThreshold = defaults.object(forKey: "ccshiftAutoSwitchThreshold") as? Double ?? 90
         self.autoSwitchDryRun = defaults.object(forKey: "ccshiftAutoSwitchDryRun") as? Bool ?? false
+        self.showUsageInMenuBar = defaults.object(forKey: "ccshiftShowUsageInMenuBar") as? Bool ?? true
         self.launchAtLoginStatus = self.launchAtLoginManager.status()
         configure(executableURL: executableURL)
         if autoSwitchEnabled {
@@ -102,6 +117,17 @@ final class MenuBarModel: ObservableObject {
     var menuTitle: String {
         guard let selectedAccount else { return "ccshift" }
         return selectedAccount.displayName
+    }
+
+    /// The active account's binding usage for the menu bar, e.g. "54%" — the
+    /// higher of its 5-hour and 7-day windows, the same one auto-switching
+    /// acts on. "~" marks a last-known reading that is not current.
+    var menuBarUsage: String? {
+        guard showUsageInMenuBar, let account = selectedAccount,
+              let usage = account.visibleUsage else { return nil }
+        let top = [usage.fiveHour?.pct, usage.sevenDay?.pct].compactMap { $0 }.max()
+        guard let top else { return nil }
+        return "\(account.isStale ? "~" : "")\(Int(top.rounded()))%"
     }
 
     var activeSummary: String {
@@ -143,6 +169,8 @@ final class MenuBarModel: ObservableObject {
     }
 
     func configure(executableURL: URL?) {
+        liveFailures = 0
+        liveSupported = true
         if let executableURL,
            let client = try? CcshiftClient(executableURL: executableURL) {
             self.client = client
@@ -195,6 +223,7 @@ final class MenuBarModel: ObservableObject {
             case let .success(snapshot):
                 self.accounts = snapshot.accounts
                 self.lastUpdated = Date()
+                self.lastFullRefresh = Date()
                 self.rosterReadFailed = false
                 self.alertMessage = afterSwitchWarning ?? snapshot.warning
             case let .failure(message):
@@ -509,7 +538,76 @@ final class MenuBarModel: ObservableObject {
         SystemUpdateNotifier.shared.install()
         let model = MenuBarModel(updateNotifier: SystemUpdateNotifier.shared)
         model.startAutomaticUpdateChecks()
+        model.startLiveUsage()
         return model
+    }
+
+    func setShowUsageInMenuBar(_ enabled: Bool) {
+        showUsageInMenuBar = enabled
+        defaults.set(enabled, forKey: "ccshiftShowUsageInMenuBar")
+    }
+
+    // MARK: Live usage
+
+    /// Keeps the shown numbers current without spending anything: every
+    /// `openInterval` seconds while the popover is open, every `idleInterval`
+    /// while it is closed and the menu bar shows usage, and not at all when
+    /// neither needs it. Each read is `list --json --cached` — the local usage
+    /// store, which the status-line feed and the poller keep current — so it
+    /// never touches the usage endpoint's budget. Starts at once, so the menu
+    /// bar has its numbers at launch instead of after the first click.
+    func startLiveUsage(openInterval: TimeInterval = 4, idleInterval: TimeInterval = 15) {
+        guard liveTask == nil else { return }
+        let tick = max(0.02, min(1, openInterval / 4))
+        liveTask = Task { [weak self] in
+            var lastRead = Date.distantPast
+            while !Task.isCancelled {
+                guard let self else { return }
+                let wanted = self.isPopoverVisible ? openInterval : idleInterval
+                let needed = self.isPopoverVisible || self.showUsageInMenuBar
+                if needed, self.liveSupported, Date().timeIntervalSince(lastRead) >= wanted {
+                    lastRead = Date()
+                    await self.refreshCached()
+                }
+                try? await Task.sleep(for: .seconds(tick))
+            }
+        }
+    }
+
+    /// The popover opened or closed. Opening shows what is on file right away
+    /// and, when the last full refresh is stale, runs one (the plan-bounded
+    /// kind that may fetch what is due).
+    func popoverVisibilityChanged(_ visible: Bool) {
+        guard visible != isPopoverVisible else { return }
+        isPopoverVisible = visible
+        guard visible else { return }
+        let stale = lastFullRefresh.map {
+            Date().timeIntervalSince($0) > Self.fullRefreshOnOpenAfter
+        } ?? true
+        if stale, !isRefreshing, !isChangingAccounts {
+            refresh(keepingAlert: true)
+        }
+    }
+
+    /// One store-only read. Quiet by design: it never shows the spinner, never
+    /// raises an alert, and yields to anything that changes the roster.
+    func refreshCached() async {
+        guard let client, liveSupported, !liveReadInFlight, !isRefreshing,
+              !isChangingAccounts, switchingAccountID == nil else { return }
+        liveReadInFlight = true
+        defer { liveReadInFlight = false }
+        let generation = refreshGeneration
+        let result = await Self.load { try client.dashboard(cached: true) }
+        guard refreshGeneration == generation, !isRefreshing,
+              !isChangingAccounts, switchingAccountID == nil else { return }
+        switch result {
+        case let .success(snapshot):
+            liveFailures = 0
+            if snapshot.accounts != accounts { accounts = snapshot.accounts }
+        case .failure:
+            liveFailures += 1
+            if liveFailures >= Self.liveFailureLimit { liveSupported = false }
+        }
     }
 
     /// The update to show in the menu: none once the person skipped that version.
@@ -636,6 +734,8 @@ final class MenuBarModel: ObservableObject {
     }
 
     func shutdown() {
+        liveTask?.cancel()
+        liveTask = nil
         updateCheckTask?.cancel()
         cancelSignIn()
         stopAutoSwitchLoop()

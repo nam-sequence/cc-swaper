@@ -21,6 +21,9 @@ struct CcshiftMenuBarApp: App {
                 Text(model.menuTitle)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if let usage = model.menuBarUsage {
+                    Text(usage).monospacedDigit()
+                }
             }
         }
         .menuBarExtraStyle(.window)

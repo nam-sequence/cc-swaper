@@ -928,6 +928,27 @@ class TestSubcommandAliases:
             show_token_status=False, json_output=True,
         )
 
+    def test_list_cached_never_fetches(self):
+        """`ccshift list --json --cached` asks list_accounts to fetch nothing."""
+        payload = {"schemaVersion": 1, "accounts": []}
+        with patch("ccshift.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["ccshift", "list", "--json", "--cached"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("ccshift.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=True, fetch=set(),
+        )
+
+    def test_cached_is_list_only(self):
+        with patch("ccshift.cli.ClaudeAccountSwitcher"), \
+             patch.object(sys, "argv", ["ccshift", "status", "--cached"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+
     def test_run_subcommand_still_dispatches(self):
         """`ccshift run 2` keeps reaching the session pre-dispatch (not translated)."""
         calls = []
