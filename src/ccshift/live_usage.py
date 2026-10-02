@@ -226,17 +226,41 @@ def accept_window(
     return {"pct": pct, "resets_ts": resets}
 
 
+def live_applies(live: dict | None, polled_at: float | None) -> bool:
+    """Whether a stored live reading can still describe the account.
+
+    A poll is the endpoint's own answer at the moment it was taken, so a live
+    reading from BEFORE the last poll is superseded by it — outright, not
+    window by window. "Usage only rises inside a window" holds for what a
+    session keeps consuming, but it does not hold when the provider resets or
+    re-grants quota early: the poll then reads lower, and a live reading that
+    outlived it would keep showing (and the engine keep acting on) the old,
+    higher number for as long as the window lasts.
+    """
+    if not isinstance(live, dict):
+        return False
+    if polled_at is None:
+        return True
+    changed = _finite(live.get("changedAt"))
+    return changed is not None and changed > polled_at
+
+
 def merge_live(
-    polled: dict | None, live: dict | None
+    polled: dict | None,
+    live: dict | None,
+    polled_at: float | None = None,
+    now: float | None = None,
 ) -> tuple[dict | None, bool]:
     """``(usage, used_live)``: ``polled`` with live windows laid over it.
 
-    A live window wins only when it is the same window with a higher
-    percentage, or a later window; otherwise the polled one stands. Scoped
-    (per-model) windows and spend are never touched — the statusLine does not
-    carry them. With nothing polled yet, the live windows stand alone.
+    Only a live reading taken after the last poll (``polled_at``) is laid over
+    it (:func:`live_applies`), and only windows that have not reset since
+    (``now``). Of those, a live window wins when it is the same window with a
+    higher percentage, or a later window; otherwise the polled one stands.
+    Scoped (per-model) windows and spend are never touched — the statusLine
+    does not carry them. With nothing polled yet, the live windows stand alone.
     """
-    if not isinstance(live, dict):
+    if not live_applies(live, polled_at):
         return polled, False
     base = dict(polled) if isinstance(polled, dict) else {}
     used = False
@@ -246,6 +270,8 @@ def merge_live(
         if pct is None:
             continue
         resets = _finite(lw.get("resets_ts"))
+        if now is not None and resets is not None and resets <= now:
+            continue  # that window has rolled over: its number is obsolete
         pw = base.get(key) if isinstance(base.get(key), dict) else None
         if pw is None or _finite(pw.get("pct")) is None:
             base[key] = _window_dict(pct, _iso(resets) if resets else None)
