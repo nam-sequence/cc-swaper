@@ -960,7 +960,9 @@ class UsageStore:
             live = row.get("live")
             live = live if isinstance(live, dict) else None
             live_at = _num_or_none(live.get("changedAt")) if live else None
-            merged, used_live = live_usage.merge_live(polled_good, live)
+            merged, used_live = live_usage.merge_live(
+                polled_good, live, polled_at=fetched_at, now=now
+            )
             if used_live and live_at is not None:
                 last_good = merged
                 newest = max(live_at, fetched_at if fetched_at is not None else live_at)
@@ -1176,11 +1178,19 @@ class UsageStore:
                 # live overlay included: the pair the planner compares
                 # (polled vs polled) would miss what the feed already saw.
                 live = row.get("live") if isinstance(row.get("live"), dict) else None
-                prev_view, _ = live_usage.merge_live(row.get("lastGood"), live)
-                new_view, _ = live_usage.merge_live(rec.usage, live)
+                prev_view, used_live = live_usage.merge_live(
+                    row.get("lastGood"),
+                    live,
+                    polled_at=_num_or_none(row.get("fetchedAt")),
+                    now=now,
+                )
+                # This poll supersedes every live reading taken before it.
+                new_view = rec.usage
                 prev_at = _num_or_none(row.get("fetchedAt"))
                 live_at = _num_or_none(live.get("changedAt")) if live else None
-                if live_at is not None and (prev_at is None or live_at > prev_at):
+                if used_live and live_at is not None and (
+                    prev_at is None or live_at > prev_at
+                ):
                     prev_at = live_at
                 burn = live_usage.update_burn(
                     row.get("burn"), prev_view, prev_at, new_view, now
@@ -1355,33 +1365,41 @@ class UsageStore:
             if slot is None:
                 return None
             row = rows[slot]
+            polled_at = _num_or_none(row.get("fetchedAt"))
             live = lives[slot] or {}
-            before_view, _ = live_usage.merge_live(polled[slot], live)
+            before_view, before_used = live_usage.merge_live(
+                polled[slot], live, polled_at=polled_at, now=now
+            )
             before_at = max(
-                _num_or_none(row.get("fetchedAt")) or 0.0,
-                _num_or_none(live.get("changedAt")) or 0.0,
+                polled_at or 0.0,
+                (_num_or_none(live.get("changedAt")) or 0.0) if before_used else 0.0,
             ) or None
-            updated = dict(live)
+            # A live reading older than the last poll is gone, not a reference:
+            # keeping its windows would hold a reset account at its old number.
+            current = live if live_usage.live_applies(live, polled_at) else {}
+            updated = dict(current)
             for key in live_usage.WINDOW_KEYS:
                 incoming = reading.get(key)
                 if incoming is None:
                     continue
                 kept = live_usage.accept_window(
-                    live.get(key) if isinstance(live.get(key), dict) else None,
+                    current.get(key) if isinstance(current.get(key), dict) else None,
                     (polled[slot] or {}).get(key),
                     incoming,
                 )
                 if kept is not None:
                     updated[key] = kept
+            updated["changedAt"] = now
             # What counts as news is what the READER would see change: a
             # reading that restates the polled value, or an idle session
             # re-sending what is already on file, adds nothing.
-            after_view, _ = live_usage.merge_live(polled[slot], updated)
+            after_view, _ = live_usage.merge_live(
+                polled[slot], updated, polled_at=polled_at, now=now
+            )
             if live_usage.view_signature(after_view) == live_usage.view_signature(
                 before_view
             ):
                 return None
-            updated["changedAt"] = now
             row["live"] = updated
             burn = live_usage.update_burn(
                 row.get("burn"), before_view, before_at, after_view, now

@@ -176,3 +176,87 @@ class TestBurnProjection:
         entry = store.entries(IDENT)["2"]
         assert entry.burn is None
         assert entry.decision_value() == entry.last_good
+
+
+class TestAPollSupersedesOlderLiveReadings:
+    """Regression: quota reset early (or re-granted) inside the same window.
+
+    The poll reads LOW, an older live reading says HIGH. "Usage only rises" is
+    false there, and the live number must not outlive the poll that contradicts
+    it — it used to, so a refresh showed (and the engine acted on) 99% for an
+    account whose usage had been reset to 0.
+    """
+
+    def test_a_reset_read_by_the_poll_wins_over_an_older_live_reading(self, store, clock):
+        clock.now += 60
+        store.feed_live(reading(70, T0 + 7200, 99, T0 + 5 * 86400), IDENT)
+        assert store.entries(IDENT)["2"].last_good["seven_day"]["pct"] == 99
+        clock.now += 60
+        # Same windows (same resets_at), but the provider reset the usage.
+        store.record(
+            {"2": FetchRecord(usage=usage(0, 0, T0 + 7200, T0 + 5 * 86400))}, IDENT
+        )
+        entry = store.entries(IDENT)["2"]
+        assert entry.last_good["five_hour"]["pct"] == 0
+        assert entry.last_good["seven_day"]["pct"] == 0
+        assert entry.decision_value()["seven_day"]["pct"] == 0
+        assert entry.live_at is None
+
+    def test_a_poll_that_reports_no_window_beats_an_older_live_window(self, store, clock):
+        clock.now += 60
+        store.feed_live(reading(64, T0 + 7200, 61, T0 + 5 * 86400), IDENT)
+        clock.now += 60
+        store.record(
+            {
+                "2": FetchRecord(
+                    usage={
+                        "five_hour": {"pct": 0.0},  # idle: no resets_at
+                        "seven_day": {
+                            "pct": 61.0,
+                            "resets_at": iso(T0 + 5 * 86400),
+                        },
+                    }
+                )
+            },
+            IDENT,
+        )
+        assert store.entries(IDENT)["2"].last_good["five_hour"]["pct"] == 0.0
+
+    def test_a_live_window_that_has_rolled_over_is_dropped(self, store, clock):
+        clock.now += 60
+        store.feed_live(reading(70, T0 + 7200, 61, T0 + 5 * 86400), IDENT)
+        assert store.entries(IDENT)["2"].last_good["five_hour"]["pct"] == 70
+        clock.now = T0 + 7200 + 1  # past the 5h reset; nobody has polled since
+        entry = store.entries(IDENT)["2"]
+        assert entry.last_good["five_hour"]["pct"] == 50, "falls back to the poll"
+
+    def test_a_reading_after_the_poll_is_taken_even_when_it_is_below_the_old_live_one(
+        self, store, clock
+    ):
+        clock.now += 60
+        store.feed_live(reading(70, T0 + 7200, 99, T0 + 5 * 86400), IDENT)
+        clock.now += 60
+        store.record(
+            {"2": FetchRecord(usage=usage(0, 0, T0 + 7200, T0 + 5 * 86400))}, IDENT
+        )
+        clock.now += 30
+        # The reset account is used again: 3% / 2%, far below the stale 99.
+        assert store.feed_live(reading(3, T0 + 7200, 2, T0 + 5 * 86400), IDENT) == "2"
+        entry = store.entries(IDENT)["2"]
+        assert entry.last_good["five_hour"]["pct"] == 3
+        assert entry.last_good["seven_day"]["pct"] == 2
+
+    def test_old_live_windows_do_not_ride_along_with_a_new_reading(self, store, clock):
+        clock.now += 60
+        store.feed_live(reading(70, T0 + 7200, 99, T0 + 5 * 86400), IDENT)
+        clock.now += 60
+        store.record(
+            {"2": FetchRecord(usage=usage(0, 0, T0 + 7200, T0 + 5 * 86400))}, IDENT
+        )
+        clock.now += 30
+        # Only the 5h window arrives; the stale 7d=99 must not come back with it.
+        slot = store.feed_live({"five_hour": {"pct": 3.0, "resets_ts": T0 + 7200}}, IDENT)
+        assert slot == "2"
+        entry = store.entries(IDENT)["2"]
+        assert entry.last_good["five_hour"]["pct"] == 3
+        assert entry.last_good["seven_day"]["pct"] == 0
